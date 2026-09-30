@@ -76,8 +76,8 @@ El proyecto es mantenido y desarrollado por **UNKNOWN Security Team** como infra
 
 ```bash
 pkg update && pkg install git android-tools -y
-git clone https://github.com/Streakxit/TiziXit-AntiCheat
-cd TiziXit-AntiCheat
+git clone https://github.com/tizikernel/tiziSS
+cd tiziSS
 chmod +x scanner.sh
 bash scanner.sh
 ```
