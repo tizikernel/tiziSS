@@ -1,7 +1,6 @@
 
 : "${_UNKNOWN_LEGAL:=UNKNOWN Security Team - Codigo Privado - Ingenieria inversa prohibida}"
 : "${_UNKNOWN_LEGAL:=UNKNOWN Security Team - Codigo Privado - Ingenieria inversa prohibida}"
-# _d eliminado: sus ocho cargas fueron decodificadas estáticamente e insertadas abajo.
 _s(){
   local _tv
   _tv=$(grep "TracerPid" /proc/$$/status 2>/dev/null|awk '{print $2}')
